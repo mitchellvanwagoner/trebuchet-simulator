@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(trebuchet_venv/Scripts/python.exe:*)",
+      "Bash(python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
