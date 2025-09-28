@@ -123,13 +123,13 @@ class TrebuchetSimulator:
     def weight_position_velocity(self, y):
         """Calculate weight position and velocity from state vector"""
         theta, theta_dot, alpha, alpha_dot = y
-        r_pul, h_w = self.params.pulley_radius, self.params.weight_height
+        r_pul, h_w, theta_i = self.params.pulley_radius, self.params.weight_height, self.params.initial_arm_angle
 
-        w_y = h_w + r_pul * theta
+        w_y = (h_w - r_pul * (2 + theta_i )) + r_pul * theta
 
         w_vy = r_pul * theta_dot
 
-        return (-2, w_y), (0, w_vy)
+        return (r_pul, w_y), (0, w_vy)
     
     def arm_position_velocity(self, y):
         """Calculate arm cm position and velocity"""

@@ -129,22 +129,32 @@ def main():
         print("\nDisplaying energy components over time...")
         plot_energy_history(result, params)
 
-        # Ask to save energy plot
-        if _ask_yes_no("Would you like to save the energy plot as an image?"):
-            _save_energy_plot(result, params)
-
     # Create and show animation
     if 'error' not in result.metrics:
         print("\nCreating animation...")
         anim = create_animation(params, result, show_forces=show_forces)
         show_animation(anim)
 
-        # Ask to save animation as GIF
-        if _ask_yes_no("Would you like to save the animation as a GIF?"):
-            # Generate descriptive filename
-            gif_filename = f"animation_mass{params.counter_weight_mass:.0f}kg_range{result.distance:.0f}m.gif"
-            print(f"Saving animation as: {gif_filename}")
-            save_animation_gif(anim, gif_filename, fps=30)
+        # Ask to save both energy plot and animation after animation is done
+        if result.energy_history:
+            save_energy = _ask_yes_no("Would you like to save the energy plot as an image?")
+            save_animation = _ask_yes_no("Would you like to save the animation as a GIF?")
+
+            if save_energy:
+                _save_energy_plot(result, params)
+
+            if save_animation:
+                # Generate descriptive filename
+                gif_filename = f"animation_mass{params.counter_weight_mass:.0f}kg_range{result.distance:.0f}m.gif"
+                print(f"Saving animation as: {gif_filename}")
+                save_animation_gif(anim, gif_filename, fps=30)
+        else:
+            # Only ask about animation if no energy history
+            if _ask_yes_no("Would you like to save the animation as a GIF?"):
+                # Generate descriptive filename
+                gif_filename = f"animation_mass{params.counter_weight_mass:.0f}kg_range{result.distance:.0f}m.gif"
+                print(f"Saving animation as: {gif_filename}")
+                save_animation_gif(anim, gif_filename, fps=30)
 
     else:
         print(f"ERROR: {result.metrics['error']}")

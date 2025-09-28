@@ -23,15 +23,15 @@ _atol=0.001
 _workers=16
 
 # Parameter locking configuration - set to None to optimize, or specify value to lock
-counter_weight_mass = 18.0
-pulley_radius = None
-arm_length = None
+counter_weight_mass = None
+pulley_radius = 0.12065
+arm_length = 0.8128
 string_length = None
 release_angle = None
 
 # Parameter bounds: [mass, pulley_radius, arm_length, string_length, release_angle]
 _bounds = [
-    (5.0, 100.0),                     # counterweight mass (kg)
+    (8.0, 18.0),                     # counterweight mass (kg)
     (0.01, 1.0),                     # pulley radius (m)
     (0.1, 2.5),                      # arm length (m)
     (0.1, 2.5),                      # string length (m)
@@ -368,10 +368,6 @@ def optimize_trebuchet(show_animation: bool = True, locked_params: dict = None) 
         print("\nDisplaying energy components over time...")
         plot_energy_history(sim_result, optimal_params)
 
-        # Ask to save energy plot
-        if _ask_yes_no("Would you like to save the energy plot as an image?"):
-            _save_energy_plot(sim_result, optimal_params)
-
     # Show animation
     if show_animation:
         print("\nCreating animation of optimal design...")
@@ -380,12 +376,26 @@ def optimize_trebuchet(show_animation: bool = True, locked_params: dict = None) 
             anim = create_animation(optimal_params, sim_result, show_forces=False)
             display_animation(anim)
 
-            # Ask to save animation as GIF
-            if _ask_yes_no("Would you like to save the animation as a GIF?"):
-                # Generate descriptive filename
-                gif_filename = f"animation_mass{optimal_params.counter_weight_mass:.0f}kg_range{sim_result.distance:.0f}m.gif"
-                print(f"Saving animation as: {gif_filename}")
-                save_animation_gif(anim, gif_filename, fps=60)
+            # Ask to save both energy plot and animation after animation is done
+            if sim_result.energy_history:
+                save_energy = _ask_yes_no("Would you like to save the energy plot as an image?")
+                save_animation = _ask_yes_no("Would you like to save the animation as a GIF?")
+
+                if save_energy:
+                    _save_energy_plot(sim_result, optimal_params)
+
+                if save_animation:
+                    # Generate descriptive filename
+                    gif_filename = f"animation_mass{optimal_params.counter_weight_mass:.0f}kg_range{sim_result.distance:.0f}m.gif"
+                    print(f"Saving animation as: {gif_filename}")
+                    save_animation_gif(anim, gif_filename, fps=60)
+            else:
+                # Only ask about animation if no energy history
+                if _ask_yes_no("Would you like to save the animation as a GIF?"):
+                    # Generate descriptive filename
+                    gif_filename = f"animation_mass{optimal_params.counter_weight_mass:.0f}kg_range{sim_result.distance:.0f}m.gif"
+                    print(f"Saving animation as: {gif_filename}")
+                    save_animation_gif(anim, gif_filename, fps=60)
 
         except Exception as e:
             print(f"Animation failed: {e}")
