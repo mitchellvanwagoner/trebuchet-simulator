@@ -10,11 +10,11 @@ from simulation import TrebuchetParams, simulate_trebuchet, print_simulation_res
 from animation import create_animation, show_animation, plot_energy_history, save_animation_gif
 
 # EDIT THESE PARAMETERS
-counter_weight_mass = 30.000
-pulley_radius = 0.076
-arm_length = 0.702
-string_length = 0.608
-release_angle = -3.994
+counter_weight_mass = 16.865
+pulley_radius = 0.121
+arm_length = 0.813
+string_length = 0.669
+release_angle = -4.877
 show_forces = False  # Set to True to show force arrows
 
 def _ask_yes_no(question: str) -> bool:

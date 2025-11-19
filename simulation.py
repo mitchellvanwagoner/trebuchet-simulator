@@ -9,20 +9,26 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 
-# GPU acceleration - test CuPy and use as numpy replacement if available
-try:
-    import cupy as cp
-    # Test basic GPU operation
-    test_array = cp.array([1.0, 2.0, 3.0])
-    test_result = cp.sin(test_array)
-    # If we get here, CuPy works
-    import cupy as np
-    GPU_AVAILABLE = True
-    print("GPU acceleration enabled with CuPy")
-except (ImportError, Exception):
+enable_gpu = False
+
+if enable_gpu:
+    # GPU acceleration - test CuPy and use as numpy replacement if available
+    try:
+        import cupy as cp
+        # Test basic GPU operation
+        test_array = cp.array([1.0, 2.0, 3.0])
+        test_result = cp.sin(test_array)
+        # If we get here, CuPy works
+        import cupy as np
+        GPU_AVAILABLE = True
+        print("GPU acceleration enabled with CuPy")
+    except (ImportError, Exception):
+        import numpy as np
+        GPU_AVAILABLE = False
+        print("GPU acceleration not available, using CPU (install cupy for GPU support)")
+else:
     import numpy as np
     GPU_AVAILABLE = False
-    print("GPU acceleration not available, using CPU (install cupy for GPU support)")
 
 # Constants
 g = 9.81                                             # gravity (m/s^2)
@@ -51,13 +57,13 @@ class TrebuchetParams:
     projectile_mass: float = 0.25                    # kg (apple)
     projectile_radius: float = 0.04                  # m
     initial_arm_angle: float = np.pi/4               # 45° start position
-    arm_drag_coefficient: float = 1.05               # N⋅m⋅s/rad
-    projectile_drag_coefficient: float = 0.47        # N⋅m⋅s/rad
-    joint_friction_coefficient: float = 0.1          # N⋅m⋅s/rad (friction at pivot)
+    arm_drag_coefficient: float = 1.05
+    projectile_drag_coefficient: float = 0.47
+    joint_friction_coefficient: float = 0.01         # N⋅m⋅s/rad (viscous damper at pivot)
 
     @property
     def pulley_mass(self):
-        return self.pulley_density * np.pi * self.pulley_radius**2 * 0.1
+        return self.pulley_density * np.pi * self.pulley_radius**2 * 0.0254
 
     @property
     def arm_mass(self):
@@ -69,7 +75,7 @@ class TrebuchetParams:
 
     @property
     def moi_pulley(self):
-        return 0.5 * self.pulley_mass * self.pulley_radius**2
+        return 0.013796 #0.5 * self.pulley_mass * self.pulley_radius**2
 
     @property
     def moi_arm(self):
@@ -412,13 +418,13 @@ class TrebuchetSimulator:
 
         # Calculate initial alpha
         alpha_i = theta_i + np.pi - np.arcsin(self.params.projectile_radius / self.params.string_length)
-        
-        # Set initial conditions
-        y0 = [theta_i, 0.0, alpha_i, 0.0]
+
+        # Set initial conditions - convert to CPU arrays for scipy compatibility
+        y0 = [to_cpu(theta_i), 0.0, to_cpu(alpha_i), 0.0]
 
         # Create a standalone event function with proper attributes
         def release_event(t, y):
-            return y[0] - self.params.release_angle
+            return y[0] - to_cpu(self.params.release_angle)
 
         release_event.terminal = True
         release_event.direction = -1

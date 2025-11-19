@@ -1,9 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(trebuchet_venv/Scripts/python.exe:*)",
-      "Bash(python:*)",
-      "Bash(rm:*)"
+      "Bash(run_with_gpu.bat simulation.py)",
+      "Bash(cmd /c:*)"
     ],
     "deny": [],
     "ask": []
