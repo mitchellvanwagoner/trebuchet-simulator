@@ -55,6 +55,17 @@ docker build -t trebuchet-sim .
 docker run -p 8501:8501 -v "$(pwd)/outputs:/app/outputs" trebuchet-sim
 ```
 
+To skip building locally and pull the prebuilt image published by CI instead
+(auto-built on every push to `main`, see `.github/workflows/docker-publish.yml`):
+
+```bash
+docker compose -f docker-compose.ghcr.yml up
+```
+
+This also persists the dashboard's saved parameter defaults (the 💾 button's
+`user_defaults.json`) in a named Docker volume, so they survive container
+recreation and image updates.
+
 ## Command line
 
 ```bash

@@ -16,6 +16,11 @@ RUN pip install --no-cache-dir -e .
 COPY run.py ./
 COPY tests ./tests
 
+# Placeholder so `user_defaults.json` exists as a file in the image; lets a
+# named volume mount directly onto it and persist saved dashboard defaults
+# across container recreations.
+RUN touch user_defaults.json
+
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_HEADLESS=true
 
