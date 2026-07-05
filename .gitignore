@@ -1,1 +1,27 @@
 nul
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+trebuchet_venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Streamlit
+.streamlit/
+
+# Generated simulation output
+outputs/
+
+# Per-user saved dashboard defaults
+user_defaults.json

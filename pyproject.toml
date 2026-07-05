@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trebuchet-sim"
+version = "1.0.0"
+description = "Trebuchet physics simulation, optimization, and visualization"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+    "streamlit>=1.35",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy>=13.0"]
+# Numba-JIT fast objective for the optimizer (optimization.py falls back to the
+# scipy engine automatically if this isn't installed).
+fast = ["numba>=0.59"]
+dev = ["pytest>=8.0", "numba>=0.59"]
+
+[project.scripts]
+trebuchet = "trebuchet_sim.cli:main"
+trebuchet-web = "trebuchet_sim.web.launcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

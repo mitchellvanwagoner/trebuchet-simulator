@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(run_with_gpu.bat simulation.py)",
-      "Bash(cmd /c:*)"
+      "Bash(cmd /c:*)",
+      "PowerShell(Get-ChildItem -Recurse src, tests, docs | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })"
     ],
     "deny": [],
     "ask": []

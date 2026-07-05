@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "trebuchet-web",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "src/trebuchet_sim/web/app.py", "--server.headless=true", "--server.port=8765"],
+      "port": 8765
+    }
+  ]
+}
