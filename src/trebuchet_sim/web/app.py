@@ -132,11 +132,12 @@ FIXED_PARAM_NAMES = ("pivot_height", "initial_arm_angle", "projectile_mass", "pr
 FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name in FIXED_PARAM_NAMES}
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
-# radians) like TrebuchetParams. Directory defaults to the repo root when
-# launched via run.py / the trebuchet CLI; TREBUCHET_DATA_DIR overrides it
-# (the Docker image points it at a mountable volume). Git-ignored: these are
-# per-user preferences.
-USER_DEFAULTS_FILE = Path(os.environ.get("TREBUCHET_DATA_DIR", ".")) / "user_defaults.json"
+# radians) like TrebuchetParams. TREBUCHET_DATA_DIR picks the directory:
+# run.py sets it to the repo root (git-ignored there) and the Docker image
+# points it at a mountable volume; without it (e.g. bare `trebuchet-web`)
+# fall back to a per-user home dir so the location never depends on the cwd.
+_DATA_DIR = Path(os.environ.get("TREBUCHET_DATA_DIR") or Path.home() / ".trebuchet-sim")
+USER_DEFAULTS_FILE = _DATA_DIR / "user_defaults.json"
 
 # Optimizer worker processes (scipy's differential_evolution `workers`; see
 # OptimizationConfig.workers). -1 = one process per CPU core, same as the
@@ -161,6 +162,7 @@ def _load_user_defaults() -> dict:
 def _save_user_defaults(optimizable: dict, fixed: dict, target: dict) -> None:
     """Persist the current inputs (None = leave free for the optimizer)."""
     defaults = {"optimizable": optimizable, "fixed": fixed, "target": target}
+    USER_DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_DEFAULTS_FILE.write_text(json.dumps(defaults, indent=2))
     st.session_state.user_defaults = defaults
 

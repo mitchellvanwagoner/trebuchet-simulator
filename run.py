@@ -109,6 +109,9 @@ def _child_env() -> dict:
     src_dir = str(REPO_ROOT / "src")
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [src_dir, env.get("PYTHONPATH")]))
     env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+    # Saved dashboard defaults (user_defaults.json) live in the repo root for
+    # local checkouts; without this the app falls back to ~/.trebuchet-sim.
+    env.setdefault("TREBUCHET_DATA_DIR", str(REPO_ROOT))
     return env
 
 

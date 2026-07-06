@@ -804,10 +804,3 @@ def build_trebuchet_3d_html(params: TrebuchetParams, result: SimulationResult, h
 def render_trebuchet_3d_html(html: str, height: int = 560) -> None:
     """Embed a previously built animation HTML block in the current Streamlit page."""
     st.iframe(html, height=height)
-
-
-def render_trebuchet_3d(params: TrebuchetParams, result: SimulationResult, height: int = 560) -> None:
-    """Build and render in one step (uncached convenience wrapper)."""
-    html = build_trebuchet_3d_html(params, result, height)
-    if html is not None:
-        render_trebuchet_3d_html(html, height)

@@ -45,16 +45,22 @@ Run the web UI in a container, no local Python setup required:
 docker compose up --build
 ```
 
-Then open `http://localhost:8501`. Outputs saved from the UI land in `./outputs`
-on the host (mounted as a volume). Equivalently, without compose:
+Then open `http://localhost:8501`. Equivalently, without compose:
 
 ```bash
 docker build -t trebuchet-sim .
-docker run -p 8501:8501 -v "$(pwd)/outputs:/app/outputs" trebuchet-sim
+docker run -p 8501:8501 trebuchet-sim
 ```
 
+The image is fully self-contained (Three.js is bundled, so the animation works
+without internet access), includes the Numba fast engine for the optimizer,
+runs as a non-root user, and reports readiness via a built-in healthcheck.
+Dependency versions are pinned in `docker-constraints.txt` so published images
+are reproducible.
+
 To skip building locally and pull the prebuilt image published by CI instead
-(auto-built on every push to `main`, see `.github/workflows/docker-publish.yml`):
+(auto-built and smoke-tested on every push to `main`, see
+`.github/workflows/docker-publish.yml`):
 
 ```bash
 docker compose -f docker-compose.ghcr.yml up
@@ -67,26 +73,21 @@ To reach the UI on a different host port (e.g. if 8501 is already taken), set
 WEBUI_PORT=8080 docker compose up --build
 ```
 
-Both compose files also persist the dashboard's saved parameter defaults (the
-💾 button's `user_defaults.json`) in a named Docker volume mounted at
-`/app/data`, so they survive container recreation and image updates. To point
-that at a host folder instead (e.g. an Unraid appdata share), replace the
-volume line with a bind mount onto the same directory path — no need to
-pre-create any files, since it's a directory-to-directory mount:
-
-```yaml
-volumes:
-  - ./outputs:/app/outputs
-  - /mnt/user/appdata/treb-sim:/app/data
-```
-
-To cap how many CPU cores the optimizer's differential-evolution search uses
-(scipy's `workers`; ignored when the Numba fast engine runs), set
-`TREBUCHET_OPT_WORKERS` — default `-1` uses one process per available core:
+The dashboard's saved parameter defaults (the 💾 button's `user_defaults.json`)
+live in `/app/data`. `docker-compose.yml` persists them in a named Docker
+volume; `docker-compose.ghcr.yml` bind-mounts a host folder chosen by
+`DATA_DIR` (default `./data`), e.g. on Unraid:
 
 ```bash
-TREBUCHET_OPT_WORKERS=2 docker compose up --build
+DATA_DIR=/mnt/user/appdata/treb-sim docker compose -f docker-compose.ghcr.yml up
 ```
+
+The container runs as uid 1000, so the `DATA_DIR` folder must be writable by
+that user.
+
+`TREBUCHET_OPT_WORKERS` caps the optimizer's worker processes, but only
+applies to the scipy fallback engine — the image ships with Numba, whose
+vectorized engine ignores it.
 
 ## Command line
 
@@ -124,5 +125,6 @@ src/trebuchet_sim/
     cli.py               `trebuchet` command-line entry point
     web/app.py           Streamlit web UI
     web/animation3d.py   Live Three.js 3D animation embedded in the web UI
+    web/static/          Vendored Three.js (r128), inlined so the UI works offline
 tests/                  pytest suite
 ```
