@@ -4,8 +4,6 @@ Euler-Lagrange physics simulation of a counterweight trebuchet with air drag,
 joint friction, energy tracking, animation, and differential-evolution
 parameter optimization.
 
-![Sample animation](docs/assets/animation_mass15kg_range20m.gif)
-
 ## Setup
 
 ```bash
@@ -128,5 +126,4 @@ src/trebuchet_sim/
     web/app.py           Streamlit web UI
     web/animation3d.py   Live Three.js 3D animation embedded in the web UI
 tests/                  pytest suite
-CAD/                    SolidWorks parts for the physical build
 ```
