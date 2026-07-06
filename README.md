@@ -117,7 +117,6 @@ pytest
 ```
 src/trebuchet_sim/
     config.py          TrebuchetParams dataclass and physical constants
-    backend.py          numpy/CuPy backend selection (TREBUCHET_GPU=1 to try GPU)
     physics.py           Euler-Lagrange dynamics, ODE integration, energy tracking
     trajectory.py        Shared post-release ballistic trajectory with air drag
     optimization.py      Differential-evolution parameter search

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from trebuchet_sim.backend import np
+import numpy as np
 
 G = 9.81                        # gravity (m/s^2)
 RHO_AIR = 1.225                 # air density at sea level (kg/m^3)

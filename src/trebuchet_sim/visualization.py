@@ -2,9 +2,9 @@
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-from trebuchet_sim.backend import np
 from trebuchet_sim.config import TrebuchetParams
 from trebuchet_sim.physics import SimulationResult, sample_full_timeline
 

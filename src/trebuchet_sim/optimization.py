@@ -8,9 +8,9 @@ from dataclasses import dataclass, field, fields
 from functools import partial
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 from scipy.optimize import differential_evolution
 
-from trebuchet_sim.backend import np
 from trebuchet_sim.config import TrebuchetParams
 from trebuchet_sim.physics import SimulationResult, simulate_trebuchet
 

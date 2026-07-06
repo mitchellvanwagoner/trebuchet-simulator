@@ -9,9 +9,9 @@ than a baked GIF.
 
 import json
 
+import numpy as np
 import streamlit as st
 
-from trebuchet_sim.backend import np
 from trebuchet_sim.config import TrebuchetParams
 from trebuchet_sim.physics import SimulationResult, TrebuchetSimulator, sample_component_positions
 from trebuchet_sim.trajectory import integrate_ballistic_trajectory

@@ -4,9 +4,9 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 from scipy.integrate import solve_ivp
 
-from trebuchet_sim.backend import np, to_cpu
 from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, TrebuchetParams
 from trebuchet_sim.trajectory import BallisticTrajectory, integrate_ballistic_trajectory
 
@@ -481,7 +481,7 @@ class TrebuchetSimulator:
         from the sling just clear of the arm, everything at rest."""
         theta_i = self.params.initial_arm_angle
         alpha_i = theta_i + np.pi - np.arcsin(self.params.projectile_radius / self.params.string_length)
-        return [to_cpu(theta_i), 0.0, to_cpu(alpha_i), 0.0]
+        return [float(theta_i), 0.0, float(alpha_i), 0.0]
 
     def simulate(
         self, t_max: float = 10.0, rtol: float = 1e-8, dense_output: bool = True, simulate_aftermath: bool = False,
@@ -499,7 +499,7 @@ class TrebuchetSimulator:
         release. It's opt-in: the optimizer objective and default callers never pay for it.
         """
         self.energy_history = []
-        release_angle = to_cpu(self.params.release_angle)
+        release_angle = self.params.release_angle
 
         def release_event(t, y):
             return y[0] - release_angle

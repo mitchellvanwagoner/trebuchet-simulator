@@ -18,7 +18,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["cupy>=13.0"]
 # Numba-JIT fast objective for the optimizer (optimization.py falls back to the
 # scipy engine automatically if this isn't installed).
 fast = ["numba>=0.59"]
