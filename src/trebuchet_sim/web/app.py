@@ -165,7 +165,13 @@ def _load_user_defaults() -> dict:
 
 
 def _save_user_defaults(optimizable: dict, fixed: dict, target: dict) -> None:
-    """Persist the current inputs (None = leave free for the optimizer)."""
+    """Persist the current inputs.
+
+    `optimizable` maps each name to {"value": <SI float>, "locked": <bool>} -
+    the box's raw content and the lock toggle's own state are saved
+    separately (see _optimizable_input) so switching the toggle off and back
+    on later restores the last value instead of resetting it.
+    """
     defaults = {"optimizable": optimizable, "fixed": fixed, "target": target}
     USER_DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_DEFAULTS_FILE.write_text(json.dumps(defaults, indent=2))
@@ -236,12 +242,18 @@ def _length_pair_input(
 
     Rendered as two columns inside the caller's existing grid cell, so it keeps
     the same row height as a single metric box rather than growing the layout.
-    Both boxes start blank ("free"/"use default") when the caller passes
-    default_m=None. The combined value counts as set as soon as EITHER box has
-    a value, treating the other as 0 - a user who only types into the inches
-    box (e.g. a 6" pulley radius) must not be silently ignored just because
-    they left feet untouched. Returns the combined value in meters (SI),
-    clamped into [min_value, max_value], or None if both boxes are blank.
+    Both boxes start pre-filled with default_m's feet/inches split (blank if
+    default_m is None), but can always be cleared back to blank afterwards:
+    Streamlit only allows an empty number_input when its `value` argument is
+    None, so the initial fill goes through session_state.setdefault() instead
+    of `value=`, and `value=None` is passed on every call - otherwise a
+    concrete `value=` re-passed on each rerun would make the box snap back to
+    it whenever the user tried to clear it. The combined value counts as set
+    as soon as EITHER box has a value, treating the other as 0 - a user who
+    only types into the inches box (e.g. a 6" pulley radius) must not be
+    silently ignored just because they left feet untouched. Returns the
+    combined value in meters (SI), clamped into [min_value, max_value], or
+    None if both boxes are blank.
     """
     feet_default = inches_default = None
     if default_m is not None:
@@ -252,14 +264,20 @@ def _length_pair_input(
 
     feet_max = math.ceil(max_value / units.METERS_PER_FOOT) + 1 if max_value is not None else None
 
+    ft_key, in_key = f"{key_prefix}_ft", f"{key_prefix}_in"
+    if feet_default is not None:
+        st.session_state.setdefault(ft_key, feet_default)
+    if inches_default is not None:
+        st.session_state.setdefault(in_key, inches_default)
+
     sub_feet, sub_inches = container.columns(2)
     feet_val = sub_feet.number_input(
-        f"{label} (ft)", min_value=0, max_value=feet_max, value=feet_default,
-        key=f"{key_prefix}_ft", step=1, help=help,
+        f"{label} (ft)", min_value=0, max_value=feet_max, value=None,
+        key=ft_key, step=1, help=help,
     )
     inches_val = sub_inches.number_input(
-        "(in)", min_value=0.0, max_value=11.99, value=inches_default,
-        key=f"{key_prefix}_in", step=0.1, format="%.2f",
+        "(in)", min_value=0.0, max_value=11.99, value=None,
+        key=in_key, step=0.1, format="%.2f",
     )
 
     if feet_val is None and inches_val is None:
@@ -268,117 +286,104 @@ def _length_pair_input(
     return min(combined, max_value) if max_value is not None else combined
 
 
-def _lock_toggle(container, name: str, locked: bool, keys: tuple) -> None:
-    """Compact lock control shown left of an optimizable input's box(es).
-
-    Locked params get a clickable button that pops the given session_state
-    keys, freeing the parameter for the optimizer to search again - this runs
-    before the input widget(s) below are (re)created in the same script pass,
-    so they come back blank immediately, no extra rerun needed. Free params
-    show a static icon instead: there's no value to lock *to* from a bare
-    click, so locking still happens by typing into the box(es) as before.
-    A spacer matches the input's label row height so the icon/button lines up
-    with the box itself rather than the label above it.
-    """
-    container.markdown("<div style='height:1.1rem'></div>", unsafe_allow_html=True)
-    if locked:
-        if container.button(
-            "🔒", key=f"unlock_{name}",
-            help="Click to unlock - let the optimizer search this parameter",
-            use_container_width=True,
-        ):
-            for key in keys:
-                st.session_state.pop(key, None)
-            # Without this, the button itself (decided from pre-click state)
-            # would still render as "locked" for this pass - only the number
-            # input below would visibly clear - so force one more rerun to
-            # flip the icon to unlocked in the same click.
-            st.rerun()
-    else:
-        container.markdown("<div style='text-align:center'>🔓</div>", unsafe_allow_html=True)
-
-
 def _optimizable_input(
     container, label: str, name: str, in_degrees: bool = False,
     kind: str = "length", imperial: bool = False,
-) -> "float | None":
-    """Number input for an optimizable parameter. None means free/unlocked.
+) -> "tuple[float | None, float, bool]":
+    """Number input for an optimizable parameter, paired with a lock toggle.
 
-    A clickable lock icon sits left of the box(es) (see _lock_toggle) so a
-    locked param can be freed with one click instead of hunting down and
-    clearing every box by hand. `kind` picks the unit conversion for the
-    non-angle case ("length" -> feet+inches, "mass" -> lb) when `imperial`;
-    the return value is always canonical SI (m, kg, or rad), matching
-    TrebuchetParams/OptimizationConfig regardless of display units.
+    The toggle is the sole source of truth for locked/free - typing into the
+    box no longer implies locking it. On: the optimizer/simulator use
+    whatever is currently in the box. Off: they disregard the box entirely
+    and treat the parameter as free, even if the box holds a leftover number.
+    The box itself can always be cleared back to blank (see the setdefault/
+    value=None pattern below); a locked-but-blank box has nothing to lock to,
+    so it's treated the same as free.
+
+    Returns (effective, raw, locked):
+      - effective: canonical-SI value when locked and the box isn't blank,
+        else None - what the rest of the app already expects for
+        simulate/optimize (None = free).
+      - raw: the box's current canonical-SI content, or a fallback default if
+        blank - saved so flipping the toggle back on (or just typing again)
+        later restores something sensible instead of nothing.
+      - locked: the toggle's own state, also saved so reloading remembers
+        which params were locked.
+
+    `kind` picks the unit conversion for the non-angle case ("length" ->
+    feet+inches, "mass" -> lb) when `imperial`.
     """
     lo, hi = PARAM_BOUNDS[name]
     if in_degrees:
         lo, hi = math.degrees(lo), math.degrees(hi)
 
-    # Saved default (canonical units): a value means "start locked at this",
-    # absent/None means start free. Clamped in case bounds changed since saving.
-    saved = _load_user_defaults().get("optimizable", {}).get(name)
-    if saved is not None:
-        saved = math.degrees(saved) if in_degrees else saved
-        saved = min(max(saved, lo), hi)
+    saved_entry = _load_user_defaults().get("optimizable", {}).get(name)
+    if not isinstance(saved_entry, dict):  # stale/pre-toggle save format - fall back to un-locked defaults
+        saved_entry = {}
+    saved_locked = bool(saved_entry.get("locked", False))
+    # Canonical-SI fallback used both to pre-fill the box and to fall back on
+    # if the box gets cleared - clamped in case bounds changed since saving.
+    fallback_si = saved_entry.get("value")
+    if fallback_si is None:
+        fallback_si = DEFAULT_OPTIMIZABLE_PARAMS[name]
+    fallback_si = min(max(fallback_si, PARAM_BOUNDS[name][0]), PARAM_BOUNDS[name][1])
+    display_default = math.degrees(fallback_si) if in_degrees else fallback_si
+    display_default = min(max(display_default, lo), hi)
 
-    help_text = "Leave blank to let the optimizer solve it; type a value to lock it."
+    lock_col, box_col = container.columns([1, 7])
+    # Spacer matches the input's label row height so the toggle lines up with
+    # the box itself, not the label above it.
+    lock_col.markdown("<div style='height:1.1rem'></div>", unsafe_allow_html=True)
+    locked = lock_col.toggle(
+        f"Lock {label}", key=f"lock_{name}", value=saved_locked, label_visibility="collapsed",
+        help="On: lock this parameter to the value in the box. Off: leave it free for the optimizer to search.",
+    )
+
+    # Every box below starts pre-filled with display_default but can still be
+    # cleared back to blank afterwards: Streamlit only allows an empty
+    # number_input when its `value` argument is None, so the initial fill goes
+    # through session_state.setdefault() instead of `value=`, and `value=None`
+    # is passed on every call - otherwise a concrete `value=` re-passed each
+    # rerun would make the box snap back to it whenever the user cleared it.
 
     if in_degrees:
         key = f"opt_{name}"
-        locked = st.session_state.get(key, saved) is not None
-        lock_col, box_col = container.columns([1, 7])
-        _lock_toggle(lock_col, name, locked, (key,))
-        return box_col.number_input(
-            f"{label} (deg)", min_value=lo, max_value=hi, value=saved,
-            key=key, format="%.4f", help=help_text,
+        st.session_state.setdefault(key, display_default)
+        box_value = box_col.number_input(
+            f"{label} (deg)", min_value=lo, max_value=hi, value=None, key=key, format="%.4f",
         )
+        raw = math.radians(box_value) if box_value is not None else fallback_si
+        effective = math.radians(box_value) if (locked and box_value is not None) else None
+        return effective, raw, locked
 
     if kind == "mass":
         lo_disp, hi_disp = (units.kg_to_lb(lo), units.kg_to_lb(hi)) if imperial else (lo, hi)
-        saved_disp = (units.kg_to_lb(saved) if saved is not None else None) if imperial else saved
-        key = f"opt_{name}"
-        locked = st.session_state.get(key, saved_disp) is not None
+        default_disp = units.kg_to_lb(display_default) if imperial else display_default
+        default_disp = min(max(default_disp, lo_disp), hi_disp)
         unit_label = "lb" if imperial else "kg"
-        lock_col, box_col = container.columns([1, 7])
-        _lock_toggle(lock_col, name, locked, (key,))
+        key = f"opt_{name}"
+        st.session_state.setdefault(key, default_disp)
         value_disp = box_col.number_input(
-            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=saved_disp,
-            key=key, format="%.4f", help=help_text,
+            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=None,
+            key=key, format="%.4f",
         )
         if value_disp is None:
-            return None
-        return units.lb_to_kg(value_disp) if imperial else value_disp
+            return None, fallback_si, locked
+        raw = units.lb_to_kg(value_disp) if imperial else value_disp
+        return (raw if locked else None), raw, locked
 
     # kind == "length"
     if imperial:
-        # The ft/in boxes' keys differ from the metric-mode single box, so the
-        # lock state falls back to the saved value's feet/inches components on
-        # first render, before session_state has those keys - same pattern as
-        # the metric case below. Locked as soon as EITHER box is set, matching
-        # _length_pair_input's own "either box counts" rule.
-        feet_saved = inches_saved = None
-        if saved is not None:
-            feet_saved, inches_saved = units.meters_to_feet_inches(min(max(saved, lo), hi))
-        ft_key, in_key = f"opt_{name}_ft", f"opt_{name}_in"
-        feet_state = st.session_state.get(ft_key, feet_saved)
-        inches_state = st.session_state.get(in_key, inches_saved)
-        locked = feet_state is not None or inches_state is not None
-        lock_col, box_col = container.columns([1, 7])
-        _lock_toggle(lock_col, name, locked, (ft_key, in_key))
-        return _length_pair_input(
-            box_col, label, f"opt_{name}", saved, lo, hi,
-            help="Leave both boxes blank to let the optimizer solve it; fill in either to lock it.",
+        value_m = _length_pair_input(box_col, label, f"opt_{name}", display_default, lo, hi)
+    else:
+        key = f"opt_{name}"
+        st.session_state.setdefault(key, display_default)
+        value_m = box_col.number_input(
+            f"{label} (m)", min_value=lo, max_value=hi, value=None, key=key, format="%.4f",
         )
-
-    key = f"opt_{name}"
-    locked = st.session_state.get(key, saved) is not None
-    lock_col, box_col = container.columns([1, 7])
-    _lock_toggle(lock_col, name, locked, (key,))
-    return box_col.number_input(
-        f"{label} (m)", min_value=lo, max_value=hi, value=saved,
-        key=key, format="%.4f", help=help_text,
-    )
+    raw = value_m if value_m is not None else fallback_si
+    effective = value_m if (locked and value_m is not None) else None
+    return effective, raw, locked
 
 
 def _fixed_input(
@@ -563,20 +568,50 @@ with left:
 
     st.subheader(
         "Optimizable parameters",
-        help="Leave a box blank to let the optimizer solve it (🔓 free); type a value to lock it (🔒 locked). "
-        "Click the 🔒 button to unlock a locked parameter again.",
+        help="Toggle 🔒 on to lock a parameter to the value in its box; off leaves it free for the "
+        "optimizer to search (the box's contents are then ignored).",
     )
     grid1, grid2 = st.columns(2)
-    optimizable_values = dict(
-        counter_weight_mass=_optimizable_input(
-            grid1, "Counterweight", "counter_weight_mass", kind="mass", imperial=imperial
-        ),
-        pulley_radius=_optimizable_input(grid2, "Pulley radius", "pulley_radius", imperial=imperial),
-        arm_length=_optimizable_input(grid1, "Arm length", "arm_length", imperial=imperial),
-        string_length=_optimizable_input(grid2, "String length", "string_length", imperial=imperial),
+    cw_mass, cw_mass_raw, cw_mass_locked = _optimizable_input(
+        grid1, "Counterweight", "counter_weight_mass", kind="mass", imperial=imperial
     )
-    release_angle_deg = _optimizable_input(grid1, "Release angle", "release_angle", in_degrees=True)
-    optimizable_values["release_angle"] = math.radians(release_angle_deg) if release_angle_deg is not None else None
+    pulley_radius, pulley_radius_raw, pulley_radius_locked = _optimizable_input(
+        grid2, "Pulley radius", "pulley_radius", imperial=imperial
+    )
+    arm_length, arm_length_raw, arm_length_locked = _optimizable_input(
+        grid1, "Arm length", "arm_length", imperial=imperial
+    )
+    string_length, string_length_raw, string_length_locked = _optimizable_input(
+        grid2, "String length", "string_length", imperial=imperial
+    )
+    release_angle_deg, release_angle_raw_deg, release_angle_locked = _optimizable_input(
+        grid1, "Release angle", "release_angle", in_degrees=True
+    )
+
+    optimizable_values = dict(
+        counter_weight_mass=cw_mass,
+        pulley_radius=pulley_radius,
+        arm_length=arm_length,
+        string_length=string_length,
+        release_angle=math.radians(release_angle_deg) if release_angle_deg is not None else None,
+    )
+    # Raw box content (always concrete, regardless of the lock toggle) and lock
+    # state, in canonical SI - saved by the 💾 button so unlocking doesn't lose
+    # the value and reloading remembers which params were locked.
+    optimizable_raw = dict(
+        counter_weight_mass=cw_mass_raw,
+        pulley_radius=pulley_radius_raw,
+        arm_length=arm_length_raw,
+        string_length=string_length_raw,
+        release_angle=math.radians(release_angle_raw_deg),
+    )
+    optimizable_locked = dict(
+        counter_weight_mass=cw_mass_locked,
+        pulley_radius=pulley_radius_locked,
+        arm_length=arm_length_locked,
+        string_length=string_length_locked,
+        release_angle=release_angle_locked,
+    )
 
     st.subheader(
         "Optimization target", help="Search for parameters that maximize launch efficiency at a target distance."
@@ -637,7 +672,10 @@ with left:
         use_container_width=True,
     ):
         _save_user_defaults(
-            optimizable_values,
+            {
+                name: {"value": optimizable_raw[name], "locked": optimizable_locked[name]}
+                for name in PARAM_NAMES
+            },
             fixed_params_all,
             {
                 "target_distance": target_distance,
