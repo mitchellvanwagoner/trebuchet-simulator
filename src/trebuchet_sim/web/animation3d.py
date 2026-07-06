@@ -8,6 +8,7 @@ than a baked GIF.
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
@@ -18,6 +19,13 @@ from trebuchet_sim.trajectory import integrate_ballistic_trajectory
 
 LAUNCH_SAMPLES = 150
 BALLISTIC_SAMPLES = 150
+
+# Three.js is vendored (pinned r128 - `examples/js/OrbitControls.js` was removed
+# from newer releases) and inlined into the animation HTML so it renders without
+# internet access on the viewing machine. Read once at import.
+_STATIC_DIR = Path(__file__).parent / "static"
+_THREE_JS = (_STATIC_DIR / "three-0.128.0.min.js").read_text(encoding="utf-8")
+_ORBIT_JS = (_STATIC_DIR / "OrbitControls-0.128.0.js").read_text(encoding="utf-8")
 
 
 def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
@@ -169,8 +177,8 @@ _HTML_TEMPLATE = r"""
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>__THREE_JS__</script>
+<script>__ORBIT_JS__</script>
 <script>
 (function () {
   const DATA = __TIMELINE_JSON__;
@@ -784,7 +792,13 @@ def build_trebuchet_3d_html(params: TrebuchetParams, result: SimulationResult, h
     if "error" in result.metrics:
         return None
     timeline = _build_timeline(params, result)
-    return _HTML_TEMPLATE.replace("__TIMELINE_JSON__", json.dumps(timeline)).replace("__HEIGHT__", str(height))
+    return (
+        _HTML_TEMPLATE
+        .replace("__THREE_JS__", _THREE_JS)
+        .replace("__ORBIT_JS__", _ORBIT_JS)
+        .replace("__TIMELINE_JSON__", json.dumps(timeline))
+        .replace("__HEIGHT__", str(height))
+    )
 
 
 def render_trebuchet_3d_html(html: str, height: int = 560) -> None:

@@ -30,5 +30,9 @@ trebuchet-web = "trebuchet_sim.web.launcher:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Vendored Three.js, inlined into the web animation HTML (see web/animation3d.py).
+"trebuchet_sim.web" = ["static/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
