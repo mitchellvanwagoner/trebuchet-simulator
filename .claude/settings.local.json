@@ -3,7 +3,9 @@
     "allow": [
       "Bash(run_with_gpu.bat simulation.py)",
       "Bash(cmd /c:*)",
-      "PowerShell(Get-ChildItem -Recurse src, tests, docs | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })"
+      "PowerShell(Get-ChildItem -Recurse src, tests, docs | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })",
+      "Bash(python -c \"import streamlit as st; help\\(st.iframe\\)\")",
+      "Bash(.venv/Scripts/python -c \"import streamlit as st; print\\(st.__version__\\); help\\(st.iframe\\)\")"
     ],
     "deny": [],
     "ask": []
