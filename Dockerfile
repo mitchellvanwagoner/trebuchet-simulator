@@ -9,12 +9,19 @@ RUN pip wheel --no-deps --no-cache-dir -w /wheels .
 # Stage 2: runtime
 FROM python:3.11-slim
 
-# [fast] pulls in numba so the optimizer uses the JIT-vectorized engine instead
-# of the slow per-simulation multiprocessing fallback. Versions are pinned by
-# the constraints file so published images are reproducible.
+# numba is installed alongside the wheel (rather than via the [fast] extra) so
+# the optimizer uses the JIT-vectorized engine instead of the slow per-simulation
+# multiprocessing fallback. Versions are pinned by the constraints file so
+# published images are reproducible.
+#
+# Deliberately not `wheel.whl[fast]`: combining a local-file requirement's
+# extras with `-c` constraints trips a pip resolver bug (pip re-derives the
+# base package as a separate PyPI requirement and reports a phantom version
+# conflict against the constraints file) - installing the wheel and numba as
+# two plain requirements sidesteps it.
 COPY docker-constraints.txt /tmp/docker-constraints.txt
 COPY --from=builder /wheels /tmp/wheels
-RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/*.whl)[fast]" \
+RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/*.whl)" numba \
     && rm -rf /tmp/wheels /tmp/docker-constraints.txt
 
 # Non-root runtime user. /app/data holds the dashboard's saved defaults
