@@ -1,0 +1,11 @@
+# Pins for the Docker image build only (see Dockerfile) so published GHCR
+# images are reproducible; local dev installs stay unpinned per pyproject.toml.
+# Versions mirror the development venv. llvmlite is pinned alongside numba
+# because the two are tightly version-coupled.
+numpy==2.4.6
+scipy==1.18.0
+matplotlib==3.11.0
+pillow==12.3.0
+streamlit==1.58.0
+numba==0.66.0
+llvmlite==0.48.0

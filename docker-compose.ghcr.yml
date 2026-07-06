@@ -3,9 +3,12 @@ services:
     image: ghcr.io/mitchellvanwagoner/trebuchet-simulator:latest
     pull_policy: always
     ports:
-      - "8501:8501"
+      - "${WEBUI_PORT:-8501}:8501"
     environment:
+      # Optimizer worker cap; only used when the Numba fast engine is
+      # unavailable (the image ships with it, so normally ignored).
       - TREBUCHET_OPT_WORKERS=${TREBUCHET_OPT_WORKERS:--1}
     volumes:
-      - ./outputs:/app/outputs
-      - /mnt/user/appdata/treb-sim:/app/data
+      # Saved dashboard defaults (user_defaults.json). Point DATA_DIR at a host
+      # folder to persist them, e.g. DATA_DIR=/mnt/user/appdata/treb-sim on Unraid.
+      - ${DATA_DIR:-./data}:/app/data

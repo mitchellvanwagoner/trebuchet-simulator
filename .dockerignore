@@ -12,6 +12,14 @@ dist/
 .streamlit/
 outputs/
 .git/
+.github/
 .vscode/
 .claude/
+CAD/
+docs/
+tests/
+run.py
+user_defaults.json
+*.compose.yml
+docker-compose*.yml
 suggestions.txt

@@ -4,9 +4,10 @@ services:
     ports:
       - "${WEBUI_PORT:-8501}:8501"
     environment:
+      # Optimizer worker cap; only used when the Numba fast engine is
+      # unavailable (the image ships with it, so normally ignored).
       - TREBUCHET_OPT_WORKERS=${TREBUCHET_OPT_WORKERS:--1}
     volumes:
-      - ./outputs:/app/outputs
       - user_defaults:/app/data
 
 volumes:

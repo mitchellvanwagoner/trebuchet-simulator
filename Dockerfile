@@ -1,30 +1,40 @@
-FROM python:3.11-slim
+# Stage 1: build the wheel (keeps setuptools and the src tree out of the runtime image)
+FROM python:3.11-slim AS builder
 
-WORKDIR /app
-
-# System deps for matplotlib/Pillow (rendering GIFs/plots headlessly)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libfreetype6 \
-    libpng16-16 \
-    && rm -rf /var/lib/apt/lists/*
-
+WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src ./src
+RUN pip wheel --no-deps --no-cache-dir -w /wheels .
 
-RUN pip install --no-cache-dir -e .
+# Stage 2: runtime
+FROM python:3.11-slim
 
-COPY run.py ./
-COPY tests ./tests
+# [fast] pulls in numba so the optimizer uses the JIT-vectorized engine instead
+# of the slow per-simulation multiprocessing fallback. Versions are pinned by
+# the constraints file so published images are reproducible.
+COPY docker-constraints.txt /tmp/docker-constraints.txt
+COPY --from=builder /wheels /tmp/wheels
+RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/*.whl)[fast]" \
+    && rm -rf /tmp/wheels /tmp/docker-constraints.txt
 
-# Saved dashboard defaults (user_defaults.json) live here; mount a volume
-# onto this directory to persist them across container recreations.
-RUN mkdir -p /app/data
+# Non-root runtime user. /app/data holds the dashboard's saved defaults
+# (user_defaults.json); mount a volume there to persist them across recreations.
+RUN useradd --create-home --uid 1000 trebuchet \
+    && mkdir -p /app/data \
+    && chown trebuchet:trebuchet /app/data
+WORKDIR /app
+USER trebuchet
 
-ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_PORT=8501 \
     STREAMLIT_SERVER_HEADLESS=true \
-    TREBUCHET_DATA_DIR=/app/data
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    TREBUCHET_DATA_DIR=/app/data \
+    MPLBACKEND=Agg
 
 EXPOSE 8501
 
-CMD ["streamlit", "run", "src/trebuchet_sim/web/app.py", \
-     "--server.port=8501", "--server.address=0.0.0.0"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)"
+
+CMD ["trebuchet-web"]

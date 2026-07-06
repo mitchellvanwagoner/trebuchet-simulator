@@ -35,7 +35,34 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: Build and push
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          push: false
+          tags: trebuchet-smoke-test
+
+      # Boot the freshly built image and require the Streamlit health endpoint to
+      # come up before anything is published. Catches broken CMD/deps/permissions.
+      - name: Smoke test image
+        run: |
+          docker run -d --name smoke -p 8501:8501 trebuchet-smoke-test
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8501/_stcore/health > /dev/null 2>&1; then
+              echo "Health endpoint responded"
+              docker rm -f smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Image failed to become healthy within 60s; container logs:"
+          docker logs smoke
+          docker rm -f smoke
+          exit 1
+
+      # Same context and builder as the smoke-test build, so this is a cache hit.
+      - name: Push image
         uses: docker/build-push-action@v5
         with:
           context: .
