@@ -1,5 +1,5 @@
 # Stage 1: build the wheel (keeps setuptools and the src tree out of the runtime image)
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 COPY pyproject.toml README.md ./
@@ -7,21 +7,19 @@ COPY src ./src
 RUN pip wheel --no-deps --no-cache-dir -w /wheels .
 
 # Stage 2: runtime
-FROM python:3.11-slim
-
-# numba is installed alongside the wheel (rather than via the [fast] extra) so
-# the optimizer uses the JIT-vectorized engine instead of the slow per-simulation
-# multiprocessing fallback. Versions are pinned by the constraints file so
-# published images are reproducible.
 #
-# Deliberately not `wheel.whl[fast]`: combining a local-file requirement's
-# extras with `-c` constraints trips a pip resolver bug (pip re-derives the
-# base package as a separate PyPI requirement and reports a phantom version
-# conflict against the constraints file) - installing the wheel and numba as
-# two plain requirements sidesteps it.
+# 3.12, not 3.11: docker-constraints.txt pins the exact versions from the dev
+# venv, and scipy's pinned version requires Python >=3.12 (it publishes no
+# cp311 wheels at all) - keep this in step with whatever scipy pin the
+# constraints file carries.
+FROM python:3.12-slim
+
+# numba installed alongside the wheel so the optimizer uses the JIT-vectorized
+# engine instead of the slow per-simulation multiprocessing fallback. Versions
+# are pinned by the constraints file so published images are reproducible.
 COPY docker-constraints.txt /tmp/docker-constraints.txt
 COPY --from=builder /wheels /tmp/wheels
-RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/*.whl)" numba \
+RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/*.whl)[fast]" \
     && rm -rf /tmp/wheels /tmp/docker-constraints.txt
 
 # Non-root runtime user. /app/data holds the dashboard's saved defaults
