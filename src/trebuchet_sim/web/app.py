@@ -268,17 +268,48 @@ def _length_pair_input(
     return min(combined, max_value) if max_value is not None else combined
 
 
+def _lock_toggle(container, name: str, locked: bool, keys: tuple) -> None:
+    """Compact lock control shown left of an optimizable input's box(es).
+
+    Locked params get a clickable button that pops the given session_state
+    keys, freeing the parameter for the optimizer to search again - this runs
+    before the input widget(s) below are (re)created in the same script pass,
+    so they come back blank immediately, no extra rerun needed. Free params
+    show a static icon instead: there's no value to lock *to* from a bare
+    click, so locking still happens by typing into the box(es) as before.
+    A spacer matches the input's label row height so the icon/button lines up
+    with the box itself rather than the label above it.
+    """
+    container.markdown("<div style='height:1.1rem'></div>", unsafe_allow_html=True)
+    if locked:
+        if container.button(
+            "🔒", key=f"unlock_{name}",
+            help="Click to unlock - let the optimizer search this parameter",
+            use_container_width=True,
+        ):
+            for key in keys:
+                st.session_state.pop(key, None)
+            # Without this, the button itself (decided from pre-click state)
+            # would still render as "locked" for this pass - only the number
+            # input below would visibly clear - so force one more rerun to
+            # flip the icon to unlocked in the same click.
+            st.rerun()
+    else:
+        container.markdown("<div style='text-align:center'>🔓</div>", unsafe_allow_html=True)
+
+
 def _optimizable_input(
     container, label: str, name: str, in_degrees: bool = False,
     kind: str = "length", imperial: bool = False,
 ) -> "float | None":
     """Number input for an optimizable parameter. None means free/unlocked.
 
-    The lock state lives in session_state from the previous rerun, so the label
-    icon can reflect it without an extra caption row. `kind` picks the unit
-    conversion for the non-angle case ("length" -> feet+inches, "mass" -> lb)
-    when `imperial`; the return value is always canonical SI (m, kg, or rad),
-    matching TrebuchetParams/OptimizationConfig regardless of display units.
+    A clickable lock icon sits left of the box(es) (see _lock_toggle) so a
+    locked param can be freed with one click instead of hunting down and
+    clearing every box by hand. `kind` picks the unit conversion for the
+    non-angle case ("length" -> feet+inches, "mass" -> lb) when `imperial`;
+    the return value is always canonical SI (m, kg, or rad), matching
+    TrebuchetParams/OptimizationConfig regardless of display units.
     """
     lo, hi = PARAM_BOUNDS[name]
     if in_degrees:
@@ -294,20 +325,26 @@ def _optimizable_input(
     help_text = "Leave blank to let the optimizer solve it; type a value to lock it."
 
     if in_degrees:
-        icon = "🔒" if st.session_state.get(f"opt_{name}", saved) is not None else "🔓"
-        return container.number_input(
-            f"{icon} {label} (deg)", min_value=lo, max_value=hi, value=saved,
-            key=f"opt_{name}", format="%.4f", help=help_text,
+        key = f"opt_{name}"
+        locked = st.session_state.get(key, saved) is not None
+        lock_col, box_col = container.columns([1, 7])
+        _lock_toggle(lock_col, name, locked, (key,))
+        return box_col.number_input(
+            f"{label} (deg)", min_value=lo, max_value=hi, value=saved,
+            key=key, format="%.4f", help=help_text,
         )
 
     if kind == "mass":
         lo_disp, hi_disp = (units.kg_to_lb(lo), units.kg_to_lb(hi)) if imperial else (lo, hi)
         saved_disp = (units.kg_to_lb(saved) if saved is not None else None) if imperial else saved
-        icon = "🔒" if st.session_state.get(f"opt_{name}", saved_disp) is not None else "🔓"
+        key = f"opt_{name}"
+        locked = st.session_state.get(key, saved_disp) is not None
         unit_label = "lb" if imperial else "kg"
-        value_disp = container.number_input(
-            f"{icon} {label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=saved_disp,
-            key=f"opt_{name}", format="%.4f", help=help_text,
+        lock_col, box_col = container.columns([1, 7])
+        _lock_toggle(lock_col, name, locked, (key,))
+        value_disp = box_col.number_input(
+            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=saved_disp,
+            key=key, format="%.4f", help=help_text,
         )
         if value_disp is None:
             return None
@@ -316,25 +353,31 @@ def _optimizable_input(
     # kind == "length"
     if imperial:
         # The ft/in boxes' keys differ from the metric-mode single box, so the
-        # icon falls back to the saved value's feet/inches components on first
-        # render, before session_state has those keys - same pattern as the
-        # metric case below. Locked as soon as EITHER box is set, matching
+        # lock state falls back to the saved value's feet/inches components on
+        # first render, before session_state has those keys - same pattern as
+        # the metric case below. Locked as soon as EITHER box is set, matching
         # _length_pair_input's own "either box counts" rule.
         feet_saved = inches_saved = None
         if saved is not None:
             feet_saved, inches_saved = units.meters_to_feet_inches(min(max(saved, lo), hi))
-        feet_state = st.session_state.get(f"opt_{name}_ft", feet_saved)
-        inches_state = st.session_state.get(f"opt_{name}_in", inches_saved)
-        icon = "🔒" if (feet_state is not None or inches_state is not None) else "🔓"
+        ft_key, in_key = f"opt_{name}_ft", f"opt_{name}_in"
+        feet_state = st.session_state.get(ft_key, feet_saved)
+        inches_state = st.session_state.get(in_key, inches_saved)
+        locked = feet_state is not None or inches_state is not None
+        lock_col, box_col = container.columns([1, 7])
+        _lock_toggle(lock_col, name, locked, (ft_key, in_key))
         return _length_pair_input(
-            container, f"{icon} {label}", f"opt_{name}", saved, lo, hi,
+            box_col, label, f"opt_{name}", saved, lo, hi,
             help="Leave both boxes blank to let the optimizer solve it; fill in either to lock it.",
         )
 
-    icon = "🔒" if st.session_state.get(f"opt_{name}", saved) is not None else "🔓"
-    return container.number_input(
-        f"{icon} {label} (m)", min_value=lo, max_value=hi, value=saved,
-        key=f"opt_{name}", format="%.4f", help=help_text,
+    key = f"opt_{name}"
+    locked = st.session_state.get(key, saved) is not None
+    lock_col, box_col = container.columns([1, 7])
+    _lock_toggle(lock_col, name, locked, (key,))
+    return box_col.number_input(
+        f"{label} (m)", min_value=lo, max_value=hi, value=saved,
+        key=key, format="%.4f", help=help_text,
     )
 
 
@@ -520,7 +563,8 @@ with left:
 
     st.subheader(
         "Optimizable parameters",
-        help="Leave a box blank to let the optimizer solve it (🔓 free); type a value to lock it (🔒 locked).",
+        help="Leave a box blank to let the optimizer solve it (🔓 free); type a value to lock it (🔒 locked). "
+        "Click the 🔒 button to unlock a locked parameter again.",
     )
     grid1, grid2 = st.columns(2)
     optimizable_values = dict(
