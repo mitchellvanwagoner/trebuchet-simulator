@@ -36,11 +36,11 @@ _FASTSIM_FIXED_FIELDS = [
 ProgressCallback = Callable[[int, float, TrebuchetParams, Optional[SimulationResult]], None]
 
 PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "counter_weight_mass": (10.0, 18.0),   # kg
+    "counter_weight_mass": (5.0, 60.0),    # kg
     "pulley_radius": (0.01, 1.0),          # m
     "arm_length": (0.1, 2.5),              # m
     "string_length": (0.1, 2.5),           # m
-    "release_angle": (-np.pi * 1.75, -np.pi * 1.15),  # rad
+    "release_angle": (np.radians(-290), np.radians(-180)),  # rad (-290 to -180 deg)
 }
 
 
