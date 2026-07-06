@@ -24,6 +24,7 @@ import streamlit as st
 # silenced rather than left spamming the console on every optimize run.
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
+from trebuchet_sim.web import units
 from trebuchet_sim.web.animation3d import build_trebuchet_3d_html, render_trebuchet_3d_html
 from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, TrebuchetParams
 from trebuchet_sim.optimization import PARAM_BOUNDS, PARAM_NAMES, OptimizationConfig, optimize_trebuchet
@@ -122,7 +123,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("#### 🏰 Trebuchet Physics Simulator")
+title_col, unit_col = st.columns([5, 1])
+title_col.markdown("#### 🏰 Trebuchet Physics Simulator")
+imperial = unit_col.toggle(
+    "Imperial", key="imperial_units", help="Show lengths in ft/in, masses in lb, speeds in ft/s."
+)
 
 ANIMATION_HEIGHT = 440
 
@@ -178,21 +183,34 @@ st.session_state.setdefault("opt_status", None)
 OPT_LOG_HEIGHT = "stretch"
 
 
-def _log_row(generation: int, score: float, target_distance: float, result) -> dict:
-    """One row of the optimizer log: the DE generation's best-so-far score and progress."""
+def _log_row(generation: int, score: float, target_distance: float, result, imperial: bool) -> dict:
+    """One row of the optimizer log: the DE generation's best-so-far score and progress.
+
+    Dataframe columns need numeric values for proper sorting, so distance uses
+    plain decimal feet here (not the feet+inches split in the results tables)
+    when Imperial. Rows already in the log keep whichever unit system was
+    active when they were generated - the log reflects history, not a live
+    reconversion of past rows when the toggle changes.
+    """
+    dist_label = "Distance (ft)" if imperial else "Distance (m)"
+    delta_label = "Δ Target (ft)" if imperial else "Δ Target (m)"
+
+    def to_display(value_m: float) -> float:
+        return value_m / units.METERS_PER_FOOT if imperial else value_m
+
     if result is not None and "error" not in result.metrics and result.metrics.get("release_occurred", True):
         return {
             "Gen": generation,
             "Score": round(score, 2),
-            "Distance (m)": round(result.distance, 2),
-            "Δ Target (m)": round(result.distance - target_distance, 2),
+            dist_label: round(to_display(result.distance), 2),
+            delta_label: round(to_display(result.distance - target_distance), 2),
             "Efficiency (%)": round(result.efficiency * 100, 1),
         }
     return {
         "Gen": generation,
         "Score": round(score, 2),
-        "Distance (m)": None,
-        "Δ Target (m)": None,
+        dist_label: None,
+        delta_label: None,
         "Efficiency (%)": None,
     }
 
@@ -210,11 +228,57 @@ def _store_result(params: TrebuchetParams, result) -> None:
     st.session_state.energy_fig = build_energy_figure(result, compact=True) if result.energy_history else None
 
 
-def _optimizable_input(container, label: str, name: str, in_degrees: bool = False) -> "float | None":
+def _length_pair_input(
+    container, label: str, key_prefix: str, default_m: "float | None",
+    min_value: float, max_value: "float | None" = None, help: str = None,
+) -> "float | None":
+    """Feet+inches sub-widget pair for a length field in Imperial mode.
+
+    Rendered as two columns inside the caller's existing grid cell, so it keeps
+    the same row height as a single metric box rather than growing the layout.
+    The feet box carries the blank/None ("free"/"use default") semantics when
+    the caller passes default_m=None; the inches box always has a numeric value
+    (default 0.0) and is only meaningful once feet is filled - this avoids an
+    ambiguous "one filled, one blank" state. Returns the combined value in
+    meters (SI), clamped into [min_value, max_value], or None if feet is blank.
+    """
+    feet_default = inches_default = None
+    if default_m is not None:
+        clamped = max(default_m, min_value)
+        if max_value is not None:
+            clamped = min(clamped, max_value)
+        feet_default, inches_default = units.meters_to_feet_inches(clamped)
+
+    feet_max = math.ceil(max_value / units.METERS_PER_FOOT) + 1 if max_value is not None else None
+
+    sub_feet, sub_inches = container.columns(2)
+    feet_val = sub_feet.number_input(
+        f"{label} (ft)", min_value=0, max_value=feet_max, value=feet_default,
+        key=f"{key_prefix}_ft", step=1, help=help,
+    )
+    inches_val = sub_inches.number_input(
+        "(in)", min_value=0.0, max_value=11.99,
+        value=inches_default if inches_default is not None else 0.0,
+        key=f"{key_prefix}_in", step=0.1, format="%.2f",
+    )
+
+    if feet_val is None:
+        return None
+    combined = max(units.feet_inches_to_meters(feet_val, inches_val), min_value)
+    return min(combined, max_value) if max_value is not None else combined
+
+
+def _optimizable_input(
+    container, label: str, name: str, in_degrees: bool = False,
+    kind: str = "length", imperial: bool = False,
+) -> "float | None":
     """Number input for an optimizable parameter. None means free/unlocked.
 
     The lock state lives in session_state from the previous rerun, so the label
-    icon can reflect it without an extra caption row.
+    icon can reflect it without an extra caption row. `kind` picks the unit
+    conversion for the non-angle case ("length" -> feet+inches, "mass" -> lb)
+    when `imperial`; the return value is always canonical SI (m, kg, or rad),
+    matching TrebuchetParams/OptimizationConfig regardless of display units.
     """
     lo, hi = PARAM_BOUNDS[name]
     if in_degrees:
@@ -227,56 +291,127 @@ def _optimizable_input(container, label: str, name: str, in_degrees: bool = Fals
         saved = math.degrees(saved) if in_degrees else saved
         saved = min(max(saved, lo), hi)
 
+    help_text = "Leave blank to let the optimizer solve it; type a value to lock it."
+
+    if in_degrees:
+        icon = "🔒" if st.session_state.get(f"opt_{name}", saved) is not None else "🔓"
+        return container.number_input(
+            f"{icon} {label} (deg)", min_value=lo, max_value=hi, value=saved,
+            key=f"opt_{name}", format="%.4f", help=help_text,
+        )
+
+    if kind == "mass":
+        lo_disp, hi_disp = (units.kg_to_lb(lo), units.kg_to_lb(hi)) if imperial else (lo, hi)
+        saved_disp = (units.kg_to_lb(saved) if saved is not None else None) if imperial else saved
+        icon = "🔒" if st.session_state.get(f"opt_{name}", saved_disp) is not None else "🔓"
+        unit_label = "lb" if imperial else "kg"
+        value_disp = container.number_input(
+            f"{icon} {label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=saved_disp,
+            key=f"opt_{name}", format="%.4f", help=help_text,
+        )
+        if value_disp is None:
+            return None
+        return units.lb_to_kg(value_disp) if imperial else value_disp
+
+    # kind == "length"
+    if imperial:
+        # The feet box's key differs from the metric-mode single box, so the icon
+        # falls back to the saved value's feet component on first render, before
+        # session_state has that key - same pattern as the metric case below.
+        feet_saved = units.meters_to_feet_inches(min(max(saved, lo), hi))[0] if saved is not None else None
+        icon = "🔒" if st.session_state.get(f"opt_{name}_ft", feet_saved) is not None else "🔓"
+        return _length_pair_input(
+            container, f"{icon} {label}", f"opt_{name}", saved, lo, hi,
+            help="Leave the feet box blank to let the optimizer solve it; fill in both to lock it.",
+        )
+
     icon = "🔒" if st.session_state.get(f"opt_{name}", saved) is not None else "🔓"
     return container.number_input(
-        f"{icon} {label}",
-        min_value=lo,
-        max_value=hi,
-        value=saved,
-        key=f"opt_{name}",
-        format="%.4f",
-        help="Leave blank to let the optimizer solve it; type a value to lock it.",
+        f"{icon} {label} (m)", min_value=lo, max_value=hi, value=saved,
+        key=f"opt_{name}", format="%.4f", help=help_text,
     )
 
 
-def _fixed_input(container, label: str, name: str, min_value: float, max_value: float, in_degrees: bool = False) -> "float | None":
-    """Number input for a fixed (never-optimized) system parameter."""
+def _fixed_input(
+    container, label: str, name: str, min_value: float, max_value: float,
+    in_degrees: bool = False, kind: str = "length", imperial: bool = False,
+) -> "float | None":
+    """Number input for a fixed (never-optimized) system parameter.
+
+    `kind` picks the unit conversion for the non-angle case ("length" -> a
+    feet+inches sub-widget pair, "mass" -> pounds) when `imperial`; always
+    returns canonical SI (m, kg, or rad) regardless of the display units.
+    """
     default = _load_user_defaults().get("fixed", {}).get(name)
     if default is None:
         default = FIXED_DEFAULTS[name]
+
     if in_degrees:
-        default = math.degrees(default)
+        default = min(max(math.degrees(default), min_value), max_value)
+        return container.number_input(
+            f"{label} (deg)", min_value=min_value, max_value=max_value, value=default,
+            key=f"fixed_{name}", format="%.4f",
+        )
+
+    if kind == "mass":
+        unit_label = "lb" if imperial else "kg"
+        lo_disp, hi_disp = (units.kg_to_lb(min_value), units.kg_to_lb(max_value)) if imperial else (min_value, max_value)
+        default_disp = min(max(units.kg_to_lb(default) if imperial else default, lo_disp), hi_disp)
+        value_disp = container.number_input(
+            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=default_disp,
+            key=f"fixed_{name}", format="%.4f",
+        )
+        return units.lb_to_kg(value_disp) if imperial else value_disp
+
+    # kind == "length"
+    if imperial:
+        return _length_pair_input(container, label, f"fixed_{name}", default, min_value, max_value)
     default = min(max(default, min_value), max_value)
     return container.number_input(
-        label,
-        min_value=min_value,
-        max_value=max_value,
-        value=default,
-        key=f"fixed_{name}",
-        format="%.4f",
+        f"{label} (m)", min_value=min_value, max_value=max_value, value=default,
+        key=f"fixed_{name}", format="%.4f",
     )
 
 
 def _fixed_input_optional(
-    container, label: str, name: str, min_value: float, max_value: float, help: str = None
+    container, label: str, name: str, min_value: float, max_value: float,
+    imperial: bool = False, help: str = None,
 ) -> "float | None":
     """Number input for a fixed system parameter that may be left blank.
 
     Unlike _fixed_input, blank is a legal value here (not "still typing") - it
-    means TrebuchetParams should fall back to its own computed default.
+    means TrebuchetParams should fall back to its own computed default. Always
+    a length field in practice (CW rope length) - kept simple rather than
+    generalized to mass/angle since there's no such call site today.
     """
     saved = _load_user_defaults().get("fixed", {}).get(name)
     if saved is not None:
         saved = min(max(saved, min_value), max_value)
+
+    if imperial:
+        return _length_pair_input(container, label, f"fixed_{name}", saved, min_value, max_value, help=help)
+
     return container.number_input(
-        label,
-        min_value=min_value,
-        max_value=max_value,
-        value=saved,
-        key=f"fixed_{name}",
-        format="%.4f",
-        help=help,
+        f"{label} (m)", min_value=min_value, max_value=max_value, value=saved,
+        key=f"fixed_{name}", format="%.4f", help=help,
     )
+
+
+def _fmt_length(value_m: float, imperial: bool) -> str:
+    """Feet+inches split for the results tables (see _log_row for why the
+    optimizer log uses plain decimal feet instead)."""
+    if not imperial:
+        return f"{value_m:.4f} m"
+    feet, inches = units.meters_to_feet_inches(value_m)
+    return f"{feet} ft {inches:.2f} in"
+
+
+def _fmt_mass(value_kg: float, imperial: bool) -> str:
+    return f"{units.kg_to_lb(value_kg):.3f} lb" if imperial else f"{value_kg:.3f} kg"
+
+
+def _fmt_speed(value_mps: float, imperial: bool) -> str:
+    return f"{units.mps_to_fps(value_mps):.2f} ft/s" if imperial else f"{value_mps:.2f} m/s"
 
 
 def _render_stat_table(data: dict, columns_per_row: int = 2) -> None:
@@ -291,7 +426,7 @@ def _render_stat_table(data: dict, columns_per_row: int = 2) -> None:
         st.table([dict(items[start : start + columns_per_row])])
 
 
-def _show_results(params: TrebuchetParams, result) -> None:
+def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
     if "error" in result.metrics:
         st.error(result.metrics["error"])
         return
@@ -310,11 +445,11 @@ def _show_results(params: TrebuchetParams, result) -> None:
     st.markdown("**Solution**")
     _render_stat_table(
         {
-            "Range": f"{result.distance:.2f} m",
+            "Range": _fmt_length(result.distance, imperial),
             "Efficiency": f"{result.efficiency * 100:.1f} %",
-            "Release velocity": f"{result.metrics['release_velocity']:.2f} m/s",
+            "Release velocity": _fmt_speed(result.metrics["release_velocity"], imperial),
             "Release angle": f"{result.metrics['release_angle_deg']:.1f} deg",
-            "Release height": f"{result.metrics['release_height']:.2f} m",
+            "Release height": _fmt_length(result.metrics["release_height"], imperial),
             "Time to release": f"{result.metrics['t_release']:.3f} s",
             "Flight time": f"{result.metrics.get('flight_time', 0.0):.2f} s",
             "Projectile KE at release": f"{result.metrics['ke_projectile']:.1f} J",
@@ -325,17 +460,17 @@ def _show_results(params: TrebuchetParams, result) -> None:
     st.markdown("**System**")
     _render_stat_table(
         {
-            "Counterweight mass": f"{params.counter_weight_mass:.3f} kg",
-            "Pulley radius": f"{params.pulley_radius:.4f} m",
-            "Arm length": f"{params.arm_length:.4f} m",
-            "String length": f"{params.string_length:.4f} m",
+            "Counterweight mass": _fmt_mass(params.counter_weight_mass, imperial),
+            "Pulley radius": _fmt_length(params.pulley_radius, imperial),
+            "Arm length": _fmt_length(params.arm_length, imperial),
+            "String length": _fmt_length(params.string_length, imperial),
             "Release angle": f"{math.degrees(params.release_angle):.1f} deg",
-            "Pivot height": f"{params.pivot_height:.4f} m",
+            "Pivot height": _fmt_length(params.pivot_height, imperial),
             "Initial arm angle": f"{math.degrees(params.initial_arm_angle):.1f} deg",
-            "CW rope length": f"{params.initial_cw_rope_length:.4f} m",
-            "Projectile mass": f"{params.projectile_mass:.4f} kg",
-            "Projectile radius": f"{params.projectile_radius:.4f} m",
-            "Total mass": f"{params.total_mass:.3f} kg",
+            "CW rope length": _fmt_length(params.initial_cw_rope_length, imperial),
+            "Projectile mass": _fmt_mass(params.projectile_mass, imperial),
+            "Projectile radius": _fmt_length(params.projectile_radius, imperial),
+            "Total mass": _fmt_mass(params.total_mass, imperial),
             "String/arm ratio": f"{params.string_arm_ratio:.3f}",
         }
     )
@@ -349,14 +484,16 @@ with left:
     # vertical space the inputs leave over (see the opt_log_panel CSS).
     st.subheader("Fixed system parameters", help="Always used as given - the solver won't run without them.")
     grid3, grid4 = st.columns(2)
-    pivot_height = _fixed_input(grid3, "Pivot height (m)", "pivot_height", 0.1, 5.0)
+    pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, imperial=imperial)
     initial_arm_angle_deg = _fixed_input(
-        grid4, "Initial arm angle (deg)", "initial_arm_angle", 5.0, 175.0, in_degrees=True
+        grid4, "Initial arm angle", "initial_arm_angle", 5.0, 175.0, in_degrees=True
     )
-    projectile_mass = _fixed_input(grid3, "Projectile mass (kg)", "projectile_mass", 0.001, 50.0)
-    projectile_radius = _fixed_input(grid4, "Projectile radius (m)", "projectile_radius", 0.001, 1.0)
+    projectile_mass = _fixed_input(
+        grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, kind="mass", imperial=imperial
+    )
+    projectile_radius = _fixed_input(grid4, "Projectile radius", "projectile_radius", 0.001, 1.0, imperial=imperial)
     counter_weight_rope_length = _fixed_input_optional(
-        grid3, "CW rope length (m)", "counter_weight_rope_length", 0.001, 5.0,
+        grid3, "CW rope length", "counter_weight_rope_length", 0.001, 5.0, imperial=imperial,
         help="Rope from the pivot axle to the counterweight at t=0. Leave blank to "
         "default to 2x the pulley radius (one wrap).",
     )
@@ -381,12 +518,14 @@ with left:
     )
     grid1, grid2 = st.columns(2)
     optimizable_values = dict(
-        counter_weight_mass=_optimizable_input(grid1, "Counterweight (kg)", "counter_weight_mass"),
-        pulley_radius=_optimizable_input(grid2, "Pulley radius (m)", "pulley_radius"),
-        arm_length=_optimizable_input(grid1, "Arm length (m)", "arm_length"),
-        string_length=_optimizable_input(grid2, "String length (m)", "string_length"),
+        counter_weight_mass=_optimizable_input(
+            grid1, "Counterweight", "counter_weight_mass", kind="mass", imperial=imperial
+        ),
+        pulley_radius=_optimizable_input(grid2, "Pulley radius", "pulley_radius", imperial=imperial),
+        arm_length=_optimizable_input(grid1, "Arm length", "arm_length", imperial=imperial),
+        string_length=_optimizable_input(grid2, "String length", "string_length", imperial=imperial),
     )
-    release_angle_deg = _optimizable_input(grid1, "Release angle (deg)", "release_angle", in_degrees=True)
+    release_angle_deg = _optimizable_input(grid1, "Release angle", "release_angle", in_degrees=True)
     optimizable_values["release_angle"] = math.radians(release_angle_deg) if release_angle_deg is not None else None
 
     st.subheader(
@@ -396,10 +535,21 @@ with left:
     # a third row would push the buttons/log off-screen at 1366x768.
     saved_target = _load_user_defaults().get("target", {})
     grid5, grid6, grid7 = st.columns(3)
-    target_distance = grid5.number_input(
-        "Target (m)", min_value=1.0, value=max(float(saved_target.get("target_distance", 30.0)), 1.0),
-        help="Target distance (m)",
-    )
+    target_min_m = 1.0
+    target_default_m = max(float(saved_target.get("target_distance", 30.0)), target_min_m)
+    if imperial:
+        target_distance_ft = grid5.number_input(
+            "Target (ft)",
+            min_value=target_min_m / units.METERS_PER_FOOT,
+            value=target_default_m / units.METERS_PER_FOOT,
+            help="Target distance (ft)",
+        )
+        target_distance = target_distance_ft * units.METERS_PER_FOOT
+    else:
+        target_distance = grid5.number_input(
+            "Target (m)", min_value=target_min_m, value=target_default_m,
+            help="Target distance (m)",
+        )
     efficiency_weight = grid6.number_input(
         "Eff. weight", min_value=0.0, value=max(float(saved_target.get("efficiency_weight", 5.0)), 0.0),
         help="Efficiency weight",
@@ -508,7 +658,7 @@ if optimize_clicked:
             # to the top, so this keeps the latest row visible without the user
             # having to scroll down as more generations are appended.
             rows = st.session_state.opt_log_rows
-            rows.insert(0, _log_row(generation, score, target_distance, result))
+            rows.insert(0, _log_row(generation, score, target_distance, result, imperial))
             log_placeholder.dataframe(rows, hide_index=True, width="stretch", height=OPT_LOG_HEIGHT)
 
         try:
@@ -540,6 +690,6 @@ with mid:
 with right:
     with st.container(key="results_panel", border=True):
         if st.session_state.result is not None:
-            _show_results(st.session_state.sim_params, st.session_state.result)
+            _show_results(st.session_state.sim_params, st.session_state.result, imperial)
         else:
             st.info("Results will appear here after you run a simulation.")

@@ -5,7 +5,12 @@
       "Bash(cmd /c:*)",
       "PowerShell(Get-ChildItem -Recurse src, tests, docs | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })",
       "Bash(python -c \"import streamlit as st; help\\(st.iframe\\)\")",
-      "Bash(.venv/Scripts/python -c \"import streamlit as st; print\\(st.__version__\\); help\\(st.iframe\\)\")"
+      "Bash(.venv/Scripts/python -c \"import streamlit as st; print\\(st.__version__\\); help\\(st.iframe\\)\")",
+      "Bash(.venv/Scripts/python -m py_compile src/trebuchet_sim/web/app.py src/trebuchet_sim/web/units.py)",
+      "Bash(.venv/Scripts/python -m pytest -q)",
+      "Skill(run)",
+      "Bash(command -v chromium-cli)",
+      "Bash(command -v chromium-cli.exe)"
     ],
     "deny": [],
     "ask": []
