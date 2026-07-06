@@ -45,12 +45,22 @@ jobs:
 
       # Boot the freshly built image and require the Streamlit health endpoint to
       # come up before anything is published. Catches broken CMD/deps/permissions.
+      #
+      # /app/data is bind-mounted from a host folder deliberately owned by a
+      # foreign uid (65534/nobody, never the image's uid 1000) - the same shape
+      # as a real DATA_DIR bind mount or Unraid appdata share - and the write
+      # check below confirms the entrypoint's chown-then-drop-privileges step
+      # actually made it writable, instead of only checking the image boots.
       - name: Smoke test image
         run: |
-          docker run -d --name smoke -p 8501:8501 trebuchet-smoke-test
+          mkdir -p /tmp/smoke-data
+          sudo chown 65534:65534 /tmp/smoke-data
+          docker run -d --name smoke -p 8501:8501 -v /tmp/smoke-data:/app/data trebuchet-smoke-test
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8501/_stcore/health > /dev/null 2>&1; then
               echo "Health endpoint responded"
+              docker exec smoke sh -c 'echo ok > /app/data/permission-check.tmp && rm /app/data/permission-check.tmp'
+              echo "/app/data is writable with a foreign-owned bind mount"
               docker rm -f smoke
               exit 0
             fi

@@ -27,8 +27,8 @@ RUN pip install --no-cache-dir -c /tmp/docker-constraints.txt "$(ls /tmp/wheels/
 RUN useradd --create-home --uid 1000 trebuchet \
     && mkdir -p /app/data \
     && chown trebuchet:trebuchet /app/data
+COPY docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 WORKDIR /app
-USER trebuchet
 
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_PORT=8501 \
@@ -42,4 +42,8 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)"
 
+# Container starts as root so the entrypoint can chown /app/data regardless of
+# what a bind mount brought with it, then drops to the trebuchet user before
+# running the actual command - see docker-entrypoint.py.
+ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]
 CMD ["trebuchet-web"]

@@ -82,8 +82,10 @@ volume; `docker-compose.ghcr.yml` bind-mounts a host folder chosen by
 DATA_DIR=/mnt/user/appdata/treb-sim docker compose -f docker-compose.ghcr.yml up
 ```
 
-The container runs as uid 1000, so the `DATA_DIR` folder must be writable by
-that user.
+The app itself runs as a non-root user, but the container starts as root just
+long enough to chown `/app/data` to that user before dropping privileges - so
+`DATA_DIR` can point at a host folder with any existing ownership (e.g. a
+fresh Unraid appdata share) without a manual `chown` first.
 
 `TREBUCHET_OPT_WORKERS` caps the optimizer's worker processes, but only
 applies to the scipy fallback engine — the image ships with Numba, whose
