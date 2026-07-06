@@ -322,6 +322,45 @@ _HTML_TEMPLATE = r"""
   controls2D.enabled = false;
   let is3D = true;
 
+  // ---------- Persist the user's camera view across Streamlit reruns ----------
+  // Each simulate/optimize click rebuilds this iframe from scratch (new timeline,
+  // fresh auto-fit camera), which would otherwise snap the view back to the
+  // default framing on every run. Since srcdoc iframes share the parent's origin,
+  // localStorage survives the reload, so we save the user's pan/zoom/rotate and
+  // restore it instead of the computed auto-fit once they've touched the camera.
+  const CAMERA_STORAGE_KEY = "trebuchet3d.cameraState";
+  let saveTimer = null;
+
+  function saveCameraState() {
+    try {
+      localStorage.setItem(CAMERA_STORAGE_KEY, JSON.stringify({
+        is3D,
+        cam3: { pos: camera.position.toArray(), target: controls.target.toArray(), zoom: camera.zoom },
+        cam2: {
+          pos: camera2D.position.toArray(), target: controls2D.target.toArray(), zoom: camera2D.zoom,
+          left: camera2D.left, right: camera2D.right, top: camera2D.top, bottom: camera2D.bottom,
+        },
+      }));
+    } catch (e) { /* localStorage unavailable (e.g. private browsing) - just skip persistence */ }
+  }
+
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveCameraState, 300);
+  }
+
+  function loadCameraState() {
+    try {
+      const raw = localStorage.getItem(CAMERA_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  controls.addEventListener("change", scheduleSave);
+  controls2D.addEventListener("change", scheduleSave);
+
   scene.add(new THREE.AmbientLight(0xffffff, 0.55));
   const sun = new THREE.DirectionalLight(0xfff2d9, 0.9);
   sun.position.set(-extent * 0.3, extent * 0.6, extent * 0.4);
@@ -461,6 +500,21 @@ _HTML_TEMPLATE = r"""
     controls2D.update();
   }
   fit2D();
+
+  // Re-letterbox the 2D view to a new aspect ratio without touching the user's
+  // (or restored) pan/zoom - unlike fit2D(), which recomputes the framing from
+  // scratch and would stomp on whatever view the user left it at.
+  function adjustAspect2D() {
+    const cx = (camera2D.left + camera2D.right) / 2;
+    const cy = (camera2D.top + camera2D.bottom) / 2;
+    let halfW = (camera2D.right - camera2D.left) / 2;
+    let halfH = (camera2D.top - camera2D.bottom) / 2;
+    const aspect = vw / vh;
+    if (halfW / halfH > aspect) halfH = halfW / aspect; else halfW = halfH * aspect;
+    camera2D.left = cx - halfW; camera2D.right = cx + halfW;
+    camera2D.top = cy + halfH; camera2D.bottom = cy - halfH;
+    camera2D.updateProjectionMatrix();
+  }
 
   // Ground reference line for the 2D view only: the ground plane is edge-on
   // there and rasterizes to nothing. Drawn well in front (ortho, so no
@@ -618,6 +672,7 @@ _HTML_TEMPLATE = r"""
     groundLine.visible = !is3D;
     if (!is3D) fit2D();
     renderFrame();
+    saveCameraState();
   });
 
   playPauseBtn.addEventListener("click", () => {
@@ -671,6 +726,37 @@ _HTML_TEMPLATE = r"""
     requestAnimationFrame(tick);
   }
 
+  // Restore the user's last camera view, if any, overriding the auto-fit computed
+  // above. Falls back to the auto-fit framing on first load, cleared storage, or
+  // a malformed/foreign value (e.g. a schema change) instead of crashing the IIFE
+  // and leaving the animation permanently blank.
+  try {
+    const savedCamera = loadCameraState();
+    if (savedCamera) {
+      is3D = savedCamera.is3D;
+      camera.position.fromArray(savedCamera.cam3.pos);
+      controls.target.fromArray(savedCamera.cam3.target);
+      camera.zoom = savedCamera.cam3.zoom || 1;
+      camera.updateProjectionMatrix();
+      controls.update();
+
+      camera2D.position.fromArray(savedCamera.cam2.pos);
+      controls2D.target.fromArray(savedCamera.cam2.target);
+      camera2D.zoom = savedCamera.cam2.zoom || 1;
+      camera2D.left = savedCamera.cam2.left;
+      camera2D.right = savedCamera.cam2.right;
+      camera2D.top = savedCamera.cam2.top;
+      camera2D.bottom = savedCamera.cam2.bottom;
+      camera2D.updateProjectionMatrix();
+      controls2D.update();
+
+      viewBtn.textContent = is3D ? "2D view" : "3D view";
+      controls.enabled = is3D;
+      controls2D.enabled = !is3D;
+      groundLine.visible = !is3D;
+    }
+  } catch (e) { /* malformed saved state - keep the auto-fit framing computed above */ }
+
   updateAtTime(0);
   renderFrame();
   requestAnimationFrame(tick);
@@ -679,7 +765,7 @@ _HTML_TEMPLATE = r"""
     [vw, vh] = viewportSize();
     camera.aspect = vw / vh;
     camera.updateProjectionMatrix();
-    if (!is3D) fit2D();
+    if (!is3D) adjustAspect2D();
     renderer.setSize(vw, vh);
   });
 })();
