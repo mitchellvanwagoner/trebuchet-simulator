@@ -11,6 +11,7 @@ two-per-row grids.
 import json
 import logging
 import math
+import os
 from dataclasses import fields
 from pathlib import Path
 
@@ -131,9 +132,11 @@ FIXED_PARAM_NAMES = ("pivot_height", "initial_arm_angle", "projectile_mass", "pr
 FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name in FIXED_PARAM_NAMES}
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
-# radians) like TrebuchetParams. Relative path = repo root when launched via
-# run.py / the trebuchet CLI. Git-ignored: these are per-user preferences.
-USER_DEFAULTS_FILE = Path("user_defaults.json")
+# radians) like TrebuchetParams. Directory defaults to the repo root when
+# launched via run.py / the trebuchet CLI; TREBUCHET_DATA_DIR overrides it
+# (the Docker image points it at a mountable volume). Git-ignored: these are
+# per-user preferences.
+USER_DEFAULTS_FILE = Path(os.environ.get("TREBUCHET_DATA_DIR", ".")) / "user_defaults.json"
 
 
 def _load_user_defaults() -> dict:

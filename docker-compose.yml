@@ -2,6 +2,10 @@ services:
   trebuchet-web:
     build: .
     ports:
-      - "8501:8501"
+      - "${WEBUI_PORT:-8501}:8501"
     volumes:
       - ./outputs:/app/outputs
+      - user_defaults:/app/data
+
+volumes:
+  user_defaults:

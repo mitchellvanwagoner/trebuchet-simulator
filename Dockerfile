@@ -16,13 +16,13 @@ RUN pip install --no-cache-dir -e .
 COPY run.py ./
 COPY tests ./tests
 
-# Placeholder so `user_defaults.json` exists as a file in the image; lets a
-# named volume mount directly onto it and persist saved dashboard defaults
-# across container recreations.
-RUN touch user_defaults.json
+# Saved dashboard defaults (user_defaults.json) live here; mount a volume
+# onto this directory to persist them across container recreations.
+RUN mkdir -p /app/data
 
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
-    STREAMLIT_SERVER_HEADLESS=true
+    STREAMLIT_SERVER_HEADLESS=true \
+    TREBUCHET_DATA_DIR=/app/data
 
 EXPOSE 8501
 

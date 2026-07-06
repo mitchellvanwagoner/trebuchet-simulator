@@ -62,9 +62,25 @@ To skip building locally and pull the prebuilt image published by CI instead
 docker compose -f docker-compose.ghcr.yml up
 ```
 
-This also persists the dashboard's saved parameter defaults (the 💾 button's
-`user_defaults.json`) in a named Docker volume, so they survive container
-recreation and image updates.
+To reach the UI on a different host port (e.g. if 8501 is already taken), set
+`WEBUI_PORT` — the container still listens on 8501 internally either way:
+
+```bash
+WEBUI_PORT=8080 docker compose up --build
+```
+
+Both compose files also persist the dashboard's saved parameter defaults (the
+💾 button's `user_defaults.json`) in a named Docker volume mounted at
+`/app/data`, so they survive container recreation and image updates. To point
+that at a host folder instead (e.g. an Unraid appdata share), replace the
+volume line with a bind mount onto the same directory path — no need to
+pre-create any files, since it's a directory-to-directory mount:
+
+```yaml
+volumes:
+  - ./outputs:/app/outputs
+  - /mnt/user/appdata/treb-sim:/app/data
+```
 
 ## Command line
 
