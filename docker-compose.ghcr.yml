@@ -3,10 +3,7 @@ services:
     image: ghcr.io/mitchellvanwagoner/trebuchet-simulator:latest
     pull_policy: always
     ports:
-      - "${WEBUI_PORT:-8501}:8501"
+      - "8501:8501"
     volumes:
       - ./outputs:/app/outputs
-      - user_defaults:/app/data
-
-volumes:
-  user_defaults:
+      - /mnt/user/appdata/treb-sim:/app/data
