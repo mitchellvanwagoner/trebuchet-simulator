@@ -646,20 +646,20 @@ with left:
     population_size = grid5.number_input(
         "Population",
         min_value=5,
-        max_value=500,
-        value=min(max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5), 500),
+        value=max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5),
         step=5,
-        help="Differential-evolution population per free parameter. Larger searches more "
-        "thoroughly; runtime grows proportionally.",
+        help="Differential-evolution population per free parameter. No upper cap - larger "
+        "searches more thoroughly, but runtime grows proportionally.",
     )
     absolute_tolerance = grid6.number_input(
         "Tolerance",
         min_value=0.0,
         value=max(float(saved_target.get("absolute_tolerance", OptimizationConfig.absolute_tolerance)), 0.0),
-        step=0.001,
-        format="%.4f",
+        step=0.00001,
+        format="%.8f",
         help="Convergence tolerance on the final solution: the search stops once the "
-        "population's objective spread falls below this. Smaller = more precise but slower.",
+        "population's objective spread falls below this. Smaller = more precise but slower; "
+        "0 runs until the population fully converges or another stop condition is hit.",
     )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
