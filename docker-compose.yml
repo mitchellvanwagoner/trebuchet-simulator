@@ -3,6 +3,8 @@ services:
     build: .
     ports:
       - "${WEBUI_PORT:-8501}:8501"
+    environment:
+      - TREBUCHET_OPT_WORKERS=${TREBUCHET_OPT_WORKERS:--1}
     volumes:
       - ./outputs:/app/outputs
       - user_defaults:/app/data

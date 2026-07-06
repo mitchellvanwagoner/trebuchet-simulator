@@ -82,6 +82,14 @@ volumes:
   - /mnt/user/appdata/treb-sim:/app/data
 ```
 
+To cap how many CPU cores the optimizer's differential-evolution search uses
+(scipy's `workers`; ignored when the Numba fast engine runs), set
+`TREBUCHET_OPT_WORKERS` — default `-1` uses one process per available core:
+
+```bash
+TREBUCHET_OPT_WORKERS=2 docker compose up --build
+```
+
 ## Command line
 
 ```bash

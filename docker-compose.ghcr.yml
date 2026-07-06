@@ -4,6 +4,8 @@ services:
     pull_policy: always
     ports:
       - "8501:8501"
+    environment:
+      - TREBUCHET_OPT_WORKERS=${TREBUCHET_OPT_WORKERS:--1}
     volumes:
       - ./outputs:/app/outputs
       - /mnt/user/appdata/treb-sim:/app/data

@@ -138,6 +138,15 @@ FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name i
 # per-user preferences.
 USER_DEFAULTS_FILE = Path(os.environ.get("TREBUCHET_DATA_DIR", ".")) / "user_defaults.json"
 
+# Optimizer worker processes (scipy's differential_evolution `workers`; see
+# OptimizationConfig.workers). -1 = one process per CPU core, same as the
+# dataclass default; TREBUCHET_OPT_WORKERS overrides it (e.g. to cap CPU use
+# in a resource-limited container). Ignored when the fast/Numba engine runs.
+try:
+    _OPT_WORKERS = int(os.environ.get("TREBUCHET_OPT_WORKERS", "-1"))
+except ValueError:
+    _OPT_WORKERS = -1
+
 
 def _load_user_defaults() -> dict:
     """Saved input defaults, read once per session; {} when absent/corrupt."""
@@ -486,6 +495,7 @@ if optimize_clicked:
             absolute_tolerance=absolute_tolerance,
             locked_params=locked,
             fixed_params=fixed_params_all,
+            workers=_OPT_WORKERS,
         )
         st.session_state.opt_log_rows = []
         st.session_state.opt_status = None
