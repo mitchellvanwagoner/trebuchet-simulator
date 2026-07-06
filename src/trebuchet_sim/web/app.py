@@ -236,11 +236,12 @@ def _length_pair_input(
 
     Rendered as two columns inside the caller's existing grid cell, so it keeps
     the same row height as a single metric box rather than growing the layout.
-    The feet box carries the blank/None ("free"/"use default") semantics when
-    the caller passes default_m=None; the inches box always has a numeric value
-    (default 0.0) and is only meaningful once feet is filled - this avoids an
-    ambiguous "one filled, one blank" state. Returns the combined value in
-    meters (SI), clamped into [min_value, max_value], or None if feet is blank.
+    Both boxes start blank ("free"/"use default") when the caller passes
+    default_m=None. The combined value counts as set as soon as EITHER box has
+    a value, treating the other as 0 - a user who only types into the inches
+    box (e.g. a 6" pulley radius) must not be silently ignored just because
+    they left feet untouched. Returns the combined value in meters (SI),
+    clamped into [min_value, max_value], or None if both boxes are blank.
     """
     feet_default = inches_default = None
     if default_m is not None:
@@ -257,12 +258,11 @@ def _length_pair_input(
         key=f"{key_prefix}_ft", step=1, help=help,
     )
     inches_val = sub_inches.number_input(
-        "(in)", min_value=0.0, max_value=11.99,
-        value=inches_default if inches_default is not None else 0.0,
+        "(in)", min_value=0.0, max_value=11.99, value=inches_default,
         key=f"{key_prefix}_in", step=0.1, format="%.2f",
     )
 
-    if feet_val is None:
+    if feet_val is None and inches_val is None:
         return None
     combined = max(units.feet_inches_to_meters(feet_val, inches_val), min_value)
     return min(combined, max_value) if max_value is not None else combined
@@ -315,14 +315,20 @@ def _optimizable_input(
 
     # kind == "length"
     if imperial:
-        # The feet box's key differs from the metric-mode single box, so the icon
-        # falls back to the saved value's feet component on first render, before
-        # session_state has that key - same pattern as the metric case below.
-        feet_saved = units.meters_to_feet_inches(min(max(saved, lo), hi))[0] if saved is not None else None
-        icon = "🔒" if st.session_state.get(f"opt_{name}_ft", feet_saved) is not None else "🔓"
+        # The ft/in boxes' keys differ from the metric-mode single box, so the
+        # icon falls back to the saved value's feet/inches components on first
+        # render, before session_state has those keys - same pattern as the
+        # metric case below. Locked as soon as EITHER box is set, matching
+        # _length_pair_input's own "either box counts" rule.
+        feet_saved = inches_saved = None
+        if saved is not None:
+            feet_saved, inches_saved = units.meters_to_feet_inches(min(max(saved, lo), hi))
+        feet_state = st.session_state.get(f"opt_{name}_ft", feet_saved)
+        inches_state = st.session_state.get(f"opt_{name}_in", inches_saved)
+        icon = "🔒" if (feet_state is not None or inches_state is not None) else "🔓"
         return _length_pair_input(
             container, f"{icon} {label}", f"opt_{name}", saved, lo, hi,
-            help="Leave the feet box blank to let the optimizer solve it; fill in both to lock it.",
+            help="Leave both boxes blank to let the optimizer solve it; fill in either to lock it.",
         )
 
     icon = "🔒" if st.session_state.get(f"opt_{name}", saved) is not None else "🔓"
