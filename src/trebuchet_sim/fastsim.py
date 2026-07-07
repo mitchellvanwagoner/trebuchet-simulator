@@ -13,6 +13,13 @@ duplicated here in scalar form. Keep this numerically consistent with physics.py
 trajectory.py whenever the equations of motion change - `tests/test_fastsim.py` checks
 agreement against the scipy engine across the parameter space.
 
+One deliberate divergence: physics.py simulates the sling going slack (free-flight
+projectile + inelastic re-tension snaps), while this engine keeps the rigid-sling
+model and instead reports the string/cw-rope compression impulses that the objective
+penalizes (`slack_penalty_weight`). The two models coincide exactly on trajectories
+whose ropes stay taut - which is precisely where the penalty drives the optimizer, so
+the search result is always in the regime where this engine is faithful.
+
 The integrator mirrors scipy's RK45: same Dormand-Prince tableau, same step-size
 control. Events (release angle, ground impact) are localized with a cubic Hermite
 interpolant built from the bracketing step's endpoint states/derivatives, refined by
@@ -110,14 +117,40 @@ def _trebuchet_dynamics(theta, theta_dot, alpha, alpha_dot, l_a, l_s, M11, M22, 
     return theta_dot, theta_ddot, alpha_dot, alpha_ddot
 
 
+@njit(cache=True, fastmath=True, inline="always")
+def _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot, l_a, l_s, proj_drag_k,
+              projectile_mass, counter_weight_mass, pulley_radius):
+    """Scalar port of physics.TrebuchetSimulator.constraint_tensions (theta_ddot passed in)."""
+    sin_t, cos_t = np.sin(theta), np.cos(theta)
+    sin_a, cos_a = np.sin(alpha), np.cos(alpha)
+    sin_at = sin_a * cos_t - cos_a * sin_t
+    cos_at = cos_a * cos_t + sin_a * sin_t
+
+    p_vx = -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a
+    p_vy = l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a
+    drag_scale = proj_drag_k * np.sqrt(p_vx * p_vx + p_vy * p_vy)
+
+    radial_acc = l_a * theta_ddot * sin_at - l_a * theta_dot**2 * cos_at - l_s * alpha_dot**2
+    string_tension = (
+        -projectile_mass * G * sin_a
+        - drag_scale * (p_vx * cos_a + p_vy * sin_a)
+        - projectile_mass * radial_acc
+    )
+    cw_tension = counter_weight_mass * (G + pulley_radius * theta_ddot)
+    return string_tension, cw_tension
+
+
 @njit(cache=True, fastmath=True)
 def _integrate_launch(theta0, alpha0, l_a, l_s, M11, M22, coupling, arm_drag_k, proj_drag_k,
                        cw_gravity_torque, arm_gravity_k, proj_gravity_theta_k,
-                       proj_gravity_alpha_k, joint_friction, release_angle, t_max, rtol, atol):
+                       proj_gravity_alpha_k, joint_friction, release_angle, t_max, rtol, atol,
+                       projectile_mass, counter_weight_mass, pulley_radius):
     """Integrate launch dynamics until the release-angle event fires.
 
-    Returns (released, t, theta, theta_dot, alpha, alpha_dot) - the state at release,
-    or the final state at t_max if the arm never reached the release angle.
+    Returns (released, t, theta, theta_dot, alpha, alpha_dot, string_impulse, cw_impulse):
+    the state at release (or the final state at t_max if the arm never reached the
+    release angle) plus the string/cw-rope compression impulses (trapezoid rule over
+    accepted steps, mirroring physics.TrebuchetSimulator._tension_metrics).
     """
     t = 0.0
     theta, theta_dot, alpha, alpha_dot = theta0, 0.0, alpha0, 0.0
@@ -130,9 +163,16 @@ def _integrate_launch(theta0, alpha0, l_a, l_s, M11, M22, coupling, arm_drag_k, 
     h = 1e-3
     g_prev = theta - release_angle
 
+    string_impulse = 0.0
+    cw_impulse = 0.0
+    string_T_prev, cw_T_prev = _tensions(
+        theta, theta_dot, alpha, alpha_dot, f0_2, l_a, l_s, proj_drag_k,
+        projectile_mass, counter_weight_mass, pulley_radius,
+    )
+
     for _ in range(MAX_STEPS):
         if t >= t_max:
-            return False, t, theta, theta_dot, alpha, alpha_dot
+            return False, t, theta, theta_dot, alpha, alpha_dot, string_impulse, cw_impulse
         if t + h > t_max:
             h = t_max - t
 
@@ -220,7 +260,26 @@ def _integrate_launch(theta0, alpha0, l_a, l_s, M11, M22, coupling, arm_drag_k, 
                 theta_dot_r = _hermite(theta_dot, yn_2, f0_2, k7_2, h, s)
                 alpha_r = _hermite(alpha, yn_3, f0_3, k7_3, h, s)
                 alpha_dot_r = _hermite(alpha_dot, yn_4, f0_4, k7_4, h, s)
-                return True, t + h * s, theta_r, theta_dot_r, alpha_r, alpha_dot_r
+                _, theta_ddot_r, _, _ = _trebuchet_dynamics(
+                    theta_r, theta_dot_r, alpha_r, alpha_dot_r, l_a, l_s, M11, M22, coupling,
+                    arm_drag_k, proj_drag_k, cw_gravity_torque, arm_gravity_k,
+                    proj_gravity_theta_k, proj_gravity_alpha_k, joint_friction,
+                )
+                string_T_r, cw_T_r = _tensions(
+                    theta_r, theta_dot_r, alpha_r, alpha_dot_r, theta_ddot_r, l_a, l_s,
+                    proj_drag_k, projectile_mass, counter_weight_mass, pulley_radius,
+                )
+                string_impulse += 0.5 * (max(0.0, -string_T_prev) + max(0.0, -string_T_r)) * h * s
+                cw_impulse += 0.5 * (max(0.0, -cw_T_prev) + max(0.0, -cw_T_r)) * h * s
+                return True, t + h * s, theta_r, theta_dot_r, alpha_r, alpha_dot_r, string_impulse, cw_impulse
+
+            string_T_new, cw_T_new = _tensions(
+                yn_1, yn_2, yn_3, yn_4, k7_2, l_a, l_s, proj_drag_k,
+                projectile_mass, counter_weight_mass, pulley_radius,
+            )
+            string_impulse += 0.5 * (max(0.0, -string_T_prev) + max(0.0, -string_T_new)) * h
+            cw_impulse += 0.5 * (max(0.0, -cw_T_prev) + max(0.0, -cw_T_new)) * h
+            string_T_prev, cw_T_prev = string_T_new, cw_T_new
 
             t = t + h
             theta, theta_dot, alpha, alpha_dot = yn_1, yn_2, yn_3, yn_4
@@ -233,7 +292,7 @@ def _integrate_launch(theta0, alpha0, l_a, l_s, M11, M22, coupling, arm_drag_k, 
             factor = max(MIN_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
 
-    return False, t, theta, theta_dot, alpha, alpha_dot
+    return False, t, theta, theta_dot, alpha, alpha_dot, string_impulse, cw_impulse
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -376,12 +435,14 @@ def simulate_fast(counter_weight_mass, pulley_radius, arm_length, string_length,
                    joint_friction_coefficient):
     """Scalar port of simulate_trebuchet's rtol=1e-6/dense_output=False path.
 
-    Returns (released, distance, efficiency); (False, 0.0, 0.0) if release never
-    occurs or the geometry/result is invalid (mirrors physics.py's degenerate cases).
+    Returns (released, distance, efficiency, string_impulse, cw_impulse); the last two
+    are the rope compression impulses (N*s, see physics._tension_metrics) used by the
+    objective's slack penalty. (False, 0.0, 0.0, 0.0, 0.0) if release never occurs or
+    the geometry/result is invalid (mirrors physics.py's degenerate cases).
     """
     arcsin_arg = projectile_radius / string_length
     if arcsin_arg > 1.0 or arcsin_arg < -1.0:
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, 0.0, 0.0
 
     (M11, M22, coupling, arm_drag_k, proj_drag_k, cw_gravity_torque, arm_gravity_k,
      proj_gravity_theta_k, proj_gravity_alpha_k, arm_mass, _pulley_mass, projectile_area) = _machine_constants(
@@ -392,13 +453,14 @@ def simulate_fast(counter_weight_mass, pulley_radius, arm_length, string_length,
     theta0 = initial_arm_angle
     alpha0 = theta0 + np.pi - np.arcsin(arcsin_arg)
 
-    released, _t_rel, theta_r, theta_dot_r, alpha_r, alpha_dot_r = _integrate_launch(
+    released, _t_rel, theta_r, theta_dot_r, alpha_r, alpha_dot_r, string_impulse, cw_impulse = _integrate_launch(
         theta0, alpha0, arm_length, string_length, M11, M22, coupling, arm_drag_k, proj_drag_k,
         cw_gravity_torque, arm_gravity_k, proj_gravity_theta_k, proj_gravity_alpha_k,
         joint_friction_coefficient, release_angle, 10.0, 1e-6, 1e-6,
+        projectile_mass, counter_weight_mass, pulley_radius,
     )
     if not released:
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, string_impulse, cw_impulse
 
     x0 = arm_length * np.cos(theta_r) + string_length * np.cos(alpha_r)
     y0 = arm_length * np.sin(theta_r) + string_length * np.sin(alpha_r) + pivot_height
@@ -406,7 +468,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, arm_length, string_length,
     vy0 = arm_length * theta_dot_r * np.cos(theta_r) + string_length * alpha_dot_r * np.cos(alpha_r)
 
     if np.isnan(x0) or np.isnan(y0) or np.isnan(vx0) or np.isnan(vy0):
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, string_impulse, cw_impulse
 
     proj_speed2 = vx0 * vx0 + vy0 * vy0
     proj_KE = 0.5 * projectile_mass * proj_speed2
@@ -432,19 +494,20 @@ def simulate_fast(counter_weight_mass, pulley_radius, arm_length, string_length,
     efficiency = proj_KE / total_PE_spent if total_PE_spent > 0.0 else 0.0
     efficiency = max(0.0, efficiency)
 
-    return True, distance, efficiency
+    return True, distance, efficiency, string_impulse, cw_impulse
 
 
 @njit(cache=True, fastmath=True)
 def _score(counter_weight_mass, pulley_radius, arm_length, string_length, release_angle,
            pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
            initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
-           joint_friction_coefficient, target_distance, efficiency_weight, distance_weight, mass_weight):
+           joint_friction_coefficient, target_distance, efficiency_weight, distance_weight, mass_weight,
+           slack_penalty_weight):
     """Scalar port of optimization._objective's cost formula for one individual."""
     if string_length > 0.95 * arm_length:
         return INVALID_COST
 
-    released, distance, efficiency = simulate_fast(
+    released, distance, efficiency, string_impulse, cw_impulse = simulate_fast(
         counter_weight_mass, pulley_radius, arm_length, string_length, release_angle,
         pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
         initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient, joint_friction_coefficient,
@@ -459,8 +522,12 @@ def _score(counter_weight_mass, pulley_radius, arm_length, string_length, releas
     efficiency_cost = -efficiency * 100.0
     distance_cost = abs(distance - target_distance) / target_distance * 100.0
     mass_cost = (total_mass / 30.0) * 100.0
+    slack_cost = slack_penalty_weight * (string_impulse + cw_impulse)
 
-    return efficiency_weight * efficiency_cost + distance_weight * distance_cost + mass_weight * mass_cost
+    return (
+        efficiency_weight * efficiency_cost + distance_weight * distance_cost
+        + mass_weight * mass_cost + slack_cost
+    )
 
 
 @njit(cache=True, fastmath=True, parallel=True)
@@ -468,7 +535,7 @@ def evaluate_population(counter_weight_mass, pulley_radius, arm_length, string_l
                          pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
                          initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
                          joint_friction_coefficient, target_distance, efficiency_weight,
-                         distance_weight, mass_weight):
+                         distance_weight, mass_weight, slack_penalty_weight):
     """Cost for an entire DE population in one call. The five optimizable-param args
     are arrays of shape (S,); everything else is a scalar shared across individuals."""
     n = counter_weight_mass.shape[0]
@@ -478,6 +545,6 @@ def evaluate_population(counter_weight_mass, pulley_radius, arm_length, string_l
             counter_weight_mass[i], pulley_radius[i], arm_length[i], string_length[i], release_angle[i],
             pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
             initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient, joint_friction_coefficient,
-            target_distance, efficiency_weight, distance_weight, mass_weight,
+            target_distance, efficiency_weight, distance_weight, mass_weight, slack_penalty_weight,
         )
     return costs

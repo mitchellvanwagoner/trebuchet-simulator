@@ -61,6 +61,22 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
     print(f"  Counterweight PE: {result.metrics['pe_spent']:.1f} J")
     print(f"  Total PE spent: {result.metrics['total_pe_spent']:.1f} J")
 
+    if "min_string_tension" in result.metrics:
+        print(f"  Min sling tension: {result.metrics['min_string_tension']:.1f} N")
+        snap_energy = result.metrics.get("sling_snap_energy", 0.0)
+        if result.metrics.get("string_slack_fraction", 0.0) > 1e-3 or snap_energy > 1e-3:
+            print(
+                f"  [WARNING] Sling goes slack for {result.metrics['string_slack_fraction'] * 100:.0f}% "
+                f"of the launch and snaps taut {result.metrics.get('sling_snap_count', 0)} time(s), "
+                f"dissipating {snap_energy:.1f} J."
+            )
+        # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
+        if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
+            print(
+                f"  [WARNING] Counterweight rope goes slack (min tension "
+                f"{result.metrics['min_cw_rope_tension']:.1f} N) - results are not physical."
+            )
+
     if "energy_analysis" in result.metrics:
         analysis = result.metrics["energy_analysis"]
         print("\nEnergy Conservation:")

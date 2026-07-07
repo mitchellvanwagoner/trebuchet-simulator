@@ -34,12 +34,7 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
     simulator = TrebuchetSimulator(params)
     release_occurred = bool(result.metrics.get("release_occurred", True))
 
-    if sol.t_events[0].size > 0:
-        t_release = float(sol.t_events[0][0])
-        y_release = sol.y_events[0][0]
-    else:
-        t_release = float(result.metrics.get("simulation_time", sol.t[-1]))
-        y_release = sol.y[:, -1]
+    t_release = float(sol.t_release) if sol.release_occurred else float(sol.t_end)
 
     t_launch = np.linspace(0, t_release, LAUNCH_SAMPLES) if t_release > 0 else np.array([0.0])
 
@@ -64,8 +59,8 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
         # Reuse the flight already integrated by the simulation; only re-integrate if it's
         # missing (e.g. a result deserialized without it).
         trajectory = result.trajectory
-        if trajectory is None:
-            (x0, y0), (vx0, vy0) = simulator.projectile_position_velocity(y_release)
+        if trajectory is None and sol.release_projectile_state is not None:
+            (x0, y0), (vx0, vy0) = sol.release_projectile_state
             if y0 >= 0 and not (np.isnan(vx0) or np.isnan(vy0)):
                 trajectory = integrate_ballistic_trajectory(
                     x0,

@@ -10,13 +10,16 @@ RHO_AIR = 1.225                 # air density at sea level (kg/m^3)
 ARM_CROSS_SECTION_WIDTH = 0.05  # arm cross-section width, used for mass and drag (m)
 
 # Canonical defaults for the five optimizable parameters, shared by the CLI,
-# the web UI, and the tests so they can't drift apart.
+# the web UI, and the tests so they can't drift apart. Optimizer output for the
+# 30 m target with the rope-slack penalty active: the sling stays taut for the
+# whole launch (min tension ~5 N), so the rigid-link model - and the ~91%
+# efficiency it reports - is physically valid for this set.
 DEFAULT_OPTIMIZABLE_PARAMS = {
-    "counter_weight_mass": 16.865,  # kg
-    "pulley_radius": 0.121,         # m
-    "arm_length": 0.813,            # m
-    "string_length": 0.669,         # m
-    "release_angle": -4.877,        # radians
+    "counter_weight_mass": 54.989,  # kg
+    "pulley_radius": 0.0173,        # m
+    "arm_length": 0.406,            # m
+    "string_length": 0.235,         # m
+    "release_angle": -4.228,        # radians
 }
 
 

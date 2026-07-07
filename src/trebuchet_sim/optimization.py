@@ -52,6 +52,13 @@ class OptimizationConfig:
     efficiency_weight: float = 5.0
     distance_weight: float = 1.0
     mass_weight: float = 0.15
+    # Cost per N*s of rope "compression impulse". The fast engine keeps the rigid-link
+    # sling model, which can push where a real rope would go slack and lose energy in
+    # re-tensioning snaps; penalizing the impulse steers the search to always-taut
+    # solutions, where the rigid model matches physics.py's slack/snap model exactly.
+    # (The scipy fallback objective simulates the snaps for real, so there the sling
+    # loss shows up directly in efficiency and only the cw-rope impulse is penalized.)
+    slack_penalty_weight: float = 200.0
     locked_params: Dict[str, float] = field(default_factory=dict)
     fixed_params: Dict[str, float] = field(default_factory=dict)
     seed: int = 572956
@@ -122,11 +129,16 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
     mass_cost = (params.total_mass / 30.0) * 100
+    slack_cost = config.slack_penalty_weight * (
+        result.metrics.get("string_compression_impulse", 0.0)
+        + result.metrics.get("cw_rope_compression_impulse", 0.0)
+    )
 
     return (
         config.efficiency_weight * efficiency_cost
         + config.distance_weight * distance_cost
         + config.mass_weight * mass_cost
+        + slack_cost
     )
 
 
@@ -157,6 +169,7 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
         fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
         config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
+        config.slack_penalty_weight,
     )
 
 

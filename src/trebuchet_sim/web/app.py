@@ -496,6 +496,25 @@ def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
         )
         return
 
+    snap_energy = result.metrics.get("sling_snap_energy", 0.0)
+    slack_fraction = result.metrics.get("string_slack_fraction", 0.0)
+    if slack_fraction > 1e-3 or snap_energy > 1e-3:
+        total_pe = result.metrics.get("total_pe_spent", 0.0)
+        loss_share = f" ({snap_energy / total_pe * 100:.0f}% of the PE spent)" if total_pe > 0 else ""
+        st.warning(
+            f"Sling goes slack for {slack_fraction * 100:.0f}% of the launch: the projectile "
+            f"flies detached and snaps taut {result.metrics.get('sling_snap_count', 0)} time(s), "
+            f"dissipating {snap_energy:.1f} J{loss_share}. The simulated flight is physical, "
+            "but a smoother geometry would keep that energy."
+        )
+    # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
+    if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
+        st.warning(
+            f"Counterweight rope goes slack (min tension "
+            f"{result.metrics.get('min_cw_rope_tension', 0.0):.1f} N): the arm out-accelerates the "
+            "falling counterweight, so the results are not physical."
+        )
+
     st.markdown("**Solution**")
     _render_stat_table(
         {
@@ -508,6 +527,7 @@ def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
             "Flight time": f"{result.metrics.get('flight_time', 0.0):.2f} s",
             "Projectile KE at release": f"{result.metrics['ke_projectile']:.1f} J",
             "Total PE spent": f"{result.metrics['total_pe_spent']:.1f} J",
+            "Min sling tension": f"{result.metrics.get('min_string_tension', float('nan')):.1f} N",
         }
     )
 

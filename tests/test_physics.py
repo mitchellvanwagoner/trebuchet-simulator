@@ -41,6 +41,94 @@ def test_string_length_ratio_derived_property():
     assert params.string_arm_ratio == 0.5
 
 
+# A parameter set (found by random search, seed 3 over PARAM_BOUNDS) whose launch keeps
+# both the sling and the counterweight rope taut throughout - the rigid-link model is
+# physically valid for it, so its compression impulses must be exactly zero.
+ALWAYS_TAUT_PARAMS = {
+    "counter_weight_mass": 31.382616,
+    "pulley_radius": 0.154871,
+    "arm_length": 1.776223,
+    "string_length": 0.800749,
+    "release_angle": -3.388988,
+}
+
+
+def test_tension_metrics_are_zero_impulse_for_an_always_taut_launch():
+    result = simulate_trebuchet(TrebuchetParams(**ALWAYS_TAUT_PARAMS))
+
+    assert result.metrics["release_occurred"] is True
+    assert result.metrics["min_string_tension"] > 0
+    assert result.metrics["min_cw_rope_tension"] > 0
+    assert result.metrics["string_compression_impulse"] == 0.0
+    assert result.metrics["cw_rope_compression_impulse"] == 0.0
+    assert result.metrics["string_slack_fraction"] == 0.0
+
+
+# A jerky parameter set (the pre-slack-penalty optimizer defaults): the rigid-link
+# model holds the sling in compression for ~half the launch, which a rope cannot do.
+JERKY_SLING_PARAMS = {
+    "counter_weight_mass": 16.865,
+    "pulley_radius": 0.121,
+    "arm_length": 0.813,
+    "string_length": 0.669,
+    "release_angle": -4.877,
+}
+
+
+def test_tension_metrics_flag_a_slack_sling_launch():
+    result = simulate_trebuchet(TrebuchetParams(**JERKY_SLING_PARAMS))
+
+    assert result.metrics["min_string_tension"] < 0
+    assert result.metrics["string_compression_impulse"] > 0.1
+    assert 0 < result.metrics["string_slack_fraction"] < 1
+
+
+def test_constraint_tensions_satisfy_newtons_law_for_the_projectile():
+    import numpy as np
+
+    from trebuchet_sim.config import G, RHO_AIR
+    from trebuchet_sim.physics import TrebuchetSimulator
+
+    # The string is a two-force member: m_p * a must equal gravity + drag plus a force
+    # of magnitude -T purely along the string. Reconstruct that force from the solved
+    # generalized accelerations and check it against constraint_tensions at several
+    # points of a real launch (one that includes a slack/compression phase).
+    params = TrebuchetParams(**JERKY_SLING_PARAMS)
+    sim = TrebuchetSimulator(params)
+    sol = simulate_trebuchet(params).solution
+    m_p, l_a, l_s = params.projectile_mass, params.arm_length, params.string_length
+    drag_k = 0.5 * RHO_AIR * params.projectile_drag_coefficient * params.projectile_area
+
+    for t in np.linspace(0.0, sol.t[-1], 9):
+        y = sol.sol(float(t))
+        theta, theta_dot, alpha, alpha_dot = (float(v) for v in y)
+        _, theta_ddot, _, alpha_ddot = sim.trebuchet_dynamics(float(t), y)
+
+        ax = -l_a * (theta_ddot * math.sin(theta) + theta_dot**2 * math.cos(theta)) - l_s * (
+            alpha_ddot * math.sin(alpha) + alpha_dot**2 * math.cos(alpha)
+        )
+        ay = l_a * (theta_ddot * math.cos(theta) - theta_dot**2 * math.sin(theta)) + l_s * (
+            alpha_ddot * math.cos(alpha) - alpha_dot**2 * math.sin(alpha)
+        )
+
+        _, (vx, vy) = sim.projectile_position_velocity(y)
+        speed = math.hypot(vx, vy)
+        string_fx = m_p * ax - (-drag_k * speed * vx)
+        string_fy = m_p * ay - (-drag_k * speed * vy - m_p * G)
+
+        expected_tension = -(string_fx * math.cos(alpha) + string_fy * math.sin(alpha))
+        tangential = -string_fx * math.sin(alpha) + string_fy * math.cos(alpha)
+
+        string_tension, cw_tension = sim.constraint_tensions(float(t), y)
+
+        scale = max(1.0, abs(expected_tension))
+        assert abs(tangential) < 1e-8 * scale  # string force is purely radial
+        assert string_tension == pytest.approx(expected_tension, rel=1e-9, abs=1e-9)
+        assert cw_tension == pytest.approx(
+            params.counter_weight_mass * (G + params.pulley_radius * theta_ddot)
+        )
+
+
 def test_release_velocity_is_true_speed_not_speed_squared():
     result = simulate_trebuchet(default_params())
 

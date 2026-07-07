@@ -34,11 +34,15 @@ def _simulate_fast(values):
 def test_fast_engine_matches_scipy_engine_for_default_params():
     ref = simulate_trebuchet(TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS), rtol=1e-6, dense_output=False)
 
-    released, distance, efficiency = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
+    released, distance, efficiency, string_impulse, cw_impulse = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
 
     assert released is True
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
+    # The impulses come from trapezoid sums over each engine's own accepted steps, so
+    # they agree only to the ~0.05 N*s noise floor (see the parameter-grid test below).
+    assert string_impulse == pytest.approx(ref.metrics["string_compression_impulse"], rel=3e-1, abs=5e-2)
+    assert cw_impulse == pytest.approx(ref.metrics["cw_rope_compression_impulse"], rel=3e-1, abs=5e-2)
 
 
 def test_fast_engine_matches_scipy_engine_across_random_parameter_grid():
@@ -53,7 +57,7 @@ def test_fast_engine_matches_scipy_engine_across_random_parameter_grid():
 
         ref = simulate_trebuchet(params, rtol=1e-6, dense_output=False)
         ref_released = ref.metrics.get("release_occurred", False)
-        released, distance, efficiency = _simulate_fast(values)
+        released, distance, efficiency, string_impulse, cw_impulse = _simulate_fast(values)
 
         assert released == ref_released, values
 
@@ -61,6 +65,16 @@ def test_fast_engine_matches_scipy_engine_across_random_parameter_grid():
             tested += 1
             assert distance == pytest.approx(ref.distance, rel=1e-2), values
             assert efficiency == pytest.approx(ref.efficiency, rel=1e-2), values
+            # max(0, -T) has kinks at the tension zero-crossings, so trapezoid sums
+            # over the two engines' different step grids agree only loosely when the
+            # impulse itself is small; genuinely jerky launches measure 1-7 N*s, so
+            # sub-0.05 N*s disagreement is noise the penalty weight can't resolve.
+            assert string_impulse == pytest.approx(
+                ref.metrics["string_compression_impulse"], rel=3e-1, abs=5e-2
+            ), values
+            assert cw_impulse == pytest.approx(
+                ref.metrics["cw_rope_compression_impulse"], rel=3e-1, abs=5e-2
+            ), values
 
     assert tested > 50  # sanity check the grid actually exercised the release path
 
@@ -75,7 +89,7 @@ def test_fast_engine_reports_no_release_for_geometry_that_never_releases():
     )
     assert ref.metrics.get("release_occurred") is False  # sanity-check the fixture against the reference engine
 
-    released, distance, efficiency = fastsim.simulate_fast(
+    released, distance, efficiency, _string_impulse, _cw_impulse = fastsim.simulate_fast(
         values["counter_weight_mass"], values["pulley_radius"], values["arm_length"],
         values["string_length"], values["release_angle"],
         FIXED["pivot_height"], FIXED["pulley_density"], FIXED["arm_density"],
@@ -98,7 +112,7 @@ def test_evaluate_population_matches_per_individual_score():
         pop["release_angle"], FIXED["pivot_height"], FIXED["pulley_density"], FIXED["arm_density"],
         FIXED["projectile_mass"], FIXED["projectile_radius"], FIXED["initial_arm_angle"],
         FIXED["arm_drag_coefficient"], FIXED["projectile_drag_coefficient"], FIXED["joint_friction_coefficient"],
-        30.0, 5.0, 1.0, 0.15,
+        30.0, 5.0, 1.0, 0.15, 200.0,
     )
 
     for i in range(s):
@@ -108,6 +122,6 @@ def test_evaluate_population_matches_per_individual_score():
             FIXED["pivot_height"], FIXED["pulley_density"], FIXED["arm_density"],
             FIXED["projectile_mass"], FIXED["projectile_radius"], FIXED["initial_arm_angle"],
             FIXED["arm_drag_coefficient"], FIXED["projectile_drag_coefficient"], FIXED["joint_friction_coefficient"],
-            30.0, 5.0, 1.0, 0.15,
+            30.0, 5.0, 1.0, 0.15, 200.0,
         )
         assert costs[i] == pytest.approx(expected)
