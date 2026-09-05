@@ -22,7 +22,8 @@ a lock toggle — lock it to pin the parameter to the value in its box, leave it
 unlocked to let the optimizer search it (an unlocked box's contents are
 ignored). Locked rows are tinted so the search space is readable at a glance. A
 live 3D animation and energy plot sit in the middle, and the range, efficiency,
-release conditions, and resolved machine geometry on the right. The animation
+release conditions, and resolved machine geometry on the right. A selector at
+the top picks the counterweight linkage — pulley or traditional. The animation
 traces the projectile's path and can switch between the 3D isometric view and a
 flat 2D side view. A units toggle switches the whole dashboard between metric
 and ft/in/lb:
@@ -98,6 +99,27 @@ fresh Unraid appdata share) without a manual `chown` first.
 applies to the scipy fallback engine — the image ships with Numba, whose
 vectorized engine ignores it.
 
+## Machine types
+
+Two counterweight linkages, sharing one set of equations of motion:
+
+- **Pulley** — the counterweight hangs from a rope over a pulley on the pivot
+  axle and drops straight down, so its lever arm is the constant
+  `pulley_radius`. The arm is a single beam from the pivot to the sling.
+- **Traditional** — the counterweight is bolted to the arm's short end,
+  `length_counterweight` behind the pivot, so it swings around with the arm and
+  on its own pin as well. The beam carries mass on both sides of the pivot.
+
+That one difference propagates: each machine has its own cocked arm angle, its
+own default geometry, and its own linkage parameter in the optimizer's search
+space (`pulley_radius` or `length_counterweight` — never both). Pick the
+machine with the selector above the dashboard's parameters, or with `--machine`
+on either CLI command; switching reloads that machine's defaults, because the
+numbers don't carry across.
+
+The Numba fast engine models the pulley machine only, so optimizing a
+traditional machine falls back to the SciPy objective — correct, just slower.
+
 ## Command line
 
 ```bash
@@ -109,6 +131,10 @@ trebuchet simulate --save-gif launch.gif --save-energy-plot energy.png
 
 # Search for parameters that hit a target distance efficiently
 trebuchet optimize --target-distance 30 --lock counter_weight_mass=14
+
+# Either machine, on both commands (see "Machine types" below)
+trebuchet simulate --machine traditional --counterweight-mass 80
+trebuchet optimize --machine traditional --target-distance 60 --lock length_counterweight=0.4
 
 python -m trebuchet_sim.cli simulate --help
 python -m trebuchet_sim.cli optimize --help

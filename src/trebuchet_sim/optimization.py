@@ -11,7 +11,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.optimize import differential_evolution
 
-from trebuchet_sim.config import DEFAULT_INITIAL_ARM_ANGLE, MachineType, TrebuchetParams
+from trebuchet_sim.config import (
+    DEFAULT_INITIAL_ARM_ANGLE,
+    LINKAGE_PARAM,
+    MachineType,
+    TrebuchetParams,
+)
 from trebuchet_sim.physics import SimulationResult, simulate_trebuchet
 
 try:
@@ -22,6 +27,20 @@ except Exception:
     _FASTSIM_AVAILABLE = False
 
 PARAM_NAMES = ["counter_weight_mass", "pulley_radius", "arm_length", "string_length", "release_angle"]
+
+
+def param_names(machine: MachineType = MachineType.PULLEY) -> List[str]:
+    """The five design variables for one machine, in display order.
+
+    Four are shared; the linkage slot holds whichever parameter sizes that machine's
+    counterweight coupling (config.LINKAGE_PARAM). The list is always five long, so the
+    search space has the same shape either way - only its second entry changes.
+
+    PARAM_NAMES stays the pulley list: it is what the module-level constants
+    (PARAM_BOUNDS keys, the fastsim call signature) are written against.
+    """
+    return [LINKAGE_PARAM[MachineType(machine)] if name == "pulley_radius" else name for name in PARAM_NAMES]
+
 
 # Non-optimizable TrebuchetParams fields the fast engine needs but that never appear
 # in PARAM_NAMES; a run either uses the dataclass default or an OptimizationConfig
@@ -41,6 +60,10 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     "arm_length": (0.1, 2.5),              # m
     "string_length": (0.1, 2.5),           # m
     "release_angle": (np.radians(-290), np.radians(-180)),  # rad (-290 to -180 deg)
+    # Traditional machine only, in the linkage slot where pulley_radius sits otherwise.
+    # Capped well under the arm-length bound: a short arm approaching the long one is a
+    # balanced beam that throws nothing.
+    "length_counterweight": (0.05, 1.0),   # m
 }
 
 
@@ -59,6 +82,10 @@ class OptimizationConfig:
     # (The scipy fallback objective simulates the snaps for real, so there the sling
     # loss shows up directly in efficiency and only the cw-rope impulse is penalized.)
     slack_penalty_weight: float = 200.0
+    # Which counterweight linkage to design for. It decides the search space (see
+    # param_names) rather than being searched itself, so it is a field of its own
+    # instead of a fixed_params entry.
+    machine: MachineType = MachineType.PULLEY
     locked_params: Dict[str, float] = field(default_factory=dict)
     fixed_params: Dict[str, float] = field(default_factory=dict)
     seed: int = 572956
@@ -72,9 +99,20 @@ class OptimizationConfig:
     use_fast_engine: bool = True          # Numba-vectorized objective when available; falls back to scipy otherwise
 
     def __post_init__(self):
-        unknown = set(self.locked_params) - set(PARAM_NAMES)
+        # Accept a plain string, so a machine read back from saved JSON works unchanged.
+        self.machine = MachineType(self.machine)
+
+        names = self.param_names
+        unknown = set(self.locked_params) - set(names)
         if unknown:
-            raise ValueError(f"Unknown parameter(s): {unknown}. Available: {PARAM_NAMES}")
+            # Naming the machine matters here: the linkage parameter is the one that
+            # differs, so "pulley_radius is unknown" is otherwise a baffling message.
+            raise ValueError(
+                f"Unknown parameter(s) for the {self.machine.value} machine: {unknown}. Available: {names}"
+            )
+
+        if "machine" in self.fixed_params:
+            raise ValueError("Set the machine with OptimizationConfig(machine=...), not via fixed_params.")
 
         valid_fields = {f.name for f in fields(TrebuchetParams)}
         unknown_fixed = set(self.fixed_params) - valid_fields
@@ -83,13 +121,18 @@ class OptimizationConfig:
 
         # Search-space params must go through locked_params; a fixed_params entry for one
         # would be silently overwritten by optimizer values in build_params.
-        overlap = set(self.fixed_params) & set(PARAM_NAMES)
+        overlap = set(self.fixed_params) & set(names)
         if overlap:
             raise ValueError(f"Parameter(s) {overlap} are optimizable; use locked_params to pin them, not fixed_params.")
 
     @property
+    def param_names(self) -> List[str]:
+        """This machine's five design variables (see the module-level param_names)."""
+        return param_names(self.machine)
+
+    @property
     def free_params(self) -> List[str]:
-        return [name for name in PARAM_NAMES if name not in self.locked_params]
+        return [name for name in self.param_names if name not in self.locked_params]
 
     @property
     def bounds(self) -> List[Tuple[float, float]]:
@@ -105,7 +148,7 @@ class OptimizationConfig:
         values = dict(self.fixed_params)
         values.update(self.locked_params)
         values.update(zip(self.free_params, free_values))
-        return TrebuchetParams(**values)
+        return TrebuchetParams(machine=self.machine, **values)
 
 
 def _objective(free_values: Sequence[float], config: OptimizationConfig) -> float:
@@ -209,8 +252,7 @@ def optimize_trebuchet(
     # the scipy objective, which builds a real TrebuchetParams and honours `machine`.
     # Left unguarded, the search would score every candidate as a pulley machine and
     # then report a traditional simulation of the winner: a silently wrong optimum.
-    machine = MachineType(config.fixed_params.get("machine", MachineType.PULLEY))
-    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE and machine is MachineType.PULLEY
+    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE and config.machine is MachineType.PULLEY
     if use_fast:
         de_result = differential_evolution(
             partial(_objective_vectorized, config=config),

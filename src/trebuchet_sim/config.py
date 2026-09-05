@@ -81,6 +81,35 @@ DEFAULT_TRADITIONAL_FIXED = {
 }
 
 
+# The one design variable that has no counterpart on the other machine: the pulley's
+# radius sets how far the weight falls per radian of arm rotation, while the traditional
+# machine's short arm sets how far the weight sits from the pivot. Both are "the size of
+# the counterweight linkage", both are worth optimizing, and neither means anything on
+# the other machine - so the search space swaps one for the other (see
+# optimization.param_names).
+LINKAGE_PARAM = {
+    MachineType.PULLEY: "pulley_radius",
+    MachineType.TRADITIONAL: "length_counterweight",
+}
+
+# Starting point for each machine's design variables, keyed the way the CLI and the web
+# UI both want them. Selecting a machine loads its set: the two are different enough
+# that carrying numbers across (a 0.4 m arm onto a 50 kg counterweight, say) would
+# simulate a machine nobody asked for.
+DEFAULT_MACHINE_PARAMS = {
+    MachineType.PULLEY: DEFAULT_OPTIMIZABLE_PARAMS,
+    MachineType.TRADITIONAL: DEFAULT_TRADITIONAL_PARAMS,
+}
+
+# Per-machine overrides for the never-optimized fields. Only the differences are listed;
+# anything absent falls back to the TrebuchetParams default, so there is one place to
+# change a value that both machines share.
+DEFAULT_MACHINE_FIXED = {
+    MachineType.PULLEY: {},
+    MachineType.TRADITIONAL: DEFAULT_TRADITIONAL_FIXED,
+}
+
+
 @dataclass
 class TrebuchetParams:
     """Trebuchet configuration parameters."""

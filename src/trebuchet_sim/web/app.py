@@ -30,11 +30,18 @@ from trebuchet_sim.web import theme, units
 from trebuchet_sim.web.animation3d import build_trebuchet_3d_html, render_trebuchet_3d_html
 from trebuchet_sim.config import (
     DEFAULT_INITIAL_ARM_ANGLE,
-    DEFAULT_OPTIMIZABLE_PARAMS,
+    DEFAULT_MACHINE_FIXED,
+    DEFAULT_MACHINE_PARAMS,
+    LINKAGE_PARAM,
     MachineType,
     TrebuchetParams,
 )
-from trebuchet_sim.optimization import PARAM_BOUNDS, PARAM_NAMES, OptimizationConfig, optimize_trebuchet
+from trebuchet_sim.optimization import (
+    PARAM_BOUNDS,
+    OptimizationConfig,
+    optimize_trebuchet,
+    param_names,
+)
 from trebuchet_sim.physics import simulate_trebuchet
 from trebuchet_sim.visualization import build_energy_figure
 
@@ -56,8 +63,14 @@ imperial = unit_col.toggle(
 )
 
 # Widget keys whose stored value is a mass, and so means a different number in
-# each unit system (see _sync_mass_units).
-MASS_INPUT_KEYS = ("opt_counter_weight_mass", "fixed_projectile_mass")
+# each unit system (see _sync_mass_units). Both machines' boxes are listed: only one
+# machine is on screen at a time, but the other's stored value has to stay in the
+# system it will be read back in.
+MASS_INPUT_KEYS = tuple(
+    f"{prefix}_{machine.value}"
+    for prefix in ("opt_counter_weight_mass", "fixed_projectile_mass")
+    for machine in MachineType
+)
 
 
 def _sync_mass_units(imperial: bool) -> None:
@@ -94,16 +107,37 @@ ANIMATION_HEIGHT = 440
 # Fixed system params: required, always used as given, never handed to the optimizer.
 # Defaults come straight from the TrebuchetParams dataclass so they can't drift.
 FIXED_PARAM_NAMES = ("pivot_height", "initial_arm_angle", "projectile_mass", "projectile_radius")
-FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name in FIXED_PARAM_NAMES}
-# initial_arm_angle is the exception: its dataclass default is None, because the
-# cocked position depends on the machine and only resolves in __post_init__ (see
-# config.DEFAULT_INITIAL_ARM_ANGLE). The dashboard builds a pulley machine, so
-# seed the box with that machine's start angle. It has to be a real number: with
-# no default the input renders blank, every run reports "fixed parameters are
-# required", and dropping the key instead makes the lookup below raise outright.
-# Only a saved user_defaults.json hides that, so it shows up first on a fresh
-# install - an empty TREBUCHET_DATA_DIR, i.e. a newly created container volume.
-FIXED_DEFAULTS["initial_arm_angle"] = float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY])
+_DATACLASS_FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name in FIXED_PARAM_NAMES}
+
+
+def _fixed_defaults(machine: MachineType) -> dict:
+    """Defaults for the fixed system parameters, for one machine.
+
+    Dataclass defaults, overlaid with whatever this machine needs different (a
+    traditional machine wants a much taller pivot, so its cocked tip clears the
+    ground by a sling length).
+
+    initial_arm_angle needs the explicit fill-in: its dataclass default is None
+    because the cocked position only resolves per machine in __post_init__, and a
+    box with no default renders blank, which the solver reads as "not ready". A
+    saved user_defaults.json used to hide that, so it showed up first on a fresh
+    install - an empty TREBUCHET_DATA_DIR, i.e. a newly created container volume.
+    """
+    defaults = dict(_DATACLASS_FIXED_DEFAULTS)
+    defaults["initial_arm_angle"] = float(DEFAULT_INITIAL_ARM_ANGLE[machine])
+    defaults.update(
+        {name: value for name, value in DEFAULT_MACHINE_FIXED[machine].items() if name in FIXED_PARAM_NAMES}
+    )
+    return defaults
+
+
+# The cocked arm sits on opposite sides of vertical on the two machines - the pulley
+# arm starts raised behind the pivot, the traditional one nose-down in front of it - so
+# one signed range cannot serve both without also admitting the poses that don't throw.
+INITIAL_ARM_ANGLE_BOUNDS = {
+    MachineType.PULLEY: (math.radians(5.0), math.radians(175.0)),
+    MachineType.TRADITIONAL: (math.radians(-175.0), math.radians(-5.0)),
+}
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
 # radians) like TrebuchetParams. TREBUCHET_DATA_DIR picks the directory:
@@ -133,18 +167,49 @@ def _load_user_defaults() -> dict:
     return st.session_state.user_defaults
 
 
-def _save_user_defaults(optimizable: dict, fixed: dict, target: dict) -> None:
+def _save_user_defaults(machine: MachineType, optimizable: dict, fixed: dict, target: dict) -> None:
     """Persist the current inputs.
 
     `optimizable` maps each name to {"value": <SI float>, "locked": <bool>} -
     the box's raw content and the lock toggle's own state are saved
     separately (see _optimizable_input) so switching the toggle off and back
     on later restores the last value instead of resetting it.
+
+    The machine is saved with them, and the values only apply back to that machine
+    (see _saved_for). A 0.4 m arm is a good pulley machine and a useless traditional
+    one, so restoring one set onto the other would just look like a broken default.
     """
-    defaults = {"optimizable": optimizable, "fixed": fixed, "target": target}
+    defaults = {"machine": machine.value, "optimizable": optimizable, "fixed": fixed, "target": target}
     USER_DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_DEFAULTS_FILE.write_text(json.dumps(defaults, indent=2))
     st.session_state.user_defaults = defaults
+
+
+def _saved_machine() -> MachineType:
+    """The machine the saved defaults were written for; pulley when there are none."""
+    try:
+        return MachineType(_load_user_defaults().get("machine", MachineType.PULLEY))
+    except ValueError:  # unrecognized value in a hand-edited file
+        return MachineType.PULLEY
+
+
+def _saved_for(machine: MachineType, section: str) -> dict:
+    """A section of the saved defaults, but only when it belongs to `machine`."""
+    if machine is not _saved_machine():
+        return {}
+    return _load_user_defaults().get(section, {})
+
+
+def _widget_key(prefix: str, name: str, machine: MachineType) -> str:
+    """Session-state key for one parameter's input on one machine.
+
+    Every input is scoped to its machine, so the two machines hold separate boxes and
+    switching between them reseeds from that machine's defaults - the same trick the
+    length inputs use across the unit toggle, and for the same reason: Streamlit keeps
+    a keyed widget's value across reruns, so a box can only be re-defaulted by becoming
+    a different widget. It also means edits to one machine survive a look at the other.
+    """
+    return f"{prefix}_{name}_{machine.value}"
 
 st.session_state.setdefault("result", None)
 st.session_state.setdefault("sim_params", None)
@@ -335,7 +400,8 @@ def _si_input(
 
 
 def _optimizable_input(
-    container, label: str, name: str, kind: str = "length", imperial: bool = False,
+    container, label: str, name: str, machine: MachineType,
+    kind: str = "length", imperial: bool = False, help: str = None,
 ) -> "tuple[float | None, float, bool]":
     """Number input for an optimizable parameter, paired with a lock toggle.
 
@@ -358,7 +424,7 @@ def _optimizable_input(
     unit = _display_unit(kind, imperial)
     si_min, si_max = PARAM_BOUNDS[name]
 
-    saved_entry = _load_user_defaults().get("optimizable", {}).get(name)
+    saved_entry = _saved_for(machine, "optimizable").get(name)
     if not isinstance(saved_entry, dict):  # stale/pre-toggle save format - fall back to un-locked defaults
         saved_entry = {}
     saved_locked = bool(saved_entry.get("locked", False))
@@ -366,30 +432,33 @@ def _optimizable_input(
     # cleared - clamped in case bounds changed since the value was saved.
     fallback_si = saved_entry.get("value")
     if fallback_si is None:
-        fallback_si = DEFAULT_OPTIMIZABLE_PARAMS[name]
+        fallback_si = DEFAULT_MACHINE_PARAMS[machine][name]
     fallback_si = min(max(fallback_si, si_min), si_max)
 
     # Keyed wrapper so the stylesheet can tint the whole row when the lock is
     # on (see the [class*="st-key-param_"] rule) - a 20px toggle on its own is
     # too small to read a column of five locks from.
-    row = container.container(key=f"param_{name}")
+    row = container.container(key=_widget_key("param", name, machine))
     lock_col, box_col = row.columns([1, 7])
     # Spacer matches the input's label row height so the toggle lines up with
     # the box itself, not the label above it.
     lock_col.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
     locked = lock_col.toggle(
-        f"Lock {label}", key=f"lock_{name}", value=saved_locked, label_visibility="collapsed",
+        f"Lock {label}", key=_widget_key("lock", name, machine), value=saved_locked, label_visibility="collapsed",
         help="On: lock this parameter to the value in the box. Off: leave it free for the optimizer to search.",
     )
 
-    value_si = _si_input(box_col, label, f"opt_{name}", unit, fallback_si, si_min, si_max, clearable=True)
+    value_si = _si_input(
+        box_col, label, _widget_key("opt", name, machine), unit, fallback_si, si_min, si_max,
+        clearable=True, help=help
+    )
     raw = fallback_si if value_si is None else value_si
     effective = value_si if locked else None
     return effective, raw, locked
 
 
 def _fixed_input(
-    container, label: str, name: str, si_min: float, si_max: float,
+    container, label: str, name: str, si_min: float, si_max: float, machine: MachineType,
     kind: str = "length", imperial: bool = False,
 ) -> "float | None":
     """Number input for a required fixed (never-optimized) system parameter.
@@ -397,15 +466,18 @@ def _fixed_input(
     Bounds and return value are canonical SI. Returns None only when the box is
     blank, which the caller treats as "not ready to solve".
     """
-    default = _load_user_defaults().get("fixed", {}).get(name)
+    default = _saved_for(machine, "fixed").get(name)
     if default is None:
-        default = FIXED_DEFAULTS[name]
+        default = _fixed_defaults(machine)[name]
+    default = min(max(default, si_min), si_max)
     unit = _display_unit(kind, imperial)
-    return _si_input(container, label, f"fixed_{name}", unit, default, si_min, si_max, clearable=False)
+    return _si_input(
+        container, label, _widget_key("fixed", name, machine), unit, default, si_min, si_max, clearable=False
+    )
 
 
 def _fixed_input_optional(
-    container, label: str, name: str, si_min: float, si_max: float,
+    container, label: str, name: str, si_min: float, si_max: float, machine: MachineType,
     kind: str = "length", imperial: bool = False, help: str = None,
 ) -> "float | None":
     """Number input for a fixed system parameter that may be left blank.
@@ -413,12 +485,15 @@ def _fixed_input_optional(
     Unlike _fixed_input, blank is a legal value here (not "still typing") - it
     means TrebuchetParams should fall back to its own computed default.
     """
-    saved = _load_user_defaults().get("fixed", {}).get(name)
+    saved = _saved_for(machine, "fixed").get(name)
+    if saved is None:
+        saved = DEFAULT_MACHINE_FIXED[machine].get(name)
     if saved is not None:
         saved = min(max(saved, si_min), si_max)
     unit = _display_unit(kind, imperial)
     return _si_input(
-        container, label, f"fixed_{name}", unit, saved, si_min, si_max, clearable=True, help=help
+        container, label, _widget_key("fixed", name, machine), unit, saved, si_min, si_max,
+        clearable=True, help=help
     )
 
 
@@ -578,10 +653,19 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
     )
 
     _section("Machine")
+    # Only the linkage this machine actually has: the other's parameter is carried on
+    # TrebuchetParams but unused, so listing it would be reporting a number that had no
+    # effect on the run above.
+    linkage_spec = (
+        {"Pulley radius": _fmt_length(params.pulley_radius, imperial)}
+        if params.has_pulley
+        else {"CW arm length": _fmt_length(params.length_counterweight, imperial)}
+    )
     _spec_list(
         {
+            "Machine": "Pulley" if params.has_pulley else "Traditional",
             "Counterweight mass": _fmt_mass(params.counter_weight_mass, imperial),
-            "Pulley radius": _fmt_length(params.pulley_radius, imperial),
+            **linkage_spec,
             "Arm length": _fmt_length(params.arm_length, imperial),
             "String length": _fmt_length(params.string_length, imperial),
             "String/arm ratio": f"{params.string_arm_ratio:.3f}",
@@ -602,21 +686,47 @@ with left:
     # Every input in this column stays visible with no scrolling; the optimizer
     # log at the bottom is the only element that flexes, absorbing whatever
     # vertical space the inputs leave over (see the opt_log_panel CSS).
-    _section("Machine", "Fixed system parameters - always used as given; the solver won't run without them.")
+    _section("Machine", "Pick the counterweight linkage, then the fixed geometry it hangs on.")
+    # Rendered before every other input, because it decides their defaults, bounds and
+    # widget keys (see _widget_key).
+    machine = MachineType(
+        st.segmented_control(
+            "Machine type",
+            options=[m.value for m in MachineType],
+            format_func=lambda value: {"pulley": "Pulley", "traditional": "Traditional"}[value],
+            default=_saved_machine().value,
+            key="machine_type",
+            label_visibility="collapsed",
+            help="Pulley: the counterweight hangs from a rope over the pivot axle and drops "
+            "straight down. Traditional: it is bolted to the arm's short end and swings with "
+            "it. Switching reloads that machine's default geometry.",
+        )
+        # segmented_control returns None if the active pill is clicked again; keep the
+        # machine we already had rather than leaving the page with no machine at all.
+        or st.session_state.get("_machine_was", MachineType.PULLEY.value)
+    )
+    angle_min, angle_max = INITIAL_ARM_ANGLE_BOUNDS[machine]
+
     grid3, grid4 = st.columns(2)
-    pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, imperial=imperial)
+    pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, machine, imperial=imperial)
     initial_arm_angle = _fixed_input(
-        grid4, "Initial arm angle", "initial_arm_angle",
-        math.radians(5.0), math.radians(175.0), kind="angle",
+        grid4, "Initial arm angle", "initial_arm_angle", angle_min, angle_max, machine, kind="angle",
     )
     projectile_mass = _fixed_input(
-        grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, kind="mass", imperial=imperial
+        grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, machine, kind="mass", imperial=imperial
     )
-    projectile_radius = _fixed_input(grid4, "Projectile radius", "projectile_radius", 0.001, 1.0, imperial=imperial)
+    projectile_radius = _fixed_input(
+        grid4, "Projectile radius", "projectile_radius", 0.001, 1.0, machine, imperial=imperial
+    )
     counter_weight_rope_length = _fixed_input_optional(
-        grid3, "CW rope length", "counter_weight_rope_length", 0.001, 5.0, imperial=imperial,
-        help="Rope from the pivot axle to the counterweight at t=0. Leave blank to "
-        "default to 2x the pulley radius (one wrap).",
+        grid3, "CW rope length", "counter_weight_rope_length", 0.001, 5.0, machine, imperial=imperial,
+        help=(
+            "Rope from the pivot axle to the counterweight at t=0. Leave blank to "
+            "default to 2x the pulley radius (one wrap)."
+            if machine is MachineType.PULLEY
+            else "Link from the pin on the arm's short end to the counterweight. The weight "
+            "swings on it, so a longer link swings more slowly."
+        ),
     )
 
     fixed_values = dict(
@@ -635,46 +745,35 @@ with left:
 
     _section("Design variables", "Lock a parameter to pin it to the value in its box; unlocked leaves it free for the optimizer to search.")
     grid1, grid2 = st.columns(2)
-    cw_mass, cw_mass_raw, cw_mass_locked = _optimizable_input(
-        grid1, "Counterweight", "counter_weight_mass", kind="mass", imperial=imperial
-    )
-    pulley_radius, pulley_radius_raw, pulley_radius_locked = _optimizable_input(
-        grid2, "Pulley radius", "pulley_radius", imperial=imperial
-    )
-    arm_length, arm_length_raw, arm_length_locked = _optimizable_input(
-        grid1, "Arm length", "arm_length", imperial=imperial
-    )
-    string_length, string_length_raw, string_length_locked = _optimizable_input(
-        grid2, "String length", "string_length", imperial=imperial
-    )
-    release_angle, release_angle_raw, release_angle_locked = _optimizable_input(
-        grid1, "Release angle", "release_angle", kind="angle"
-    )
+    # The linkage row is the one design variable that differs between the machines
+    # (config.LINKAGE_PARAM): a pulley radius on one, the short arm's length on the
+    # other. Both have their own widget keys, so each machine keeps its own box value
+    # across a switch.
+    linkage = LINKAGE_PARAM[machine]
+    linkage_label, linkage_help = {
+        "pulley_radius": ("Pulley radius", "How far the counterweight falls per radian of arm rotation."),
+        "length_counterweight": ("CW arm length", "How far the counterweight sits behind the pivot."),
+    }[linkage]
 
-    optimizable_values = dict(
-        counter_weight_mass=cw_mass,
-        pulley_radius=pulley_radius,
-        arm_length=arm_length,
-        string_length=string_length,
-        release_angle=release_angle,
-    )
-    # Raw box content (always concrete, regardless of the lock toggle) and lock
-    # state, in canonical SI - saved by the 💾 button so unlocking doesn't lose
-    # the value and reloading remembers which params were locked.
-    optimizable_raw = dict(
-        counter_weight_mass=cw_mass_raw,
-        pulley_radius=pulley_radius_raw,
-        arm_length=arm_length_raw,
-        string_length=string_length_raw,
-        release_angle=release_angle_raw,
-    )
-    optimizable_locked = dict(
-        counter_weight_mass=cw_mass_locked,
-        pulley_radius=pulley_radius_locked,
-        arm_length=arm_length_locked,
-        string_length=string_length_locked,
-        release_angle=release_angle_locked,
-    )
+    # (container, label, name, kind) per row, laid out down the two columns.
+    rows = [
+        (grid1, "Counterweight", "counter_weight_mass", "mass", None),
+        (grid2, linkage_label, linkage, "length", linkage_help),
+        (grid1, "Arm length", "arm_length", "length", None),
+        (grid2, "String length", "string_length", "length", None),
+        (grid1, "Release angle", "release_angle", "angle", None),
+    ]
+    optimizable_values, optimizable_raw, optimizable_locked = {}, {}, {}
+    for container, label, name, kind, help_text in rows:
+        value, raw, is_locked = _optimizable_input(
+            container, label, name, machine, kind=kind, imperial=imperial, help=help_text
+        )
+        # value is None when the parameter is free; raw is always concrete, and both it
+        # and the lock state are saved by the 💾 button so unlocking doesn't lose the
+        # number and reloading remembers which params were locked.
+        optimizable_values[name] = value
+        optimizable_raw[name] = raw
+        optimizable_locked[name] = is_locked
 
     _section("Optimizer target", "Search for parameters that maximize launch efficiency at a target distance.")
     # Target is the knob that changes per run, so it stays on the surface. The
@@ -742,9 +841,10 @@ with left:
         use_container_width=True,
     ):
         _save_user_defaults(
+            machine,
             {
                 name: {"value": optimizable_raw[name], "locked": optimizable_locked[name]}
-                for name in PARAM_NAMES
+                for name in param_names(machine)
             },
             fixed_params_all,
             {
@@ -781,10 +881,14 @@ status_area = mid.container(key="status_area")
 
 if simulate_clicked:
     sim_values = {
-        name: (optimizable_values[name] if optimizable_values[name] is not None else DEFAULT_OPTIMIZABLE_PARAMS[name])
-        for name in PARAM_NAMES
+        name: (
+            optimizable_values[name]
+            if optimizable_values[name] is not None
+            else DEFAULT_MACHINE_PARAMS[machine][name]
+        )
+        for name in param_names(machine)
     }
-    params = TrebuchetParams(**sim_values, **fixed_params_all)
+    params = TrebuchetParams(machine=machine, **sim_values, **fixed_params_all)
     try:
         with st.spinner("Simulating..."):
             result = simulate_trebuchet(params, track_energy=True, simulate_aftermath=True)
@@ -794,10 +898,11 @@ if simulate_clicked:
 
 if optimize_clicked:
     locked = {name: value for name, value in optimizable_values.items() if value is not None}
-    if len(locked) == len(PARAM_NAMES):
+    if len(locked) == len(param_names(machine)):
         status_area.error("At least one optimizable parameter must be left blank for the optimizer to search.")
     else:
         config = OptimizationConfig(
+            machine=machine,
             target_distance=target_distance,
             efficiency_weight=efficiency_weight,
             distance_weight=distance_weight,

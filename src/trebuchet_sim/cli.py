@@ -2,7 +2,13 @@
 
 Examples:
     trebuchet simulate --arm-length 0.813 --animate
+    trebuchet simulate --machine traditional --counterweight-mass 80
     trebuchet optimize --target-distance 30 --lock counter_weight_mass=14 --save-gif best.gif
+    trebuchet optimize --machine traditional --target-distance 60 --lock length_counterweight=0.4
+
+Every numeric default depends on the machine (see config.DEFAULT_MACHINE_PARAMS), so
+the argument parser leaves them unset and cmd_simulate fills them in once --machine is
+known. Angles are radians throughout, matching TrebuchetParams.
 """
 
 import argparse
@@ -10,8 +16,15 @@ import math
 import sys
 from pathlib import Path
 
-from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, TrebuchetParams
-from trebuchet_sim.optimization import PARAM_NAMES, OptimizationConfig, optimize_trebuchet
+from trebuchet_sim.config import (
+    DEFAULT_INITIAL_ARM_ANGLE,
+    DEFAULT_MACHINE_FIXED,
+    DEFAULT_MACHINE_PARAMS,
+    LINKAGE_PARAM,
+    MachineType,
+    TrebuchetParams,
+)
+from trebuchet_sim.optimization import OptimizationConfig, optimize_trebuchet, param_names
 from trebuchet_sim.physics import SimulationResult, simulate_trebuchet
 from trebuchet_sim.visualization import (
     create_animation,
@@ -28,8 +41,14 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
     """Print a summary of a simulation run to stdout."""
     print("\n=== TREBUCHET SIMULATION RESULTS ===")
     print("Parameters:")
+    print(f"  Machine: {params.machine.value}")
     print(f"  Counterweight: {params.counter_weight_mass:.1f} kg")
-    print(f"  Pulley radius: {params.pulley_radius:.3f} m")
+    # The linkage parameter is the one that differs between the machines; printing the
+    # other machine's would be reporting a number this run never used.
+    if params.has_pulley:
+        print(f"  Pulley radius: {params.pulley_radius:.3f} m")
+    else:
+        print(f"  CW arm length: {params.length_counterweight:.3f} m")
     print(f"  Arm length: {params.arm_length:.3f} m")
     print(f"  String length: {params.string_length:.3f} m")
     print(f"  Release angle: {math.degrees(params.release_angle):.1f} deg")
@@ -87,12 +106,54 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
 
 
 def _parse_lock(spec: str) -> tuple:
+    """Parse NAME=VALUE. Which names are legal is checked later, in cmd_optimize.
+
+    argparse runs this during parsing, before --machine has been read, and the legal
+    names depend on the machine: the linkage parameter is pulley_radius on one and
+    length_counterweight on the other.
+    """
     name, _, value = spec.partition("=")
     if not value:
         raise argparse.ArgumentTypeError(f"Expected NAME=VALUE, got {spec!r}")
-    if name not in PARAM_NAMES:
-        raise argparse.ArgumentTypeError(f"Unknown parameter {name!r}. Available: {', '.join(PARAM_NAMES)}")
     return name, float(value)
+
+
+def _machine_defaults(machine: MachineType) -> dict:
+    """Every value a `simulate` run needs, defaulted for one machine.
+
+    Design variables come from that machine's table; the fixed fields fall back to the
+    TrebuchetParams defaults wherever the machine doesn't override them, so a value the
+    two machines share is still written down only once.
+    """
+    fixed = DEFAULT_MACHINE_FIXED[machine]
+    values = dict(DEFAULT_MACHINE_PARAMS[machine])
+    values["pivot_height"] = fixed.get("pivot_height", TrebuchetParams.pivot_height)
+    values["counter_weight_rope_length"] = fixed.get("counter_weight_rope_length")
+    values["initial_arm_angle"] = DEFAULT_INITIAL_ARM_ANGLE[machine]
+    return values
+
+
+def _default_note(name: str, unit: str) -> str:
+    """Help text spelling out both machines' defaults for one argument.
+
+    The parser cannot carry a real default for these - it does not know the machine yet
+    - so the help has to say what each machine will fall back to.
+    """
+    parts = []
+    for machine in MachineType:
+        value = _machine_defaults(machine).get(name)
+        parts.append(f"{value:g} {machine.value}" if value is not None else f"auto ({machine.value})")
+    return f"{unit} (default: {', '.join(parts)})"
+
+
+def _add_machine_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--machine",
+        choices=[m.value for m in MachineType],
+        default=MachineType.PULLEY.value,
+        help="Counterweight linkage: 'pulley' hangs the weight from a rope over the pivot "
+             "axle, 'traditional' bolts it to the arm's short end (default: pulley)",
+    )
 
 
 def _add_output_args(parser: argparse.ArgumentParser) -> None:
@@ -123,13 +184,43 @@ def _handle_outputs(args: argparse.Namespace, params: TrebuchetParams, result: S
             show_animation(anim)
 
 
+def _resolve_linkage(machine: MachineType, args: argparse.Namespace) -> float:
+    """The linkage argument that belongs to this machine, defaulted if not given.
+
+    Both flags always exist, so passing the other machine's is a plain mistake worth
+    naming rather than silently ignoring - it would otherwise look like the value had
+    been applied.
+    """
+    wanted = LINKAGE_PARAM[machine]
+    unused = "length_counterweight" if wanted == "pulley_radius" else "pulley_radius"
+    if getattr(args, unused) is not None:
+        raise SystemExit(
+            f"--{unused.replace('_', '-')} does not apply to the {machine.value} machine; "
+            f"use --{wanted.replace('_', '-')}."
+        )
+    given = getattr(args, wanted)
+    return _machine_defaults(machine)[wanted] if given is None else given
+
+
 def cmd_simulate(args: argparse.Namespace) -> int:
+    machine = MachineType(args.machine)
+    defaults = _machine_defaults(machine)
+
+    def value(name):
+        """A command-line value, or this machine's default when the flag was omitted."""
+        given = getattr(args, name)
+        return defaults[name] if given is None else given
+
     params = TrebuchetParams(
-        counter_weight_mass=args.counterweight_mass,
-        pulley_radius=args.pulley_radius,
-        arm_length=args.arm_length,
-        string_length=args.string_length,
-        release_angle=args.release_angle,
+        machine=machine,
+        counter_weight_mass=value("counter_weight_mass"),
+        arm_length=value("arm_length"),
+        string_length=value("string_length"),
+        release_angle=value("release_angle"),
+        pivot_height=value("pivot_height"),
+        initial_arm_angle=value("initial_arm_angle"),
+        counter_weight_rope_length=value("counter_weight_rope_length"),
+        **{LINKAGE_PARAM[machine]: _resolve_linkage(machine, args)},
     )
     result = simulate_trebuchet(params, track_energy=True, simulate_aftermath=True)
     print_simulation_results(params, result)
@@ -142,16 +233,39 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 
 
 def cmd_optimize(args: argparse.Namespace) -> int:
+    machine = MachineType(args.machine)
+    locked = dict(args.lock or [])
+    names = param_names(machine)
+    unknown = set(locked) - set(names)
+    if unknown:
+        # Caught here rather than in _parse_lock, which runs before --machine is known.
+        raise SystemExit(
+            f"Cannot lock {', '.join(sorted(unknown))} on the {machine.value} machine. "
+            f"Available: {', '.join(names)}"
+        )
+
+    # The machine's own fixed geometry, so `optimize --machine traditional` starts from a
+    # buildable machine instead of the pulley machine's 1 m pivot.
+    defaults = _machine_defaults(machine)
+    fixed = {
+        "pivot_height": defaults["pivot_height"],
+        "initial_arm_angle": defaults["initial_arm_angle"],
+    }
+    if defaults["counter_weight_rope_length"] is not None:
+        fixed["counter_weight_rope_length"] = defaults["counter_weight_rope_length"]
+
     config = OptimizationConfig(
+        machine=machine,
         target_distance=args.target_distance,
         efficiency_weight=args.efficiency_weight,
         distance_weight=args.distance_weight,
         mass_weight=args.mass_weight,
-        locked_params=dict(args.lock or []),
+        locked_params=locked,
+        fixed_params=fixed,
         display_progress=True,
     )
 
-    print(f"Optimizing for {config.target_distance:.0f}m target distance...")
+    print(f"Optimizing a {machine.value} machine for {config.target_distance:.0f}m target distance...")
     print(f"Free parameters: {', '.join(config.free_params)}")
 
     optimal_params, sim_result, de_result = optimize_trebuchet(config)
@@ -160,7 +274,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     print_simulation_results(optimal_params, sim_result)
 
     print("\nCopy-paste parameters:")
-    for name in PARAM_NAMES:
+    for name in names:
         print(f"  {name} = {getattr(optimal_params, name):.3f}")
 
     _handle_outputs(args, optimal_params, sim_result)
@@ -171,32 +285,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trebuchet", description="Trebuchet physics simulation toolkit")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    defaults = DEFAULT_OPTIMIZABLE_PARAMS
     sim_parser = subparsers.add_parser("simulate", help="Run a single simulation with fixed parameters")
+    _add_machine_arg(sim_parser)
+    # Defaults stay None so cmd_simulate can fill in the selected machine's values; see
+    # the module docstring.
     sim_parser.add_argument(
-        "--counterweight-mass", type=float, default=defaults["counter_weight_mass"],
-        help=f"kg (default: {defaults['counter_weight_mass']})",
+        "--counterweight-mass", dest="counter_weight_mass", type=float,
+        help=_default_note("counter_weight_mass", "kg"),
     )
     sim_parser.add_argument(
-        "--pulley-radius", type=float, default=defaults["pulley_radius"],
-        help=f"m (default: {defaults['pulley_radius']})",
+        "--pulley-radius", type=float,
+        help="m, pulley machine only - how far the weight falls per radian of arm "
+             f"rotation (default: {DEFAULT_MACHINE_PARAMS[MachineType.PULLEY]['pulley_radius']:g})",
     )
     sim_parser.add_argument(
-        "--arm-length", type=float, default=defaults["arm_length"],
-        help=f"m (default: {defaults['arm_length']})",
+        "--length-counterweight", type=float,
+        help="m, traditional machine only - how far the weight sits behind the pivot "
+             f"(default: {DEFAULT_MACHINE_PARAMS[MachineType.TRADITIONAL]['length_counterweight']:g})",
+    )
+    sim_parser.add_argument("--arm-length", type=float, help=_default_note("arm_length", "m"))
+    sim_parser.add_argument("--string-length", type=float, help=_default_note("string_length", "m"))
+    sim_parser.add_argument("--release-angle", type=float, help=_default_note("release_angle", "radians"))
+    sim_parser.add_argument("--pivot-height", type=float, help=_default_note("pivot_height", "m"))
+    sim_parser.add_argument(
+        "--initial-arm-angle", type=float, help=_default_note("initial_arm_angle", "radians"),
     )
     sim_parser.add_argument(
-        "--string-length", type=float, default=defaults["string_length"],
-        help=f"m (default: {defaults['string_length']})",
-    )
-    sim_parser.add_argument(
-        "--release-angle", type=float, default=defaults["release_angle"],
-        help=f"radians (default: {defaults['release_angle']})",
+        "--counter-weight-rope-length", type=float,
+        help=_default_note("counter_weight_rope_length", "m") + "; auto = twice the pulley radius",
     )
     _add_output_args(sim_parser)
     sim_parser.set_defaults(func=cmd_simulate)
 
     opt_parser = subparsers.add_parser("optimize", help="Search for optimal parameters via differential evolution")
+    _add_machine_arg(opt_parser)
     opt_parser.add_argument("--target-distance", type=float, default=30.0, help="m (default: 30.0)")
     opt_parser.add_argument("--efficiency-weight", type=float, default=5.0)
     opt_parser.add_argument("--distance-weight", type=float, default=1.0)
@@ -206,7 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_lock,
         action="append",
         metavar="NAME=VALUE",
-        help=f"Lock a parameter to a fixed value. Repeatable. Available: {', '.join(PARAM_NAMES)}",
+        help="Lock a parameter to a fixed value. Repeatable. Available: "
+             + ", ".join(sorted(set(param_names(MachineType.PULLEY)) | set(param_names(MachineType.TRADITIONAL))))
+             + " (the linkage parameter depends on --machine)",
     )
     _add_output_args(opt_parser)
     opt_parser.set_defaults(func=cmd_optimize)

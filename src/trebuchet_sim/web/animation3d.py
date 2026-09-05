@@ -46,9 +46,14 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
             "arm_tip": [float(tip[0]), float(tip[1])],
             "projectile": [float(proj[0]), float(proj[1])],
             "counterweight": [float(cw[0]), float(cw[1])],
+            # Where the counterweight hangs from: the pivot axle on the pulley machine,
+            # the arm's short end on the traditional one. The scene draws the back arm
+            # and the link from it.
+            "cw_pin": [float(pin[0]), float(pin[1])],
         }
-        for t, tip, proj, cw in zip(
-            t_launch, positions["arm_tip"], positions["projectile"], positions["counterweight"]
+        for t, tip, proj, cw, pin in zip(
+            t_launch, positions["arm_tip"], positions["projectile"],
+            positions["counterweight"], positions["cw_pin"],
         )
     ]
 
@@ -101,9 +106,11 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
                 if regime == "slack"
                 else simulator.weight_position_velocity(machine_state)[0]
             )
+            pin = simulator.counterweight_pin_position(theta)
             aftermath_frames.append(
                 {"t": float(t), "arm_tip": [float(arm_tip[0]), float(arm_tip[1])],
-                 "counterweight": [float(cw_pos[0]), float(cw_pos[1])]}
+                 "counterweight": [float(cw_pos[0]), float(cw_pos[1])],
+                 "cw_pin": [float(pin[0]), float(pin[1])]}
             )
 
     last_launch = launch_frames[-1] if launch_frames else None
@@ -116,12 +123,16 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
             "pulley_radius": params.pulley_radius,
             "projectile_radius": params.projectile_radius,
             "counter_weight_size": params.counter_weight_size,
+            # Which linkage to build the scene around (see config.MachineType).
+            "has_pulley": params.has_pulley,
+            "arm_back_length": params.arm_back_length,
         },
         "launch_frames": launch_frames,
         "release_frames": release_frames,
         "aftermath_frames": aftermath_frames,
         "hold_arm_tip": last_launch["arm_tip"] if last_launch else [0.0, 0.0],
         "hold_counterweight": last_launch["counterweight"] if last_launch else [0.0, 0.0],
+        "hold_cw_pin": last_launch["cw_pin"] if last_launch else [0.0, 0.0],
         "t_release": t_release,
         "flight_time": flight_time,
         "total_time": t_release + flight_time,
@@ -452,13 +463,19 @@ _HTML_TEMPLATE = r"""
   // Pulley at the end of the pivot axle, directly above the counterweight.
   // A torus lies in the XY plane by default, so its rotation axis already
   // points along z - the same line as the axle - and needs no rotation.
+  // The traditional machine has no pulley at all: its weight is pinned to the arm, so
+  // the disc is left out and the counterweight rides in the arm's own plane instead of
+  // out at the axle's end.
   const pulleyZ = -(legOffset + 0.15);
-  const pulley = new THREE.Mesh(
-    new THREE.TorusGeometry(Math.max(geo.pulley_radius, 0.05), Math.max(geo.pulley_radius * 0.12, 0.015), 10, 24),
-    new THREE.MeshStandardMaterial({ color: 0x8a5a2a, metalness: 0.2, roughness: 0.6 })
-  );
-  pulley.position.set(0, geo.pivot_height, pulleyZ);
-  scene.add(pulley);
+  const cwZ = geo.has_pulley ? pulleyZ : 0;
+  if (geo.has_pulley) {
+    const pulley = new THREE.Mesh(
+      new THREE.TorusGeometry(Math.max(geo.pulley_radius, 0.05), Math.max(geo.pulley_radius * 0.12, 0.015), 10, 24),
+      new THREE.MeshStandardMaterial({ color: 0x8a5a2a, metalness: 0.2, roughness: 0.6 })
+    );
+    pulley.position.set(0, geo.pivot_height, pulleyZ);
+    scene.add(pulley);
+  }
 
   // ---------- Dynamic parts ----------
   const armRadius = Math.max(geo.arm_length * 0.03, 0.02);
@@ -473,6 +490,24 @@ _HTML_TEMPLATE = r"""
     new THREE.MeshStandardMaterial({ color: 0xcccccc })
   );
   scene.add(slingMesh);
+
+  // Traditional machine only: the beam continues behind the pivot to the pin, and the
+  // counterweight hangs from that pin on a link. Both swing with the arm, so they are
+  // re-drawn every frame from the sampled pin position.
+  let backArmMesh = null;
+  let cwLinkMesh = null;
+  if (!geo.has_pulley) {
+    backArmMesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(armRadius, armRadius, 1, 10),
+      new THREE.MeshStandardMaterial({ color: 0x4a3520, roughness: 0.8 })
+    );
+    scene.add(backArmMesh);
+    cwLinkMesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(armRadius * 0.3, armRadius * 0.3, 1, 6),
+      new THREE.MeshStandardMaterial({ color: 0x8a5a2a, roughness: 0.7 })
+    );
+    scene.add(cwLinkMesh);
+  }
 
   // Matches the physical cube size used by the aftermath's ground-collision check
   // (TrebuchetParams.counter_weight_size), so the box's bottom face - not its center -
@@ -625,12 +660,13 @@ _HTML_TEMPLATE = r"""
   }
 
   function updateAtTime(t) {
-    let armTip, cwPos, projPos, phase;
+    let armTip, cwPos, cwPin, projPos, phase;
 
     if (t <= tRelease) {
       phase = "Launching";
       armTip = lerpFrames(launchFrames, t, "arm_tip");
       cwPos = lerpFrames(launchFrames, t, "counterweight");
+      cwPin = lerpFrames(launchFrames, t, "cw_pin");
       projPos = lerpFrames(launchFrames, t, "projectile");
     } else {
       // The machine keeps moving after release (arm/counterweight settling under
@@ -639,9 +675,11 @@ _HTML_TEMPLATE = r"""
       if (aftermathFrames.length) {
         armTip = lerpFrames(aftermathFrames, t - tRelease, "arm_tip");
         cwPos = lerpFrames(aftermathFrames, t - tRelease, "counterweight");
+        cwPin = lerpFrames(aftermathFrames, t - tRelease, "cw_pin");
       } else {
         armTip = DATA.hold_arm_tip;
         cwPos = DATA.hold_counterweight;
+        cwPin = DATA.hold_cw_pin;
       }
       if (t >= totalTime) {
         phase = "Landed";
@@ -654,10 +692,16 @@ _HTML_TEMPLATE = r"""
 
     const armTipVec = new THREE.Vector3(armTip[0], armTip[1], 0);
     const projVec = new THREE.Vector3(projPos[0], projPos[1], 0);
-    // Counterweight hangs in the pulley's plane at the end of the axle.
-    const cwVec = new THREE.Vector3(cwPos[0], cwPos[1], pulleyZ);
+    // Pulley machine: the weight hangs in the pulley's plane at the end of the axle.
+    // Traditional: it is pinned to the beam, so it rides in the beam's own plane.
+    const cwVec = new THREE.Vector3(cwPos[0], cwPos[1], cwZ);
 
     setSegment(armMesh, pivot, armTipVec);
+    if (backArmMesh) {
+      const pinVec = new THREE.Vector3(cwPin[0], cwPin[1], 0);
+      setSegment(backArmMesh, pivot, pinVec);
+      setSegment(cwLinkMesh, pinVec, cwVec);
+    }
     // The sling releases the projectile at t_release: only draw it while
     // still attached, otherwise it visibly stretches across the whole
     // ballistic trajectory.

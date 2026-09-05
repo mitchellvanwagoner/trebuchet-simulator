@@ -136,8 +136,16 @@ def _animate_frame(frame: int, ax_trajectory, ax_system, state_data: dict, param
         ax_system.plot([arm_tip_pos[0], proj_pos[0]], [arm_tip_pos[1], proj_pos[1]], "r-", linewidth=4, label="String")
     ax_system.plot(proj_pos[0], proj_pos[1], "ro", markersize=12, label="Projectile")
     ax_system.plot(cw_pos[0], cw_pos[1], "s", color="gray", markersize=12, label="Counterweight")
-    pulley = patches.Circle((pivot_x, pivot_y), params.pulley_radius, fill=False, edgecolor="brown", linewidth=6)
-    ax_system.add_patch(pulley)
+    if params.has_pulley:
+        pulley = patches.Circle((pivot_x, pivot_y), params.pulley_radius, fill=False, edgecolor="brown", linewidth=6)
+        ax_system.add_patch(pulley)
+    else:
+        # No pulley to draw. Instead the beam continues behind the pivot to the pin the
+        # counterweight hangs from, and the weight swings on a link below it - both of
+        # which move with the arm, so they come from the sampled positions.
+        pin_pos = state_data["positions"]["cw_pin"][frame]
+        ax_system.plot([pivot_x, pin_pos[0]], [pivot_y, pin_pos[1]], "k-", linewidth=8)
+        ax_system.plot([pin_pos[0], cw_pos[0]], [pin_pos[1], cw_pos[1]], color="brown", linewidth=3)
     phase = "Launching" if not launched else ("In Flight" if current_time < state_data["times"][-1] else "Landed")
     ax_system.set_title(f"System Close-up ({phase})\nTime: {current_time:.3f}s", fontsize=12)
 

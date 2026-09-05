@@ -40,15 +40,17 @@ Python package under `src/trebuchet_sim/` (src-layout, installed editable). The 
 - **web/theme.py** — the design system, and the single source of truth for the dashboard's look: palette constants, `streamlit_theme_env()` (Streamlit resolves its theme at server start, before the app script runs, so it can only arrive via env vars — applied by both `web/launcher.py` and `run.py`, which is why the container and a local checkout match without a `.streamlit/config.toml`, a path that is git-ignored), and `DASHBOARD_CSS`. The layout is a fixed-viewport flex column: the page is pinned to `100vh` and the panels that should absorb slack are marked `flex: 1 1 0`, replacing the previous `calc(100vh - Npx)` magic numbers that had to be re-measured by hand and had already drifted far enough to push the header off-screen. Imports nothing, so `run.py` can read the palette before the package is installed.
 - **web/animation3d.py** — no physics: samples the solved result into a JSON timeline (`_build_timeline`) and embeds a self-contained Three.js HTML page that plays it back with scrub/speed controls. The HTML template is a Python string with `__TIMELINE_JSON__` / `__HEIGHT__` / `__THREE_JS__` / `__ORBIT_JS__` placeholders plus the palette placeholders in `_THEME_SUBSTITUTIONS` (so the scene shares `web/theme.py`'s colors); Three.js r128 is vendored in `web/static/` and inlined so the animation works offline (r128 pinned deliberately — newer releases removed `examples/js/OrbitControls.js`).
 
-`MachineType.TRADITIONAL` is finished in the simulation core (config, physics, aftermath, and
-the optimizer's scipy path) but not yet wired up above it. Still to do before it is a user-facing
-feature: a machine selector in `web/app.py` and a `--machine` flag in `cli.py` (the dashboard's
-"Initial arm angle" input is also bounded 5-175 deg, which cannot express the traditional
-machine's -135 deg cocked position); back-arm and pinned-link rendering in both animation
-frontends, which still draw a pulley disc at the pivot and ignore the `cw_pin` positions
-`sample_component_positions()` already returns; and test coverage - every current test exercises
-the pulley machine. Until then a traditional machine is reachable only by constructing
-`TrebuchetParams(machine=MachineType.TRADITIONAL, ...)` directly.
+Selecting a machine touches every layer, because the two differ in one design variable rather
+than in a setting: `config.LINKAGE_PARAM` maps each machine to the parameter that sizes its
+counterweight coupling (`pulley_radius` / `length_counterweight`), and `optimization.param_names(machine)`
+swaps it into the five-name search space. So `OptimizationConfig.machine` is a field of its own,
+not a `fixed_params` entry (it decides the search space rather than being searched), and the
+CLI/UI both resolve their defaults, bounds and labels through it. In the dashboard every input's
+session-state key is scoped to the machine (`_widget_key`): Streamlit keeps a keyed widget's value
+across reruns, so a box can only be re-defaulted by becoming a different widget - the same trick
+the length inputs use across the unit toggle. Saved defaults record the machine they were written
+for and only reload onto that machine. Both animation frontends draw the linkage from the `cw_pin`
+track that `sample_component_positions()` returns, and skip the pulley disc when there is none.
 
 The Docker image (multi-stage, non-root, healthcheck) installs the wheel with the `[fast]` extra and starts via the `trebuchet-web` console script; deps are pinned in `docker-constraints.txt`. Saved dashboard defaults go to `TREBUCHET_DATA_DIR` (run.py sets the repo root, Docker sets `/app/data`, bare `trebuchet-web` falls back to `~/.trebuchet-sim`).
 

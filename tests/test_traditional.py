@@ -155,6 +155,58 @@ def test_traditional_aftermath_runs_as_one_regime_and_stops_at_the_ground():
         assert wy >= result_params.counter_weight_size / 2 - 1e-6
 
 
+def test_animation_timeline_carries_the_pin_the_counterweight_hangs_from():
+    """Both animation frontends draw the linkage from `cw_pin`.
+
+    On the pulley machine the weight hangs from the axle, so the pin never moves; on the
+    traditional one the pin rides the arm's short end and swings with it. A pin that sat
+    still on the traditional machine would draw the counterweight hanging off the pivot -
+    which is exactly the pulley machine, and what both renderers used to show.
+    """
+    pytest.importorskip("streamlit")
+    from trebuchet_sim.web.animation3d import _build_timeline
+
+    for machine, params in (
+        (MachineType.PULLEY, TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS)),
+        (MachineType.TRADITIONAL, traditional_params()),
+    ):
+        result = simulate_trebuchet(params, simulate_aftermath=True)
+        timeline = _build_timeline(params, result)
+
+        assert timeline["geometry"]["has_pulley"] is (machine is MachineType.PULLEY)
+        pins = [frame["cw_pin"] for frame in timeline["launch_frames"]]
+        assert all(len(pin) == 2 for pin in pins)
+        assert timeline["aftermath_frames"], "aftermath frames drive the post-release pose"
+        assert all("cw_pin" in frame for frame in timeline["aftermath_frames"])
+
+        moved = max(abs(pin[0] - pins[0][0]) + abs(pin[1] - pins[0][1]) for pin in pins)
+        if machine is MachineType.PULLEY:
+            assert pins[0] == [0.0, params.pivot_height]  # the axle
+            assert moved == 0.0
+        else:
+            # Swept through a good fraction of a circle of radius length_counterweight.
+            assert moved > params.length_counterweight
+
+
+def test_traditional_scene_drops_the_pulley_and_draws_the_linkage():
+    """The embedded Three.js page builds a different machine per linkage."""
+    pytest.importorskip("streamlit")
+    from trebuchet_sim.web.animation3d import build_trebuchet_3d_html
+
+    def scene_for(params):
+        return build_trebuchet_3d_html(params, simulate_trebuchet(params, simulate_aftermath=True))
+
+    traditional = scene_for(traditional_params())
+    assert '"has_pulley": false' in traditional
+    # The meshes are created conditionally, so their presence is decided by this flag at
+    # runtime; what the payload must carry is the pin track they are drawn along.
+    assert '"cw_pin"' in traditional
+    assert "backArmMesh" in traditional and "cwLinkMesh" in traditional
+
+    pulley = scene_for(TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS))
+    assert '"has_pulley": true' in pulley
+
+
 def _objective_chosen_for(monkeypatch, machine) -> str:
     """Name of the objective `optimize_trebuchet` hands to differential_evolution.
 
@@ -167,7 +219,8 @@ def _objective_chosen_for(monkeypatch, machine) -> str:
     captured = {}
 
     class _StubResult:
-        x = [DEFAULT_OPTIMIZABLE_PARAMS[name] for name in optimization.PARAM_NAMES]
+        # One value per free parameter, in the order build_params will read them.
+        x = [0.0] * len(optimization.param_names(machine))
 
     def stub(func, bounds, **kwargs):
         captured["objective"] = func.func.__name__  # func is a functools.partial
@@ -176,9 +229,7 @@ def _objective_chosen_for(monkeypatch, machine) -> str:
 
     monkeypatch.setattr(optimization, "differential_evolution", stub)
     monkeypatch.setattr(optimization, "simulate_trebuchet", lambda *a, **k: None)
-    optimization.optimize_trebuchet(
-        optimization.OptimizationConfig(fixed_params={"machine": machine})
-    )
+    optimization.optimize_trebuchet(optimization.OptimizationConfig(machine=machine))
     return captured
 
 
