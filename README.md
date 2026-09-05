@@ -17,18 +17,25 @@ pip install -e ".[dev]"
 ## Web UI
 
 The easiest way to explore the simulator, all in your browser: a single-screen
-3-column dashboard with locking number inputs on the left (leave a box blank to
-let the optimizer solve it, type a value to lock it), a live animation and
-energy plot in the middle, and a full results table on the right. The animation
+3-column dashboard. Parameters are on the left, each design variable paired with
+a lock toggle — lock it to pin the parameter to the value in its box, leave it
+unlocked to let the optimizer search it (an unlocked box's contents are
+ignored). Locked rows are tinted so the search space is readable at a glance. A
+live 3D animation and energy plot sit in the middle, and the range, efficiency,
+release conditions, and resolved machine geometry on the right. The animation
 traces the projectile's path and can switch between the 3D isometric view and a
-flat 2D side view:
+flat 2D side view. A units toggle switches the whole dashboard between metric
+and ft/in/lb:
 
 ```bash
 python run.py
 ```
 
-This opens `http://localhost:8501` automatically. Equivalently, once
-installed, you can run `trebuchet-web` from anywhere.
+This opens `http://localhost:8501` automatically, or the next free port if 8501
+is taken. `run.py` also rebuilds `.venv` if it is missing or stale, so a fresh
+clone — or a copy of the project moved to a new folder, which leaves the venv's
+recorded absolute paths dangling — needs no manual setup first. Equivalently,
+once installed, you can run `trebuchet-web` from anywhere.
 
 To serve at the friendlier `http://treb-simulator.local:8501` instead, run
 this once in an elevated (admin) PowerShell, then restart `run.py`:
@@ -119,13 +126,17 @@ pytest
 
 ```
 src/trebuchet_sim/
-    config.py          TrebuchetParams dataclass and physical constants
+    config.py            TrebuchetParams dataclass and physical constants
     physics.py           Euler-Lagrange dynamics, ODE integration, energy tracking
     trajectory.py        Shared post-release ballistic trajectory with air drag
+    fastsim.py           Numba-JIT engine used by the optimizer's objective
     optimization.py      Differential-evolution parameter search
     visualization.py     Matplotlib animation (CLI) and energy plots
     cli.py               `trebuchet` command-line entry point
     web/app.py           Streamlit web UI
+    web/theme.py         Dashboard palette, Streamlit theme, and layout CSS
+    web/units.py         Metric <-> Imperial conversions for the dashboard
+    web/launcher.py      `trebuchet-web` console-script entry point
     web/animation3d.py   Live Three.js 3D animation embedded in the web UI
     web/static/          Vendored Three.js (r128), inlined so the UI works offline
 tests/                  pytest suite

@@ -10,7 +10,10 @@ from scipy.integrate import solve_ivp
 from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, TrebuchetParams
 from trebuchet_sim.trajectory import BallisticTrajectory, integrate_ballistic_trajectory
 
-State = Tuple[float, float, float, float]  # theta, theta_dot, alpha, alpha_dot
+# Launch state, taut sling: theta (arm), alpha (sling), psi (counterweight swing).
+# psi is inert on the pulley machine, where the weight hangs from a rope over the
+# axle instead of a pin on the arm - see TrebuchetSimulator.__init__.
+State = Tuple[float, float, float, float, float, float]
 PositionVelocity = Tuple[Tuple[float, float], Tuple[float, float]]
 
 # Evenly spaced samples taken from the dense ODE solution for energy tracking.
@@ -47,20 +50,30 @@ class AftermathResult:
     touchdown_times: List[float]   # counterweight-hits-ground events, aftermath-clock seconds
     retension_times: List[float]   # rope-snaps-taut-again events, aftermath-clock seconds
 
-    def state_at(self, t: float) -> Tuple[float, float, str]:
-        """(theta, theta_dot, regime) at aftermath-clock time t; clamped to the timeline's ends."""
+    def _raw_state_at(self, t: float):
+        """(state vector, regime) at aftermath-clock time t; clamped to the ends."""
         if not self.segments:
             raise ValueError("AftermathResult has no segments")
         if t <= self.segments[0].t0:
-            theta, theta_dot = self.segments[0].sol.y[:, 0]
-            return float(theta), float(theta_dot), self.segments[0].regime
+            return self.segments[0].sol.y[:, 0], self.segments[0].regime
         for seg in self.segments:
             if t <= seg.t1:
-                theta, theta_dot = seg.sol.sol(t - seg.t0)
-                return float(theta), float(theta_dot), seg.regime
+                return seg.sol.sol(t - seg.t0), seg.regime
         last = self.segments[-1]
-        theta, theta_dot = last.sol.y[:, -1]
-        return float(theta), float(theta_dot), last.regime
+        return last.sol.y[:, -1], last.regime
+
+    def state_at(self, t: float) -> Tuple[float, float, str]:
+        """(theta, theta_dot, regime) at aftermath-clock time t; clamped to the timeline's ends."""
+        y, regime = self._raw_state_at(t)
+        return float(y[0]), float(y[1]), regime
+
+    def swing_at(self, t: float) -> Tuple[float, float]:
+        """(psi, psi_dot) - the counterweight's swing about its pin at time t.
+
+        Inert on the pulley machine, whose weight has no freedom of its own.
+        """
+        y, _regime = self._raw_state_at(t)
+        return float(y[2]), float(y[3])
 
 
 @dataclass
@@ -102,6 +115,7 @@ class LaunchSolution:
         self.t_release: Optional[float] = None
         self.release_machine_state: Optional[Tuple[float, float]] = None  # theta, theta_dot
         self.release_projectile_state: Optional[PositionVelocity] = None
+        self.release_swing_state: Optional[Tuple[float, float]] = None  # psi, psi_dot
         self.snap_times: List[float] = []
         self.snap_energy_losses: List[float] = []
 
@@ -142,6 +156,17 @@ class LaunchSolution:
             return self._sim.projectile_position_velocity(y)
         return (float(y[2]), float(y[3])), (float(y[4]), float(y[5]))
 
+    def swing_state(self, t: float) -> Tuple[float, float]:
+        """(psi, psi_dot) - the counterweight's swing about its pin at time t.
+
+        psi sits at the end of both state layouts, so its index depends on the
+        regime: 4 while the sling is taut, 6 once the projectile has been cut
+        loose and the state grew four projectile components.
+        """
+        seg, y = self._y_at(t)
+        base = 4 if seg.regime == "taut" else 6
+        return float(y[base]), float(y[base + 1])
+
 
 @dataclass
 class SimulationResult:
@@ -164,11 +189,13 @@ def sample_component_positions(params: TrebuchetParams, sol: LaunchSolution, tim
     detached, inside the string circle) render exactly where the physics puts it.
     """
     simulator = TrebuchetSimulator(params)
-    positions = {"projectile": [], "arm_tip": [], "counterweight": []}
+    positions = {"projectile": [], "arm_tip": [], "counterweight": [], "cw_pin": []}
     for t in times:
         theta, theta_dot = sol.machine_state(float(t))
-        machine_state = (theta, theta_dot, 0.0, 0.0)
+        psi, psi_dot = sol.swing_state(float(t))
+        machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
         positions["counterweight"].append(simulator.weight_position_velocity(machine_state)[0])
+        positions["cw_pin"].append(simulator.counterweight_pin_position(theta))
         positions["arm_tip"].append(simulator.arm_tip_position_velocity(machine_state)[0])
         positions["projectile"].append(sol.projectile_state(float(t))[0])
     return positions
@@ -194,14 +221,16 @@ def sample_full_timeline(
     release_occurred = bool(result.metrics.get("release_occurred", False))
     t_release = result.metrics.get("t_release") if release_occurred else None
 
-    positions = {"projectile": [], "arm_tip": [], "counterweight": []}
+    positions = {"projectile": [], "arm_tip": [], "counterweight": [], "cw_pin": []}
 
     for t in times:
         if not release_occurred or t <= t_release:
             t_clamped = float(min(t, sol.t_end))
             theta, theta_dot = sol.machine_state(t_clamped)
-            machine_state = (theta, theta_dot, 0.0, 0.0)
+            psi, psi_dot = sol.swing_state(t_clamped)
+            machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
             positions["counterweight"].append(simulator.weight_position_velocity(machine_state)[0])
+            positions["cw_pin"].append(simulator.counterweight_pin_position(theta))
             positions["arm_tip"].append(simulator.arm_tip_position_velocity(machine_state)[0])
             positions["projectile"].append(sol.projectile_state(t_clamped)[0])
             continue
@@ -210,7 +239,8 @@ def sample_full_timeline(
 
         if result.aftermath is not None:
             theta, theta_dot, regime = result.aftermath.state_at(t_local)
-            machine_state = (theta, theta_dot, 0.0, 0.0)
+            psi, psi_dot = result.aftermath.swing_at(t_local)
+            machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
             arm_tip = simulator.arm_tip_position_velocity(machine_state)[0]
             cw_pos = (
                 (params.pulley_radius, params.counter_weight_size / 2)  # box resting on the ground, bottom at y=0
@@ -220,12 +250,15 @@ def sample_full_timeline(
         else:
             # No aftermath computed: hold the release pose.
             theta_r, theta_dot_r = sol.release_machine_state
-            release_state = (theta_r, theta_dot_r, 0.0, 0.0)
+            psi_r, psi_dot_r = sol.release_swing_state or (0.0, 0.0)
+            theta = theta_r
+            release_state = (theta_r, theta_dot_r, 0.0, 0.0, psi_r, psi_dot_r)
             arm_tip = simulator.arm_tip_position_velocity(release_state)[0]
             cw_pos = simulator.weight_position_velocity(release_state)[0]
 
         positions["arm_tip"].append(arm_tip)
         positions["counterweight"].append(cw_pos)
+        positions["cw_pin"].append(simulator.counterweight_pin_position(theta))
         positions["projectile"].append(
             result.trajectory.position_at(t_local) if result.trajectory is not None else arm_tip
         )
@@ -250,13 +283,46 @@ class TrebuchetSimulator:
         self._l_a, self._l_s = l_a, l_s
         self._m_p = m_p
         self._h_T = p.pivot_height
-        self._M11 = p.counter_weight_mass * p.pulley_radius**2 + p.moi_pulley + p.moi_arm + m_p * l_a**2
+        # The counterweight's contribution is the only thing that differs between
+        # the two machines (see config.MachineType), and it enters in exactly two
+        # places: an inertia about the pivot, and a gravity torque.
+        self._cw_inertia = p.counter_weight_mass * p.counter_weight_lever**2
+        self._M11 = self._cw_inertia + p.moi_pulley + p.moi_arm + m_p * l_a**2
         self._M22 = m_p * l_s**2
         self._coupling = m_p * l_a * l_s  # projectile inertial coupling between theta and alpha
         self._arm_drag_k = 1 / 6 * ARM_CROSS_SECTION_WIDTH * p.arm_drag_coefficient * RHO_AIR * l_a**3
         self._proj_drag_k = 0.5 * RHO_AIR * p.projectile_drag_coefficient * p.projectile_area
-        self._cw_gravity_torque = p.counter_weight_mass * p.pulley_radius * G
-        self._arm_gravity_k = l_a / 2 * G * p.arm_mass
+        # Counterweight gravity torque, written once for both linkages as
+        #     Q_cw(theta) = cw_torque_const + cw_torque_cos * cos(theta)
+        # Pulley: the weight descends r_pul metres per radian of rotation whatever
+        # the arm angle, so its torque is the constant -m*g*r_pul. Traditional: the
+        # weight rides the arm's far end at height h_T - l_cw*sin(theta), giving
+        # -dU/dtheta = +m*g*l_cw*cos(theta). Keeping both in one expression means
+        # the hot ODE path needs no branch.
+        # On the traditional machine the weight hangs from a pin on the arm and can
+        # swing relative to it, so it carries its own coordinate psi. Those terms are
+        # all zero on the pulley machine, where the rope-over-axle linkage leaves the
+        # weight no freedom of its own; M33 = 1 there keeps the 3x3 solve below
+        # non-singular while making psi inert (see the reduction note there).
+        m_cw = p.counter_weight_mass
+        self._l_w = 0.0 if p.has_pulley else p.initial_cw_rope_length
+        self._psi_rest = -math.pi / 2  # link hanging straight down
+        if p.has_pulley:
+            # Factor order matches the original m*r*G exactly: reassociating a
+            # product can shift the last bit, and that is enough for the ODE to
+            # diverge in the 6th digit over a launch.
+            self._cw_torque_const = -(m_cw * p.pulley_radius * G)
+            self._cw_torque_cos = 0.0
+            self._cw_swing_coupling = 0.0
+            self._cw_swing_gravity_k = 0.0
+            self._M33 = 1.0
+        else:
+            self._cw_torque_const = 0.0
+            self._cw_torque_cos = m_cw * G * p.length_counterweight
+            self._cw_swing_coupling = m_cw * p.length_counterweight * self._l_w
+            self._cw_swing_gravity_k = m_cw * G * self._l_w
+            self._M33 = m_cw * self._l_w**2
+        self._arm_gravity_k = p.arm_cm_offset * G * p.arm_mass
         self._proj_gravity_theta_k = m_p * G * l_a
         self._proj_gravity_alpha_k = m_p * l_s * G
         self._joint_friction = p.joint_friction_coefficient
@@ -267,41 +333,71 @@ class TrebuchetSimulator:
         # drops the counterweight (it's resting on the ground). theta_ground solves
         # weight_position_velocity's w_y = counter_weight_size/2 for theta - i.e. the
         # counterweight's bottom face (not its center of mass) touches the ground.
-        self._M_taut = p.counter_weight_mass * p.pulley_radius**2 + p.moi_pulley + p.moi_arm
+        self._M_taut = self._cw_inertia + p.moi_pulley + p.moi_arm
         self._M_slack = p.moi_pulley + p.moi_arm
         self._cw_half_size = p.counter_weight_size / 2
-        self._theta_ground = p.initial_arm_angle + (
-            self._cw_half_size - p.weight_height + p.initial_cw_rope_length
-        ) / p.pulley_radius
+        # Arm angle at which the counterweight's bottom face reaches the ground.
+        # Only the pulley machine needs it: there the weight descends linearly with
+        # theta and the rope goes slack on touchdown. The traditional machine's
+        # weight is pinned to the arm, so ground contact is a hard stop instead
+        # (see _simulate_aftermath_pinned).
+        self._theta_ground = (
+            p.initial_arm_angle
+            + (self._cw_half_size - p.weight_height + p.initial_cw_rope_length) / p.pulley_radius
+            if p.has_pulley
+            else -math.inf
+        )
 
     def weight_position_velocity(self, y: State) -> PositionVelocity:
         """Counterweight position and velocity from the state vector."""
-        theta, theta_dot, _alpha, _alpha_dot = y
-        r_pul, h_w, theta_i = self.params.pulley_radius, self.params.weight_height, self.params.initial_arm_angle
-        rope_length = self.params.initial_cw_rope_length
+        theta, theta_dot = y[0], y[1]
+        p = self.params
 
-        # The weight hangs `rope_length` below the axle at t=0 (theta=theta_i) and
-        # descends by r_pul for every radian the pulley/arm rotates from there.
-        w_y = (h_w - rope_length) + r_pul * (theta - theta_i)
-        w_vy = r_pul * theta_dot
+        if p.has_pulley:
+            r_pul, h_w, theta_i = p.pulley_radius, p.weight_height, p.initial_arm_angle
+            rope_length = p.initial_cw_rope_length
+            # The weight hangs `rope_length` below the axle at t=0 (theta=theta_i)
+            # and descends by r_pul for every radian the pulley/arm rotates.
+            w_y = (h_w - rope_length) + r_pul * (theta - theta_i)
+            return (r_pul, w_y), (0.0, r_pul * theta_dot)
 
-        return (r_pul, w_y), (0, w_vy)
+        # Traditional: the weight hangs on a pin carried by the arm's short end,
+        # so its motion is the pin's plus the link's own swing about it.
+        psi, psi_dot = (y[4], y[5]) if len(y) > 5 else (self._psi_rest, 0.0)
+        l_cw, l_w, h_T = p.length_counterweight, self._l_w, p.pivot_height
+        pin_x, pin_y = -l_cw * np.cos(theta), h_T - l_cw * np.sin(theta)
+        pin_vx, pin_vy = l_cw * theta_dot * np.sin(theta), -l_cw * theta_dot * np.cos(theta)
+        w_x = pin_x + l_w * np.cos(psi)
+        w_y = pin_y + l_w * np.sin(psi)
+        w_vx = pin_vx - l_w * psi_dot * np.sin(psi)
+        w_vy = pin_vy + l_w * psi_dot * np.cos(psi)
+        return (w_x, w_y), (w_vx, w_vy)
+
+    def counterweight_pin_position(self, theta: float) -> Tuple[float, float]:
+        """Where the counterweight's pin sits, for rendering the link."""
+        p = self.params
+        if p.has_pulley:
+            return 0.0, p.pivot_height
+        l_cw = p.length_counterweight
+        return -l_cw * math.cos(theta), p.pivot_height - l_cw * math.sin(theta)
 
     def arm_position_velocity(self, y: State) -> PositionVelocity:
         """Arm center-of-mass position and velocity."""
-        theta, theta_dot, _alpha, _alpha_dot = y
-        h_T, l_a = self.params.pivot_height, self.params.arm_length
+        theta, theta_dot = y[0], y[1]
+        # Offset, not half-length: on the traditional machine the beam extends
+        # behind the pivot too, so its balance point is not at arm_length/2.
+        h_T, r_cm = self.params.pivot_height, self.params.arm_cm_offset
 
-        a_x = l_a / 2 * np.cos(theta)
-        a_y = l_a / 2 * np.sin(theta) + h_T
-        a_vx = -l_a / 2 * theta_dot * np.sin(theta)
-        a_vy = l_a / 2 * theta_dot * np.cos(theta)
+        a_x = r_cm * np.cos(theta)
+        a_y = r_cm * np.sin(theta) + h_T
+        a_vx = -r_cm * theta_dot * np.sin(theta)
+        a_vy = r_cm * theta_dot * np.cos(theta)
 
         return (a_x, a_y), (a_vx, a_vy)
 
     def arm_tip_position_velocity(self, y: State) -> PositionVelocity:
         """Arm tip position and velocity."""
-        theta, theta_dot, _alpha, _alpha_dot = y
+        theta, theta_dot = y[0], y[1]
         h_T, l_a = self.params.pivot_height, self.params.arm_length
 
         a_x = l_a * np.cos(theta)
@@ -313,7 +409,7 @@ class TrebuchetSimulator:
 
     def projectile_position_velocity(self, y: State) -> PositionVelocity:
         """Projectile position and velocity (arm tip plus string extension)."""
-        theta, theta_dot, alpha, alpha_dot = y
+        theta, theta_dot, alpha, alpha_dot = y[0], y[1], y[2], y[3]
         l_a, l_s, h_T = self.params.arm_length, self.params.string_length, self.params.pivot_height
 
         pos_x = l_a * np.cos(theta) + l_s * np.cos(alpha)
@@ -326,7 +422,7 @@ class TrebuchetSimulator:
     def calculate_system_energy(self, y: State, t: float) -> Dict[str, float]:
         """Kinetic/potential energy breakdown at a taut launch state."""
         proj_pos, proj_vel = self.projectile_position_velocity(y)
-        return self._system_energy(t, y[0], y[1], proj_pos, proj_vel)
+        return self._system_energy(t, y[0], y[1], proj_pos, proj_vel, y[4], y[5])
 
     def launch_energy_at(self, launch: LaunchSolution, t: float) -> Dict[str, float]:
         """Energy breakdown at any point of a stitched launch (taut or slack).
@@ -336,19 +432,23 @@ class TrebuchetSimulator:
         """
         theta, theta_dot = launch.machine_state(t)
         proj_pos, proj_vel = launch.projectile_state(t)
-        return self._system_energy(t, theta, theta_dot, proj_pos, proj_vel)
+        psi, psi_dot = launch.swing_state(t)
+        return self._system_energy(t, theta, theta_dot, proj_pos, proj_vel, psi, psi_dot)
 
     def _system_energy(
-        self, t: float, theta: float, theta_dot: float, proj_pos, proj_vel
+        self, t: float, theta: float, theta_dot: float, proj_pos, proj_vel,
+        psi: float = 0.0, psi_dot: float = 0.0,
     ) -> Dict[str, float]:
-        machine_state = (theta, theta_dot, 0.0, 0.0)
+        machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
         arm_cm_pos, _ = self.arm_position_velocity(machine_state)
         cw_pos, cw_vel = self.weight_position_velocity(machine_state)
 
         proj_ke = 0.5 * self.params.projectile_mass * (proj_vel[0] ** 2 + proj_vel[1] ** 2)
         arm_ke = 0.5 * self.params.moi_arm * theta_dot**2
         pulley_ke = 0.5 * self.params.moi_pulley * theta_dot**2
-        cw_ke = 0.5 * self.params.counter_weight_mass * cw_vel[1] ** 2
+        # Both components: the pulley machine's weight only moves vertically (vx is
+        # exactly 0 there, so this is unchanged for it), but a pinned weight swings.
+        cw_ke = 0.5 * self.params.counter_weight_mass * (cw_vel[0] ** 2 + cw_vel[1] ** 2)
         total_ke = proj_ke + arm_ke + pulley_ke + cw_ke
 
         proj_pe = self.params.projectile_mass * G * proj_pos[1]
@@ -429,22 +529,29 @@ class TrebuchetSimulator:
         machine constants folded in __init__ rather than numpy scalars and the
         dataclass properties.
         """
-        theta, theta_dot, alpha, alpha_dot = y
+        theta, theta_dot, alpha, alpha_dot, psi, psi_dot = y
         l_a, l_s = self._l_a, self._l_s
 
         sin_t, cos_t = math.sin(theta), math.cos(theta)
         sin_a, cos_a = math.sin(alpha), math.cos(alpha)
-        # Angle-difference identities: sin/cos(alpha - theta) from what we already have
+        sin_p, cos_p = math.sin(psi), math.cos(psi)
+        # Angle-difference identities: sin/cos(alpha - theta) and sin/cos(psi - theta)
+        # from what we already have
         sin_at = sin_a * cos_t - cos_a * sin_t
         cos_at = cos_a * cos_t + sin_a * sin_t
+        sin_pt = sin_p * cos_t - cos_p * sin_t
+        cos_pt = cos_p * cos_t + sin_p * sin_t
 
         # Projectile velocity (arm tip plus string extension)
         p_vx = -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a
         p_vy = l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a
         proj_speed = math.sqrt(p_vx * p_vx + p_vy * p_vy)
 
-        # Inertia matrix: M11/M22 are constants of the machine, only M12 (=M21) varies
+        # Inertia matrix: M11/M22/M33 are constants of the machine; the off-diagonal
+        # couplings vary with the angle between the members. M23 is identically zero -
+        # the sling and the counterweight link never touch each other's coordinates.
         M12 = self._coupling * cos_at
+        M13 = -self._cw_swing_coupling * cos_pt
 
         # Arm aero drag torque always opposes the arm's angular velocity, whichever way it spins
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
@@ -461,7 +568,8 @@ class TrebuchetSimulator:
         # Generalized forces on theta (arm angle)
         Q_theta = (
             self._coupling * sin_at * alpha_dot**2                       # projectile inertial coupling
-            - self._cw_gravity_torque                                    # counterweight gravity
+            - self._cw_swing_coupling * sin_pt * psi_dot**2              # counterweight swing coupling
+            + self._cw_torque_const + self._cw_torque_cos * cos_t        # counterweight gravity (via arm)
             - self._arm_gravity_k * cos_t                                # arm gravity
             - self._proj_gravity_theta_k * cos_t                         # projectile gravity (via arm)
             + arm_drag_torque                                            # arm drag
@@ -476,14 +584,34 @@ class TrebuchetSimulator:
             + Q_alpha_drag                                               # projectile drag
         )
 
-        det = self._M11 * self._M22 - M12 * M12
+        # Generalized force on psi (counterweight swing about its pin)
+        Q_psi = (
+            self._cw_swing_coupling * sin_pt * theta_dot**2              # arm inertial coupling
+            - self._cw_swing_gravity_k * cos_p                           # weight gravity
+        )
+
+        # Solve M q_ddot = Q for the symmetric 3x3 with M23 = 0, via its adjugate.
+        # On the pulley machine M13 = 0 and M33 = 1, so every expression below
+        # collapses to the original two-coordinate solve exactly - multiplying by
+        # 1.0 and subtracting 0.0 are exact in IEEE754, so each call returns the same
+        # accelerations it did before the third coordinate existed.
+        #
+        # The integrated *trajectory* still shifts very slightly (~3e-7 relative on the
+        # default machine). psi is inert there, but RK45 measures its error over the
+        # whole state vector, so two always-zero components dilute the norm and change
+        # the accepted step sizes - 73 steps where the 4-state system took 75. It is a
+        # different path to the same solution, orders of magnitude below the model's
+        # own accuracy, not a change in the physics.
+        A, B, C, D, E = self._M11, M12, M13, self._M22, self._M33
+        det = A * D * E - B * B * E - C * C * D
         if abs(det) < 1e-12:
-            return [theta_dot, 0.0, alpha_dot, 0.0]
+            return [theta_dot, 0.0, alpha_dot, 0.0, psi_dot, 0.0]
 
-        theta_ddot = (Q_theta * self._M22 - Q_alpha * M12) / det
-        alpha_ddot = (Q_alpha * self._M11 - Q_theta * M12) / det
+        theta_ddot = (D * E * Q_theta - B * E * Q_alpha - C * D * Q_psi) / det
+        alpha_ddot = (-B * E * Q_theta + (A * E - C * C) * Q_alpha + B * C * Q_psi) / det
+        psi_ddot = (-C * D * Q_theta + B * C * Q_alpha + (A * D - B * B) * Q_psi) / det
 
-        return [theta_dot, theta_ddot, alpha_dot, alpha_ddot]
+        return [theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot]
 
     def constraint_tensions(self, t: float, y: State) -> Tuple[float, float]:
         """(string tension, counterweight rope tension) at the current state, in newtons.
@@ -499,8 +627,8 @@ class TrebuchetSimulator:
         radial (along-string) acceleration, and alpha_ddot only contributes
         tangentially; the counterweight's acceleration is r_pul * theta_ddot.
         """
-        theta, theta_dot, alpha, alpha_dot = y
-        _, theta_ddot, _, _ = self.trebuchet_dynamics(t, y)
+        theta, theta_dot, alpha, alpha_dot = y[0], y[1], y[2], y[3]
+        theta_ddot = self.trebuchet_dynamics(t, y)[1]
         l_a, l_s = self._l_a, self._l_s
         m_p = self.params.projectile_mass
 
@@ -522,7 +650,12 @@ class TrebuchetSimulator:
             - m_p * radial_acc
         )
 
-        # The counterweight moves vertically with a_y = r_pul * theta_ddot; the rope pulls up.
+        # Pulley machine only: the weight moves vertically with a_y = r_pul *
+        # theta_ddot and the rope pulls up, so the rope can be checked for going
+        # slack. The traditional machine hangs its weight on a pinned link, a rigid
+        # two-force member by construction - no rope, so no tension to report.
+        if not self.params.has_pulley:
+            return string_tension, math.nan
         cw_tension = self.params.counter_weight_mass * (G + self.params.pulley_radius * theta_ddot)
 
         return string_tension, cw_tension
@@ -542,6 +675,9 @@ class TrebuchetSimulator:
         cw_T_min = math.inf
         cw_impulse = 0.0
         m_cw, r_pul = self.params.counter_weight_mass, self.params.pulley_radius
+        # Counterweight-rope diagnostics only mean something on the pulley machine
+        # (see constraint_tensions); a pinned link cannot go slack.
+        track_cw = self.params.has_pulley
 
         for seg in launch.segments:
             ts = seg.sol.t
@@ -553,8 +689,10 @@ class TrebuchetSimulator:
                 else:
                     string_T = 0.0  # slack rope carries nothing
                     theta_ddot = self._launch_slack_dynamics(t_i, y_i)[1]
-                    cw_T = m_cw * (G + r_pul * theta_ddot)
+                    cw_T = m_cw * (G + r_pul * theta_ddot) if track_cw else math.nan
                 string_T_min = min(string_T_min, string_T)
+                if not track_cw:
+                    continue
                 cw_T_min = min(cw_T_min, cw_T)
                 deficit = max(0.0, -cw_T)
                 if prev_deficit is not None:
@@ -562,39 +700,74 @@ class TrebuchetSimulator:
                 prev_deficit = deficit
 
         duration = launch.t_end
-        return {
+        metrics = {
             "min_string_tension": float(string_T_min),
-            "min_cw_rope_tension": float(cw_T_min),
-            "cw_rope_compression_impulse": float(cw_impulse),
             "string_slack_fraction": float(launch.slack_time / duration) if duration > 0 else 0.0,
             "sling_snap_count": len(launch.snap_times),
             "sling_snap_energy": float(sum(launch.snap_energy_losses)),
         }
+        if track_cw:
+            metrics["min_cw_rope_tension"] = float(cw_T_min)
+            metrics["cw_rope_compression_impulse"] = float(cw_impulse)
+        return metrics
 
-    def _launch_slack_dynamics(self, t: float, y) -> List[float]:
-        """Launch dynamics while the sling is slack: y = [theta, theta_dot, px, py, pvx, pvy].
+    def _machine_only_accelerations(self, theta, theta_dot, psi, psi_dot):
+        """(theta_ddot, psi_ddot) for the machine carrying no projectile.
 
-        The arm/pulley/counterweight run as the same single-DOF machine as the taut
-        aftermath (projectile terms gone); the projectile is in free flight with
-        quadratic drag (same force law as trajectory.py).
+        Shared by the slack-sling launch regime and the post-release aftermath: both
+        are the same body - arm, plus either a pulley-hung or a pinned counterweight -
+        swinging on its own. Two coordinates on the traditional machine; on the pulley
+        machine M13 = 0 and M33 = 1 reduce it to Q_theta / M_taut exactly.
         """
-        theta, theta_dot, _px, _py, pvx, pvy = y
-        cos_t = math.cos(theta)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        cos_p, sin_p = math.cos(psi), math.sin(psi)
+        sin_pt = sin_p * cos_t - cos_p * sin_t
+        cos_pt = cos_p * cos_t + sin_p * sin_t
+
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
         Q_theta = (
-            -self._cw_gravity_torque
+            -self._cw_swing_coupling * sin_pt * psi_dot**2
+            + self._cw_torque_const + self._cw_torque_cos * cos_t
             - self._arm_gravity_k * cos_t
             + arm_drag_torque
             - self._joint_friction * theta_dot
         )
+        Q_psi = self._cw_swing_coupling * sin_pt * theta_dot**2 - self._cw_swing_gravity_k * cos_p
+
+        M13 = -self._cw_swing_coupling * cos_pt
+        det = self._M_taut * self._M33 - M13 * M13
+        if abs(det) < 1e-12:
+            return 0.0, 0.0
+        return (
+            (self._M33 * Q_theta - M13 * Q_psi) / det,
+            (self._M_taut * Q_psi - M13 * Q_theta) / det,
+        )
+
+    def _launch_slack_dynamics(self, t: float, y) -> List[float]:
+        """Launch dynamics while the sling is slack.
+
+        y = [theta, theta_dot, px, py, pvx, pvy, psi, psi_dot]. The machine runs as
+        the same body as the taut aftermath (projectile terms gone); the projectile
+        is in free flight with quadratic drag (same force law as trajectory.py).
+        """
+        theta, theta_dot, _px, _py, pvx, pvy, psi, psi_dot = y
+        theta_ddot, psi_ddot = self._machine_only_accelerations(theta, theta_dot, psi, psi_dot)
         speed = math.hypot(pvx, pvy)
         drag_accel = -self._proj_drag_k * speed / self._m_p if speed > 1e-12 else 0.0
-        return [theta_dot, Q_theta / self._M_taut, pvx, pvy, drag_accel * pvx, -G + drag_accel * pvy]
+        return [
+            theta_dot, theta_ddot, pvx, pvy,
+            drag_accel * pvx, -G + drag_accel * pvy,
+            psi_dot, psi_ddot,
+        ]
 
     def _slack_state_from_taut(self, y_taut) -> List[float]:
         """Map a taut state to the slack state vector (projectile cut loose in place)."""
         pos, vel = self.projectile_position_velocity(y_taut)
-        return [float(y_taut[0]), float(y_taut[1]), float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1])]
+        return [
+            float(y_taut[0]), float(y_taut[1]),
+            float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1]),
+            float(y_taut[4]), float(y_taut[5]),
+        ]
 
     def _apply_snap(self, y_slack) -> Tuple[List[float], List[float], float]:
         """Inelastic re-tension snap at the moment the string comes taut again.
@@ -606,7 +779,7 @@ class TrebuchetSimulator:
         a regime by checking the post-snap string tension. The energy lost is
         0.5 * P * g_dot, always >= 0: the snap can only ever dissipate.
         """
-        theta, theta_dot, px, py, pvx, pvy = (float(v) for v in y_slack)
+        theta, theta_dot, px, py, pvx, pvy, psi, psi_dot = (float(v) for v in y_slack)
         l_a, l_s, m_p = self._l_a, self._l_s, self._m_p
 
         sin_t, cos_t = math.sin(theta), math.cos(theta)
@@ -619,10 +792,21 @@ class TrebuchetSimulator:
         g_dot = (pvx - theta_dot * tvx) * ex + (pvy - theta_dot * tvy) * ey  # radial separation speed
         t_dot_e = tvx * ex + tvy * ey
 
+        # The sling pulls on theta only, but on the traditional machine theta is
+        # inertially coupled to the counterweight's swing, so the arm resists the
+        # impulse with an effective inertia M_taut - M13^2/M33 rather than M_taut,
+        # and the weight picks up its share of the jerk. On the pulley machine
+        # M13 = 0, leaving M_eff = M_taut and the weight untouched, exactly as before.
+        cos_p, sin_p = math.cos(psi), math.sin(psi)
+        cos_pt = cos_p * cos_t + sin_p * sin_t
+        M13 = -self._cw_swing_coupling * cos_pt
+        M_eff = self._M_taut - M13 * M13 / self._M33
+
         energy_lost = 0.0
         if g_dot > 0.0:
-            P = g_dot / (1.0 / m_p + t_dot_e * t_dot_e / self._M_taut)
-            theta_dot += P * t_dot_e / self._M_taut
+            P = g_dot / (1.0 / m_p + t_dot_e * t_dot_e / M_eff)
+            theta_dot += P * t_dot_e / M_eff
+            psi_dot -= M13 * P * t_dot_e / (self._M33 * M_eff)
             pvx -= P / m_p * ex
             pvy -= P / m_p * ey
             energy_lost = 0.5 * P * g_dot
@@ -631,10 +815,12 @@ class TrebuchetSimulator:
         v_tip_x, v_tip_y = theta_dot * tvx, theta_dot * tvy
         alpha_dot = ((pvx - v_tip_x) * -math.sin(alpha) + (pvy - v_tip_y) * math.cos(alpha)) / l_s
 
-        taut_state = [theta, theta_dot, alpha, alpha_dot]
+        taut_state = [theta, theta_dot, alpha, alpha_dot, psi, psi_dot]
         # Snap the projectile exactly onto the string circle so a continued slack
         # segment starts with separation == l_s rather than integration-error above it.
-        slack_state = [theta, theta_dot, tip_x + l_s * ex, tip_y + l_s * ey, pvx, pvy]
+        slack_state = [
+            theta, theta_dot, tip_x + l_s * ex, tip_y + l_s * ey, pvx, pvy, psi, psi_dot,
+        ]
         return taut_state, slack_state, energy_lost
 
     def _integrate_launch(self, t_max: float, rtol: float, dense_output: bool) -> LaunchSolution:
@@ -697,6 +883,10 @@ class TrebuchetSimulator:
                 launch.release_occurred = True
                 launch.t_release = float(sol.t_events[0][0])
                 launch.release_machine_state = (float(y_release[0]), float(y_release[1]))
+                swing_base = 4 if regime == "taut" else 6
+                launch.release_swing_state = (
+                    float(y_release[swing_base]), float(y_release[swing_base + 1])
+                )
                 if regime == "taut":
                     launch.release_projectile_state = self.projectile_position_velocity(y_release)
                 else:
@@ -730,24 +920,57 @@ class TrebuchetSimulator:
 
     def _aftermath_dynamics_taut(self, t: float, y) -> List[float]:
         """Single-DOF dynamics with the counterweight coupled through the taut rope."""
-        theta, theta_dot = y
-        cos_t = math.cos(theta)
-        arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
-        Q_theta = (
-            -self._cw_gravity_torque
-            - self._arm_gravity_k * cos_t
-            + arm_drag_torque
-            - self._joint_friction * theta_dot
-        )
-        return [theta_dot, Q_theta / self._M_taut]
+        theta, theta_dot, psi, psi_dot = y
+        theta_ddot, psi_ddot = self._machine_only_accelerations(theta, theta_dot, psi, psi_dot)
+        return [theta_dot, theta_ddot, psi_dot, psi_ddot]
 
     def _aftermath_dynamics_slack(self, t: float, y) -> List[float]:
-        """Single-DOF dynamics with the counterweight resting on the ground (rope slack)."""
-        theta, theta_dot = y
+        """Dynamics with the counterweight resting on the ground (rope slack).
+
+        Pulley machine only - psi is inert there, so it is carried unchanged.
+        """
+        theta, theta_dot = y[0], y[1]
         cos_t = math.cos(theta)
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
         Q_theta = -self._arm_gravity_k * cos_t + arm_drag_torque - self._joint_friction * theta_dot
-        return [theta_dot, Q_theta / self._M_slack]
+        return [theta_dot, Q_theta / self._M_slack, 0.0, 0.0]
+
+    def _simulate_aftermath_pinned(
+        self, theta_release: float, theta_dot_release: float, duration: float, rtol: float = 1e-8,
+    ) -> AftermathResult:
+        """Post-release dynamics for a counterweight pinned to the arm.
+
+        Nothing can go slack here - the weight is part of the machine - so there is
+        one regime for the whole window rather than the pulley machine's taut/slack
+        alternation. The only discontinuity is the weight striking the ground, which
+        stops the arm rather than letting it swing on through the floor; after that
+        the pose is held (state_at clamps past the final segment).
+        """
+        half = self._cw_half_size
+
+        def ground_event(t, y):
+            (_wx, wy), _vel = self.weight_position_velocity((y[0], y[1], 0.0, 0.0, y[2], y[3]))
+            return wy - half
+
+        ground_event.terminal = True
+        ground_event.direction = -1
+
+        y0 = [theta_release, theta_dot_release, self._psi_rest, 0.0]
+        # Only arm the event if the weight starts clear of the ground; otherwise the
+        # solver would trip it immediately at t=0 and return a zero-length segment.
+        events = ground_event if ground_event(0.0, y0) > 0 else None
+        sol = solve_ivp(
+            self._aftermath_dynamics_taut, (0, duration), y0,
+            events=events, dense_output=True, rtol=rtol,
+        )
+        touchdowns = []
+        if events is not None and sol.t_events[0].size:
+            touchdowns.append(float(sol.t[-1]))
+        return AftermathResult(
+            segments=[AftermathSegment(sol=sol, t0=0.0, t1=float(sol.t[-1]), regime="taut")],
+            touchdown_times=touchdowns,
+            retension_times=[],
+        )
 
     def simulate_aftermath(
         self, theta_release: float, theta_dot_release: float, duration: float,
@@ -769,6 +992,11 @@ class TrebuchetSimulator:
         the taut regime (the arm out-accelerating the falling counterweight) - the same
         assumption the launch phase already makes.
         """
+        if not self.params.has_pulley:
+            return self._simulate_aftermath_pinned(
+                theta_release, theta_dot_release, duration, rtol=rtol
+            )
+
         theta_ground = self._theta_ground
 
         def touchdown_event(t, y):
@@ -798,12 +1026,12 @@ class TrebuchetSimulator:
 
             if regime == "taut":
                 sol = solve_ivp(
-                    self._aftermath_dynamics_taut, (0, remaining), [theta, theta_dot],
+                    self._aftermath_dynamics_taut, (0, remaining), [theta, theta_dot, 0.0, 0.0],
                     events=touchdown_event, dense_output=True, rtol=rtol,
                 )
             else:
                 sol = solve_ivp(
-                    self._aftermath_dynamics_slack, (0, remaining), [theta, theta_dot],
+                    self._aftermath_dynamics_slack, (0, remaining), [theta, theta_dot, 0.0, 0.0],
                     events=retension_event, dense_output=True, rtol=rtol,
                 )
 
@@ -814,7 +1042,7 @@ class TrebuchetSimulator:
             if sol.t_events[0].size == 0:
                 break  # ran out of duration without crossing the ground line again
 
-            theta, theta_dot = sol.y_events[0][0]
+            theta, theta_dot = sol.y_events[0][0][0], sol.y_events[0][0][1]
             # The event leaves theta exactly on the ground line, where scipy sees
             # g(t0) == 0 as a sign change in both directions and fires the next
             # segment's terminal event again at t0 - an endless chatter of
@@ -833,11 +1061,24 @@ class TrebuchetSimulator:
         return AftermathResult(segments=segments, touchdown_times=touchdown_times, retension_times=retension_times)
 
     def initial_state(self) -> List[float]:
-        """Launch-ready state: arm cocked at the initial angle, projectile hanging
-        from the sling just clear of the arm, everything at rest."""
-        theta_i = self.params.initial_arm_angle
-        alpha_i = theta_i + np.pi - np.arcsin(self.params.projectile_radius / self.params.string_length)
-        return [float(theta_i), 0.0, float(alpha_i), 0.0]
+        """Launch-ready state: arm cocked at the initial angle, everything at rest.
+
+        Pulley machine: the projectile is tucked alongside the arm, the sling
+        angled just far enough off the arm line to clear it.
+
+        Traditional machine: the arm is cocked nose-down and the sling hangs
+        straight below the tip, putting the projectile on the ground in front of
+        the machine; the counterweight likewise hangs straight down from its pin.
+        (The projectile is not ground-constrained once the launch starts - the
+        model has never had a contact phase - so choose a geometry where the tip
+        sits about a sling length above the ground.)
+        """
+        p = self.params
+        theta_i = float(p.initial_arm_angle)
+        if p.has_pulley:
+            alpha_i = theta_i + np.pi - np.arcsin(p.projectile_radius / p.string_length)
+            return [theta_i, 0.0, float(alpha_i), 0.0, 0.0, 0.0]
+        return [theta_i, 0.0, self._psi_rest, 0.0, self._psi_rest, 0.0]
 
     def simulate(
         self, t_max: float = 10.0, rtol: float = 1e-8, dense_output: bool = True, simulate_aftermath: bool = False,
@@ -985,11 +1226,28 @@ class TrebuchetSimulator:
             aftermath = self.simulate_aftermath(theta_release, theta_dot_release, flight_time)
 
         arm_angle_rotated = self.params.initial_arm_angle - theta_release
-        height_dropped = self.params.pulley_radius * arm_angle_rotated
+        if self.params.has_pulley:
+            # The weight descends r_pul per radian, so the drop is exactly linear.
+            height_dropped = self.params.pulley_radius * arm_angle_rotated
+        else:
+            # The pinned weight follows the pin around the pivot and swings on top of
+            # that, so measure its height directly at both ends of the launch.
+            psi_0, psi_dot_0 = self._psi_rest, 0.0
+            psi_r, psi_dot_r = launch.release_swing_state or (self._psi_rest, 0.0)
+            start = self.weight_position_velocity(
+                (self.params.initial_arm_angle, 0.0, 0.0, 0.0, psi_0, psi_dot_0)
+            )[0][1]
+            end = self.weight_position_velocity(
+                (theta_release, theta_dot_release, 0.0, 0.0, psi_r, psi_dot_r)
+            )[0][1]
+            height_dropped = start - end
         counterweight_PE_spent = self.params.counter_weight_mass * G * height_dropped
 
+        # The beam's centre of mass, not its half-length: on the traditional machine the
+        # arm extends behind the pivot as well, which pulls the balance point in to
+        # (a - b)/2. Dividing by two is exact, so the pulley machine (b = 0) is unchanged.
         arm_height_change = (
-            (np.sin(self.params.initial_arm_angle) - np.sin(theta_release)) * self.params.arm_length / 2
+            (np.sin(self.params.initial_arm_angle) - np.sin(theta_release)) * self.params.arm_cm_offset
         )
         arm_PE_spent = arm_height_change * self.params.arm_mass * G
 

@@ -174,54 +174,123 @@ def save_animation_gif(anim: FuncAnimation, filename: str, fps: int = 30) -> Non
     print(f"Animation saved as {filename}")
 
 
-def build_energy_figure(result: SimulationResult, compact: bool = False):
+# Dark palette for the web dashboard's embedded energy figure, kept in step with
+# web/theme.py. Imported lazily inside build_energy_figure so this module (used
+# by the CLI, which never touches the web package) keeps no web dependency.
+def _dark_plot_palette() -> dict:
+    from trebuchet_sim.web import theme
+
+    return {
+        "surface": theme.SURFACE,
+        "text": theme.TEXT,
+        "muted": theme.MUTED,
+        "grid": theme.BORDER,
+        "total": theme.TEXT,
+        "cw": theme.SUCCESS,
+        "proj": "#ff7a5c",
+        "arm": theme.INFO,
+        "pulley": "#c084fc",
+        "release": theme.ACCENT,
+    }
+
+
+_LIGHT_PLOT_PALETTE = {
+    "surface": "white",
+    "text": "black",
+    "muted": "black",
+    "grid": "gray",
+    "total": "black",
+    "cw": "green",
+    "proj": "red",
+    "arm": "blue",
+    "pulley": "magenta",
+    "release": "orange",
+}
+
+
+def _legend_above(ax, ncol: int, fontsize: int) -> None:
+    """Put an axes' legend in a horizontal strip just above the plot area.
+
+    Frameless and spanning the full axes width, so it reads as a caption rather
+    than a box floating over the data.
+    """
+    # Anchored to the axes' top-left corner and packed left, rather than
+    # stretched across the full width - with only two entries an expanded
+    # legend pushes them to opposite ends and reads as two stray labels.
+    ax.legend(
+        fontsize=fontsize, ncol=ncol, frameon=False,
+        loc="lower left", bbox_to_anchor=(0.0, 1.01),
+        borderaxespad=0.0, handlelength=1.4,
+        columnspacing=1.2, handletextpad=0.4,
+    )
+
+
+def build_energy_figure(result: SimulationResult, compact: bool = False, dark: bool = False):
     """Build the two-panel energy-components figure. Public so callers (e.g. the web UI) can embed it directly.
 
     compact=True lays the panels side by side in a short, wide figure sized for
     embedding in the single-screen web dashboard.
+
+    dark=True restyles the figure for the dashboard's dark surface (the default
+    light styling is what the CLI's saved PNGs want).
     """
     history = result.energy_history
     times = [e["time"] for e in history]
+    palette = _dark_plot_palette() if dark else _LIGHT_PLOT_PALETTE
 
     if compact:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.2))
     else:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), height_ratios=[1, 1])
-        fig.suptitle("Trebuchet Energy Components Over Time", fontsize=16, fontweight="bold")
+        fig.suptitle("Trebuchet Energy Components Over Time", fontsize=16, fontweight="bold", color=palette["text"])
 
     label_size = 9 if compact else 12
     title_size = 10 if compact else 14
     legend_size = 8 if compact else 11
     detail_legend_size = 7 if compact else 10
 
-    total_energies = [e["total"] for e in history]
-    ax1.plot(times, total_energies, "k-", label="Total Energy", linewidth=3, alpha=0.9)
-    ax1.plot(times, [e["cw_pe"] for e in history], "g--", label="Counterweight PE", linewidth=2.5, alpha=0.8)
-    ax1.set_ylabel("Energy (J)", fontsize=label_size)
-    ax1.set_title("Total and Counterweight PE" if compact else "Total Energy and Counterweight Potential Energy", fontsize=title_size)
-    ax1.legend(fontsize=legend_size)
-    ax1.grid(True, alpha=0.3)
+    # Compact mode abbreviates the series names and drops the axes titles: the
+    # panels are only a few inches wide there, and the legend already says what
+    # each one plots, so the title was redundant with it.
+    def name(full: str, short: str) -> str:
+        return short if compact else full
 
-    ax2.plot(times, [e["proj_ke"] for e in history], "r-", label="Projectile KE", linewidth=2)
-    ax2.plot(times, [e["arm_ke"] for e in history], "b-", label="Arm KE", linewidth=2)
-    ax2.plot(times, [e["cw_ke"] for e in history], "g-", label="Counterweight KE", linewidth=2)
-    ax2.plot(times, [e["pulley_ke"] for e in history], "m-", label="Pulley KE", linewidth=2)
-    ax2.plot(times, [e["proj_pe"] for e in history], "r--", label="Projectile PE", linewidth=2, alpha=0.8)
-    ax2.plot(times, [e["arm_pe"] for e in history], "b--", label="Arm PE", linewidth=2, alpha=0.8)
+    total_energies = [e["total"] for e in history]
+    ax1.plot(times, total_energies, "-", color=palette["total"], label=name("Total Energy", "Total"), linewidth=2.5, alpha=0.95)
+    ax1.plot(times, [e["cw_pe"] for e in history], "--", color=palette["cw"], label=name("Counterweight PE", "CW PE"), linewidth=2.2, alpha=0.9)
+    ax1.set_ylabel("Energy (J)", fontsize=label_size)
+
+    ax2.plot(times, [e["proj_ke"] for e in history], "-", color=palette["proj"], label=name("Projectile KE", "Proj KE"), linewidth=2)
+    ax2.plot(times, [e["arm_ke"] for e in history], "-", color=palette["arm"], label="Arm KE", linewidth=2)
+    ax2.plot(times, [e["cw_ke"] for e in history], "-", color=palette["cw"], label=name("Counterweight KE", "CW KE"), linewidth=2)
+    ax2.plot(times, [e["pulley_ke"] for e in history], "-", color=palette["pulley"], label=name("Pulley KE", "Pulley"), linewidth=2)
+    ax2.plot(times, [e["proj_pe"] for e in history], "--", color=palette["proj"], label=name("Projectile PE", "Proj PE"), linewidth=1.8, alpha=0.75)
+    ax2.plot(times, [e["arm_pe"] for e in history], "--", color=palette["arm"], label=name("Arm PE", "Arm PE"), linewidth=1.8, alpha=0.75)
     ax2.set_xlabel("Time (s)", fontsize=label_size)
     ax2.set_ylabel("Energy (J)", fontsize=label_size)
-    ax2.set_title("Energy Components" if compact else "Kinetic and Potential Energy Components (Detail View)", fontsize=title_size)
-    ax2.legend(fontsize=detail_legend_size, ncol=2)
-    ax2.grid(True, alpha=0.3)
+
     if compact:
+        # Legends go above the axes as a single horizontal strip. Inside the
+        # plot they sat on top of the curves - with six series the detail panel
+        # has no empty corner for `loc="best"` to find.
+        _legend_above(ax1, ncol=2, fontsize=legend_size)
+        _legend_above(ax2, ncol=6, fontsize=detail_legend_size)
         ax1.set_xlabel("Time (s)", fontsize=label_size)
         ax1.tick_params(labelsize=8)
         ax2.tick_params(labelsize=8)
+    else:
+        ax1.set_title("Total Energy and Counterweight Potential Energy", fontsize=title_size)
+        ax2.set_title("Kinetic and Potential Energy Components (Detail View)", fontsize=title_size)
+        ax1.legend(fontsize=legend_size)
+        ax2.legend(fontsize=detail_legend_size, ncol=2)
+
+    ax1.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.3)
 
     if result.metrics.get("release_occurred", True) and "t_release" in result.metrics:
         release_time = result.metrics["t_release"]
-        ax1.axvline(x=release_time, color="orange", linestyle=":", linewidth=2, alpha=0.8)
-        ax2.axvline(x=release_time, color="orange", linestyle=":", linewidth=2, alpha=0.8)
+        ax1.axvline(x=release_time, color=palette["release"], linestyle=":", linewidth=2, alpha=0.9)
+        ax2.axvline(x=release_time, color=palette["release"], linestyle=":", linewidth=2, alpha=0.9)
 
         if not compact:
             max_energy_top = max(total_energies)
@@ -229,14 +298,52 @@ def build_energy_figure(result: SimulationResult, compact: bool = False):
                 f"Release\n(t={release_time:.3f}s)",
                 xy=(release_time, max_energy_top * 0.9),
                 xytext=(release_time + 0.1, max_energy_top * 0.9),
-                arrowprops=dict(arrowstyle="->", color="orange", alpha=0.8),
+                arrowprops=dict(arrowstyle="->", color=palette["release"], alpha=0.8),
                 fontsize=10,
-                color="orange",
+                color=palette["release"],
                 fontweight="bold",
             )
 
+    if dark:
+        _apply_dark_axes(fig, (ax1, ax2), palette)
+
     plt.tight_layout()
+    if compact:
+        # tight_layout ignores legends anchored outside the axes, so the strip
+        # would otherwise be clipped by the top of the figure.
+        fig.subplots_adjust(top=0.84)
     return fig
+
+
+def _apply_dark_axes(fig, axes, palette: dict) -> None:
+    """Recolor a finished figure for the dashboard's dark panel.
+
+    Applied after plotting rather than through an rcParams style so the CLI's
+    light output is untouched by a global side effect.
+    """
+    fig.patch.set_facecolor(palette["surface"])
+    for ax in axes:
+        ax.set_facecolor(palette["surface"])
+        ax.tick_params(colors=palette["muted"])
+        ax.xaxis.label.set_color(palette["muted"])
+        ax.yaxis.label.set_color(palette["muted"])
+        # Colour alone separates the title here; DejaVu (matplotlib's bundled
+        # default) has no semibold face, and asking for one logs a findfont
+        # warning on every render.
+        ax.title.set_color(palette["text"])
+        ax.grid(True, alpha=0.18, color=palette["grid"])
+        for side, spine in ax.spines.items():
+            # Keep a single light baseline instead of a full box - the chart
+            # reads as part of the panel rather than a pasted-in image.
+            spine.set_visible(side in ("bottom", "left"))
+            spine.set_color(palette["grid"])
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.get_frame().set_facecolor(palette["surface"])
+            legend.get_frame().set_edgecolor(palette["grid"])
+            legend.get_frame().set_alpha(0.85)
+            for text in legend.get_texts():
+                text.set_color(palette["muted"])
 
 
 def plot_energy_history(result: SimulationResult) -> None:

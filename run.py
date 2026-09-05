@@ -4,12 +4,18 @@
 Usage: python run.py
 
 Works with any Python — even one without Streamlit installed — because it
-finds the project's .venv/ interpreter and launches Streamlit with that.
+finds the project's .venv/ interpreter and launches Streamlit with that. If
+that venv is missing or stale (see _repair_venv), it is rebuilt in place first,
+so moving or copying the project folder needs no manual setup.
 Picks the first free port at or after 8501, then opens the browser once the
 server responds. Serves at http://treb-simulator.local:<port> if that
 hostname is mapped in your hosts file, otherwise at http://localhost:<port>.
+
+Every path here is derived from this file's own location, so the project can
+live anywhere.
 """
 
+import importlib.util
 import os
 import socket
 import subprocess
@@ -35,29 +41,97 @@ Streamlit is not installed. Set the project up once, then re-run this script:
 """
 
 
+VENV_DIR = REPO_ROOT / ".venv"
+
+
+def _venv_pythons() -> "list[Path]":
+    """Candidate venv interpreter paths, both platform layouts."""
+    return [
+        VENV_DIR / "Scripts" / "python.exe",  # Windows
+        VENV_DIR / "bin" / "python",          # macOS/Linux
+    ]
+
+
+def _runs_streamlit(python: Path) -> bool:
+    """True if `python` exists and can import Streamlit."""
+    if not python.exists():
+        return False
+    try:
+        probe = subprocess.run([str(python), "-c", "import streamlit"], capture_output=True)
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+def _repair_venv() -> bool:
+    """Rebuild .venv in place, then reinstall the project into it.
+
+    A virtual environment is not relocatable: pyvenv.cfg records an absolute
+    path to the base interpreter, and pip's editable install records an
+    absolute path to src/. Moving or copying the project - or upgrading the
+    system Python - leaves both dangling, and every command that uses the venv
+    then fails with a confusing "did not find executable" error.
+
+    `python -m venv` over an existing directory rewrites those records without
+    deleting anything, so this is a repair rather than a wipe; the editable
+    reinstall then re-points the project path and refreshes any dependency
+    built for the previous Python's ABI.
+
+    Returns False (leaving the venv untouched) when this script is *running*
+    from the venv it would have to rebuild.
+    """
+    if Path(sys.executable).resolve().is_relative_to(VENV_DIR.resolve()):
+        return False
+
+    print("Setting up .venv (missing or stale) - this runs once after a move or a fresh clone.")
+    try:
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+        python = next(p for p in _venv_pythons() if p.exists())
+        subprocess.check_call([str(python), "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
+        subprocess.check_call([str(python), "-m", "pip", "install", "-e", ".[dev]"], cwd=REPO_ROOT)
+    except (subprocess.CalledProcessError, StopIteration, OSError) as exc:
+        print(f"Automatic setup failed ({exc}).", file=sys.stderr)
+        return False
+    return True
+
+
 def _find_interpreter() -> str:
     """Pick an interpreter that has Streamlit installed, preferring the venv.
 
     run.py itself may be started with any Python (system install, py launcher,
     double-click); only the child process that runs Streamlit needs the venv.
     """
-    candidates = [
-        REPO_ROOT / ".venv" / "Scripts" / "python.exe",  # Windows venv
-        REPO_ROOT / ".venv" / "bin" / "python",          # macOS/Linux venv
-        Path(sys.executable),
-    ]
-    for python in candidates:
-        if not python.exists():
-            continue
-        probe = subprocess.run(
-            [str(python), "-c", "import streamlit"],
-            capture_output=True,
-        )
-        if probe.returncode == 0:
+    for python in [*_venv_pythons(), Path(sys.executable)]:
+        if _runs_streamlit(python):
             return str(python)
+
+    # Nothing usable: most often a venv that was moved with the project, or a
+    # checkout that has never been set up. Both are repairable without help.
+    if _repair_venv():
+        for python in _venv_pythons():
+            if _runs_streamlit(python):
+                return str(python)
 
     print(SETUP_HELP, file=sys.stderr)
     raise SystemExit(1)
+
+
+def _theme_env() -> dict:
+    """Streamlit theme settings from the dashboard's own palette module.
+
+    Loaded straight from the file rather than `from trebuchet_sim.web import
+    theme`: that would execute the package __init__, which imports numpy and
+    scipy - and run.py has to work under an interpreter where nothing is
+    installed yet. theme.py itself imports nothing, so this is safe.
+    """
+    theme_path = REPO_ROOT / "src" / "trebuchet_sim" / "web" / "theme.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_trebuchet_theme", theme_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.streamlit_theme_env()
+    except Exception:  # theme is cosmetic - never block startup over it
+        return {}
 
 
 def _find_free_port(start: int, attempts: int = 20) -> int:
@@ -112,6 +186,11 @@ def _child_env() -> dict:
     # Saved dashboard defaults (user_defaults.json) live in the repo root for
     # local checkouts; without this the app falls back to ~/.trebuchet-sim.
     env.setdefault("TREBUCHET_DATA_DIR", str(REPO_ROOT))
+    # Streamlit resolves its theme at server start, before app.py runs, so the
+    # palette has to arrive as config (see web/launcher.py for the same step on
+    # the installed/console-script path).
+    for key, value in _theme_env().items():
+        env.setdefault(key, value)
     return env
 
 

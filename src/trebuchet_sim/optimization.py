@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.optimize import differential_evolution
 
-from trebuchet_sim.config import TrebuchetParams
+from trebuchet_sim.config import DEFAULT_INITIAL_ARM_ANGLE, MachineType, TrebuchetParams
 from trebuchet_sim.physics import SimulationResult, simulate_trebuchet
 
 try:
@@ -129,10 +129,12 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
     mass_cost = (params.total_mass / 30.0) * 100
-    slack_cost = config.slack_penalty_weight * (
-        result.metrics.get("string_compression_impulse", 0.0)
-        + result.metrics.get("cw_rope_compression_impulse", 0.0)
-    )
+    # Only the counterweight rope is still a rigid link here. The sling's slack phases
+    # and re-tension snaps are simulated for real by physics.py, so that loss already
+    # shows up in `efficiency` and needs no separate penalty (the key this used to read,
+    # `string_compression_impulse`, is not in the metrics any more). A traditional
+    # machine has no counterweight rope either, leaving this term zero for it.
+    slack_cost = config.slack_penalty_weight * result.metrics.get("cw_rope_compression_impulse", 0.0)
 
     return (
         config.efficiency_weight * efficiency_cost
@@ -145,7 +147,13 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
 def _fastsim_fixed_scalar(config: "OptimizationConfig", name: str) -> float:
     """A fixed (non-optimizable) TrebuchetParams field as a plain float: the config
     override if present, otherwise the dataclass default (matches build_params)."""
-    return float(config.fixed_params.get(name, getattr(TrebuchetParams, name)))
+    default = getattr(TrebuchetParams, name)
+    if default is None and name == "initial_arm_angle":
+        # No single dataclass default any more: the start angle depends on the
+        # machine. The fast engine only models the pulley machine, so that is the
+        # one to fall back on here (see the machine note in optimize_trebuchet).
+        default = DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY]
+    return float(config.fixed_params.get(name, default))
 
 
 def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.ndarray:
@@ -196,7 +204,13 @@ def optimize_trebuchet(
             result = None
         progress_callback(intermediate_result.nit, intermediate_result.fun, params, result)
 
-    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE
+    # fastsim ports the pulley machine's equations of motion only - it has no
+    # counterweight-swing coordinate - so a traditional machine has to fall back to
+    # the scipy objective, which builds a real TrebuchetParams and honours `machine`.
+    # Left unguarded, the search would score every candidate as a pulley machine and
+    # then report a traditional simulation of the winner: a silently wrong optimum.
+    machine = MachineType(config.fixed_params.get("machine", MachineType.PULLEY))
+    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE and machine is MachineType.PULLEY
     if use_fast:
         de_result = differential_evolution(
             partial(_objective_vectorized, config=config),

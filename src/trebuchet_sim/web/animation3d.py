@@ -14,6 +14,7 @@ import numpy as np
 import streamlit as st
 
 from trebuchet_sim.config import TrebuchetParams
+from trebuchet_sim.web import theme
 from trebuchet_sim.physics import SimulationResult, TrebuchetSimulator, sample_component_positions
 from trebuchet_sim.trajectory import integrate_ballistic_trajectory
 
@@ -89,7 +90,11 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
         t_aftermath = np.linspace(0, flight_time, BALLISTIC_SAMPLES)
         for t in t_aftermath:
             theta, theta_dot, regime = result.aftermath.state_at(float(t))
-            machine_state = (theta, theta_dot, 0.0, 0.0)
+            # psi carried through as well: a pinned counterweight keeps swinging about
+            # its pin after release, and dropping it would render the link frozen
+            # straight down. Inert on the pulley machine, whose weight has no swing.
+            psi, psi_dot = result.aftermath.swing_at(float(t))
+            machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
             arm_tip = simulator.arm_tip_position_velocity(machine_state)[0]
             cw_pos = (
                 (params.pulley_radius, params.counter_weight_size / 2)  # box resting on the ground, bottom at y=0
@@ -125,13 +130,35 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
     }
 
 
+# The embedded page is a plain string, so the palette is injected by placeholder
+# substitution (same mechanism as the timeline/Three.js payloads) - this keeps
+# the scene, its controls, and the dashboard chrome on one set of colors.
+def _hex_literal(css_hex: str) -> str:
+    """'#0f1724' -> '0x0f1724', the form Three.js color constructors take."""
+    return "0x" + css_hex.lstrip("#")
+
+
+_THEME_SUBSTITUTIONS = {
+    "__SCENE_BG__": theme.SCENE_BG,
+    "__TEXT__": theme.TEXT,
+    "__BORDER__": theme.BORDER_STRONG,
+    "__SURFACE2__": theme.SURFACE_2,
+    "__ACCENT__": theme.ACCENT,
+    "__SCENE_BG_HEX__": _hex_literal(theme.SCENE_BG),
+    "__GRID_HEX__": _hex_literal(theme.SCENE_GRID),
+    "__GROUND_HEX__": _hex_literal(theme.SCENE_GROUND),
+    "__TRAJ_HEX__": _hex_literal(theme.SCENE_TRAJECTORY),
+    "__TRAIL_HEX__": _hex_literal(theme.SCENE_TRAIL),
+}
+
+
 _HTML_TEMPLATE = r"""
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <style>
-  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b1220; }
+  html, body { margin: 0; padding: 0; overflow: hidden; background: __SCENE_BG__; }
   /* 100vh: fill whatever height the host gives the iframe (the Streamlit app
      stretches it with CSS), falling back to the height attribute otherwise. */
   #treb-root { position: relative; width: 100%; height: 100vh; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
@@ -139,18 +166,18 @@ _HTML_TEMPLATE = r"""
   #treb-controls {
     position: absolute; left: 0; right: 0; bottom: 0;
     display: flex; align-items: center; gap: 10px;
-    padding: 8px 14px; background: rgba(10, 14, 24, 0.72); backdrop-filter: blur(4px);
-    color: #e6ecf5; font-size: 13px;
+    padding: 7px 12px; background: rgba(8, 13, 22, 0.82); backdrop-filter: blur(6px);
+    color: __TEXT__; font-size: 12.5px; border-top: 1px solid __BORDER__;
   }
   #treb-controls button {
-    background: #2b6fe0; border: none; color: white; border-radius: 5px;
-    padding: 6px 12px; cursor: pointer; font-size: 13px;
+    background: __SURFACE2__; border: 1px solid __BORDER__; color: __TEXT__; border-radius: 6px;
+    padding: 5px 11px; cursor: pointer; font-size: 12.5px; font-weight: 600;
   }
-  #treb-controls button:hover { background: #3d80f0; }
+  #treb-controls button:hover { border-color: __ACCENT__; color: __ACCENT__; }
   #treb-scrub { flex: 1; }
   #treb-phase { min-width: 110px; text-align: right; opacity: 0.85; }
   #treb-time { min-width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
-  #treb-speed { background: #182338; color: #e6ecf5; border: 1px solid #33456b; border-radius: 4px; padding: 3px 4px; }
+  #treb-speed { background: __SURFACE2__; color: __TEXT__; border: 1px solid __BORDER__; border-radius: 5px; padding: 3px 4px; }
 </style>
 </head>
 <body>
@@ -189,7 +216,7 @@ _HTML_TEMPLATE = r"""
 
   // ---------- Scene setup ----------
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0b1220);
+  scene.background = new THREE.Color(__SCENE_BG_HEX__);
   // Fog distances are set after the camera is framed, scaled to the scene.
 
   const extent = Math.max(
@@ -304,7 +331,7 @@ _HTML_TEMPLATE = r"""
   // Debug/verification handle (used by automated UI checks; no runtime role).
   window.__treb = { camera, fit, lookTarget, ndcOf, machineRef, impactRef, composeScore };
   // Fog scaled to the framed scene so the far end of the flight stays visible.
-  scene.fog = new THREE.Fog(0x0b1220, fit.dist + extent, (fit.dist + extent) * 4);
+  scene.fog = new THREE.Fog(__SCENE_BG_HEX__, fit.dist + extent, (fit.dist + extent) * 4);
 
   const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
@@ -373,12 +400,12 @@ _HTML_TEMPLATE = r"""
   const groundSize = Math.max(extent * 2.4, 20);
   const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(groundSize, groundSize),
-    new THREE.MeshStandardMaterial({ color: 0x3a6b3a, roughness: 1, transparent: true, opacity: 0.45 })
+    new THREE.MeshStandardMaterial({ color: __GROUND_HEX__, roughness: 1, transparent: true, opacity: 0.42 })
   );
   ground.rotation.x = -Math.PI / 2;
   scene.add(ground);
 
-  const grid = new THREE.GridHelper(groundSize, Math.round(groundSize / 2), 0x224422, 0x1c3a1c);
+  const grid = new THREE.GridHelper(groundSize, Math.round(groundSize / 2), __GRID_HEX__, __GRID_HEX__);
   grid.position.y = 0.01;
   scene.add(grid);
 
@@ -473,7 +500,7 @@ _HTML_TEMPLATE = r"""
   const fullPathPoints = buildFullPath();
   const refLine = new THREE.Line(
     new THREE.BufferGeometry().setFromPoints(fullPathPoints),
-    new THREE.LineBasicMaterial({ color: 0xffb020, transparent: true, opacity: 0.28 })
+    new THREE.LineBasicMaterial({ color: __TRAJ_HEX__, transparent: true, opacity: 0.3 })
   );
   scene.add(refLine);
 
@@ -540,7 +567,7 @@ _HTML_TEMPLATE = r"""
   const trailPositions = new Float32Array(MAX_TRAIL * 3);
   trailGeom.setAttribute("position", new THREE.BufferAttribute(trailPositions, 3));
   trailGeom.setDrawRange(0, 0);
-  const trailLine = new THREE.Line(trailGeom, new THREE.LineBasicMaterial({ color: 0xffe066, linewidth: 2 }));
+  const trailLine = new THREE.Line(trailGeom, new THREE.LineBasicMaterial({ color: __TRAIL_HEX__, linewidth: 2 }));
   scene.add(trailLine);
 
   // ---------- Timeline interpolation ----------
@@ -787,13 +814,16 @@ def build_trebuchet_3d_html(params: TrebuchetParams, result: SimulationResult, h
     if "error" in result.metrics:
         return None
     timeline = _build_timeline(params, result)
-    return (
+    html = (
         _HTML_TEMPLATE
         .replace("__THREE_JS__", _THREE_JS)
         .replace("__ORBIT_JS__", _ORBIT_JS)
         .replace("__TIMELINE_JSON__", json.dumps(timeline))
         .replace("__HEIGHT__", str(height))
     )
+    for placeholder, value in _THEME_SUBSTITUTIONS.items():
+        html = html.replace(placeholder, value)
+    return html
 
 
 def render_trebuchet_3d_html(html: str, height: int = 560) -> None:

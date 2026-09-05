@@ -4,7 +4,12 @@
     {
       "name": "trebuchet-web",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "streamlit", "run", "src/trebuchet_sim/web/app.py", "--server.headless=true", "--server.port=8765"],
+      "runtimeArgs": [
+        "-m",
+        "trebuchet_sim.web.launcher",
+        "--server.headless=true",
+        "--server.port=8765"
+      ],
       "port": 8765
     }
   ]

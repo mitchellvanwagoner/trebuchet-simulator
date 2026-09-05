@@ -25,7 +25,9 @@ def test_aftermath_state_continuous_with_launch_release_state():
     result = simulate_trebuchet(params, simulate_aftermath=True)
 
     assert result.aftermath is not None
-    theta_release, theta_dot_release = result.solution.y_events[0][0][0], result.solution.y_events[0][0][1]
+    # LaunchSolution records the release state directly; it stitches several solver
+    # runs together across taut/slack regimes, so there is no single events array.
+    theta_release, theta_dot_release = result.solution.release_machine_state
     theta0, theta_dot0, _regime = result.aftermath.state_at(0.0)
 
     assert theta0 == pytest.approx(theta_release)
@@ -104,8 +106,10 @@ def test_sample_full_timeline_matches_launch_sampling_before_release():
 
     simulator = TrebuchetSimulator(params)
     for i, t in enumerate(times):
-        y = result.solution.sol(float(t))
-        expected_arm_tip = simulator.arm_tip_position_velocity(y)[0]
+        # machine_state() reads (theta, theta_dot) whichever regime the launch is in;
+        # the arm tip depends on theta alone, so the sling terms are padded with zeros.
+        theta, theta_dot = result.solution.machine_state(float(t))
+        expected_arm_tip = simulator.arm_tip_position_velocity((theta, theta_dot, 0.0, 0.0))[0]
         assert positions["arm_tip"][i] == pytest.approx(expected_arm_tip)
 
 

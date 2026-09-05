@@ -53,19 +53,28 @@ ALWAYS_TAUT_PARAMS = {
 }
 
 
-def test_tension_metrics_are_zero_impulse_for_an_always_taut_launch():
+def test_tension_metrics_report_no_slack_for_an_always_taut_launch():
     result = simulate_trebuchet(TrebuchetParams(**ALWAYS_TAUT_PARAMS))
+    sol = result.solution
 
     assert result.metrics["release_occurred"] is True
     assert result.metrics["min_string_tension"] > 0
     assert result.metrics["min_cw_rope_tension"] > 0
-    assert result.metrics["string_compression_impulse"] == 0.0
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
+    # Nothing ever detached, so there is no slack time and no re-tension snap.
     assert result.metrics["string_slack_fraction"] == 0.0
+    assert result.metrics["sling_snap_count"] == 0
+    assert result.metrics["sling_snap_energy"] == 0.0
+    # A launch that never goes slack is a single uninterrupted taut segment - the
+    # regime never switches, so the rigid-link model is exact here.
+    assert [seg.regime for seg in sol.segments] == ["taut"]
+    assert sol.slack_time == 0
 
 
-# A jerky parameter set (the pre-slack-penalty optimizer defaults): the rigid-link
-# model holds the sling in compression for ~half the launch, which a rope cannot do.
+# A jerky parameter set (the pre-slack-penalty optimizer defaults). Under the old
+# rigid-link model the sling was held in compression for much of the launch, which a
+# rope cannot do; the sling is now modelled as a real rope, so the same parameters
+# instead produce detach/re-tension cycles.
 JERKY_SLING_PARAMS = {
     "counter_weight_mass": 16.865,
     "pulley_radius": 0.121,
@@ -75,12 +84,69 @@ JERKY_SLING_PARAMS = {
 }
 
 
-def test_tension_metrics_flag_a_slack_sling_launch():
+def test_slack_sling_launch_detaches_and_snaps_instead_of_pushing():
     result = simulate_trebuchet(TrebuchetParams(**JERKY_SLING_PARAMS))
+    sol = result.solution
+    metrics = result.metrics
 
-    assert result.metrics["min_string_tension"] < 0
-    assert result.metrics["string_compression_impulse"] > 0.1
-    assert 0 < result.metrics["string_slack_fraction"] < 1
+    # The point of the rope model: the sling never carries compression. The rigid-link
+    # model used to report a large negative minimum here; now the solver switches to a
+    # slack regime at the zero crossing instead, so the minimum can only touch zero.
+    assert metrics["min_string_tension"] >= -1e-9
+
+    # It pays for that with detached flight and an inelastic re-tension snap.
+    assert 0 < metrics["string_slack_fraction"] < 1
+    assert metrics["sling_snap_count"] >= 1
+    assert metrics["sling_snap_energy"] > 0
+
+    # Metrics are just summaries of the stitched solution, so they must agree with it.
+    assert metrics["sling_snap_count"] == len(sol.snap_times)
+    assert metrics["sling_snap_energy"] == pytest.approx(sum(sol.snap_energy_losses))
+    assert metrics["string_slack_fraction"] == pytest.approx(sol.slack_time / sol.t_end)
+
+    regimes = [seg.regime for seg in sol.segments]
+    assert "slack" in regimes
+    # Segments are a stitched alternation - two consecutive segments of the same
+    # regime would mean a spurious switch that changed nothing.
+    assert all(a != b for a, b in zip(regimes, regimes[1:]))
+    assert sol.slack_time == pytest.approx(
+        sum(seg.t1 - seg.t0 for seg in sol.segments if seg.regime == "slack")
+    )
+
+    # The counterweight rope is still a rigid link, so it keeps the feasibility-style
+    # compression impulse - this fixture is unphysical there even though the sling is
+    # now handled properly.
+    assert metrics["cw_rope_compression_impulse"] > 0.1
+
+
+def test_sling_snap_only_ever_removes_energy():
+    """The re-tension snap is inelastic: it must dissipate, never act as a spring."""
+    import numpy as np
+
+    result = simulate_trebuchet(TrebuchetParams(**JERKY_SLING_PARAMS), track_energy=True)
+    sol = result.solution
+    assert sol.snap_times, "fixture is expected to snap at least once"
+
+    totals = np.array([entry["total"] for entry in result.energy_history])
+    times = np.array([entry["time"] for entry in result.energy_history])
+
+    # Total energy is monotonically non-increasing across the whole launch: drag,
+    # joint friction and the snaps all remove energy and nothing adds any. The
+    # tolerance is scaled to the energy in the machine (~1e-7 J here) purely to absorb
+    # float noise - a snap behaving like a spring would show up as a jump of order the
+    # snap loss itself, ~1 J.
+    assert np.max(np.diff(totals)) <= 1e-9 * totals[0]
+
+    # Across a tight window around the snap, the drop accounts for the reported loss.
+    # It is slightly larger because drag and friction keep acting during the window.
+    t_snap, loss = sol.snap_times[0], sol.snap_energy_losses[0]
+    window = 0.002
+    before = totals[times < t_snap - window]
+    after = totals[times > t_snap + window]
+    assert len(before) and len(after)
+    drop = before[-1] - after[0]
+    assert drop >= loss
+    assert drop == pytest.approx(loss, rel=0.15)
 
 
 def test_constraint_tensions_satisfy_newtons_law_for_the_projectile():
@@ -92,41 +158,59 @@ def test_constraint_tensions_satisfy_newtons_law_for_the_projectile():
     # The string is a two-force member: m_p * a must equal gravity + drag plus a force
     # of magnitude -T purely along the string. Reconstruct that force from the solved
     # generalized accelerations and check it against constraint_tensions at several
-    # points of a real launch (one that includes a slack/compression phase).
+    # points of a real launch (one that includes slack phases).
+    #
+    # Sampled per taut segment rather than across the whole launch: constraint_tensions
+    # and trebuchet_dynamics both take the taut state [theta, theta_dot, alpha,
+    # alpha_dot, psi, psi_dot], and while the sling is slack the solution carries
+    # [theta, theta_dot, px, py, pvx, pvy, psi, psi_dot] instead - there is no string
+    # force to check there, because the rope is carrying nothing.
     params = TrebuchetParams(**JERKY_SLING_PARAMS)
     sim = TrebuchetSimulator(params)
     sol = simulate_trebuchet(params).solution
     m_p, l_a, l_s = params.projectile_mass, params.arm_length, params.string_length
     drag_k = 0.5 * RHO_AIR * params.projectile_drag_coefficient * params.projectile_area
 
-    for t in np.linspace(0.0, sol.t[-1], 9):
-        y = sol.sol(float(t))
-        theta, theta_dot, alpha, alpha_dot = (float(v) for v in y)
-        _, theta_ddot, _, alpha_ddot = sim.trebuchet_dynamics(float(t), y)
+    taut_segments = [seg for seg in sol.segments if seg.regime == "taut"]
+    assert taut_segments, "fixture is expected to spend part of the launch taut"
+    sampled = 0
 
-        ax = -l_a * (theta_ddot * math.sin(theta) + theta_dot**2 * math.cos(theta)) - l_s * (
-            alpha_ddot * math.sin(alpha) + alpha_dot**2 * math.cos(alpha)
-        )
-        ay = l_a * (theta_ddot * math.cos(theta) - theta_dot**2 * math.sin(theta)) + l_s * (
-            alpha_ddot * math.cos(alpha) - alpha_dot**2 * math.sin(alpha)
-        )
+    for seg in taut_segments:
+        for t in np.linspace(seg.t0, seg.t1, 5):
+            y = seg.sol.sol(float(t))
+            sampled += 1
+            theta, theta_dot, alpha, alpha_dot = (float(v) for v in y[:4])
+            derivs = sim.trebuchet_dynamics(float(t), y)
+            theta_ddot, alpha_ddot = derivs[1], derivs[3]
 
-        _, (vx, vy) = sim.projectile_position_velocity(y)
-        speed = math.hypot(vx, vy)
-        string_fx = m_p * ax - (-drag_k * speed * vx)
-        string_fy = m_p * ay - (-drag_k * speed * vy - m_p * G)
+            ax = -l_a * (theta_ddot * math.sin(theta) + theta_dot**2 * math.cos(theta)) - l_s * (
+                alpha_ddot * math.sin(alpha) + alpha_dot**2 * math.cos(alpha)
+            )
+            ay = l_a * (theta_ddot * math.cos(theta) - theta_dot**2 * math.sin(theta)) + l_s * (
+                alpha_ddot * math.cos(alpha) - alpha_dot**2 * math.sin(alpha)
+            )
 
-        expected_tension = -(string_fx * math.cos(alpha) + string_fy * math.sin(alpha))
-        tangential = -string_fx * math.sin(alpha) + string_fy * math.cos(alpha)
+            _, (vx, vy) = sim.projectile_position_velocity(y)
+            speed = math.hypot(vx, vy)
+            string_fx = m_p * ax - (-drag_k * speed * vx)
+            string_fy = m_p * ay - (-drag_k * speed * vy - m_p * G)
 
-        string_tension, cw_tension = sim.constraint_tensions(float(t), y)
+            expected_tension = -(string_fx * math.cos(alpha) + string_fy * math.sin(alpha))
+            tangential = -string_fx * math.sin(alpha) + string_fy * math.cos(alpha)
 
-        scale = max(1.0, abs(expected_tension))
-        assert abs(tangential) < 1e-8 * scale  # string force is purely radial
-        assert string_tension == pytest.approx(expected_tension, rel=1e-9, abs=1e-9)
-        assert cw_tension == pytest.approx(
-            params.counter_weight_mass * (G + params.pulley_radius * theta_ddot)
-        )
+            string_tension, cw_tension = sim.constraint_tensions(float(t), y)
+
+            scale = max(1.0, abs(expected_tension))
+            assert abs(tangential) < 1e-8 * scale  # string force is purely radial
+            assert string_tension == pytest.approx(expected_tension, rel=1e-9, abs=1e-9)
+            assert cw_tension == pytest.approx(
+                params.counter_weight_mass * (G + params.pulley_radius * theta_ddot)
+            )
+            # A taut segment runs from one tension zero-crossing to the next, so the
+            # rope is pulling (or exactly slack at the boundary) everywhere inside it.
+            assert string_tension >= -1e-9 * scale
+
+    assert sampled >= 8  # the fixture has several taut stretches; keep coverage real
 
 
 def test_release_velocity_is_true_speed_not_speed_squared():

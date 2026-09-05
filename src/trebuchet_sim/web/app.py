@@ -8,12 +8,14 @@ CSS below compacts Streamlit's default paddings and the inputs sit in
 two-per-row grids.
 """
 
+import html
 import json
 import logging
 import math
 import os
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Callable
 
 import streamlit as st
 
@@ -24,110 +26,68 @@ import streamlit as st
 # silenced rather than left spamming the console on every optimize run.
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
-from trebuchet_sim.web import units
+from trebuchet_sim.web import theme, units
 from trebuchet_sim.web.animation3d import build_trebuchet_3d_html, render_trebuchet_3d_html
-from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, TrebuchetParams
+from trebuchet_sim.config import (
+    DEFAULT_INITIAL_ARM_ANGLE,
+    DEFAULT_OPTIMIZABLE_PARAMS,
+    MachineType,
+    TrebuchetParams,
+)
 from trebuchet_sim.optimization import PARAM_BOUNDS, PARAM_NAMES, OptimizationConfig, optimize_trebuchet
 from trebuchet_sim.physics import simulate_trebuchet
 from trebuchet_sim.visualization import build_energy_figure
 
 st.set_page_config(page_title="Trebuchet Simulator", page_icon="🏰", layout="wide")
 
-# Compact, single-screen dashboard styling. Also hides the "Ask Google" /
-# "Ask ChatGPT" links Streamlit appends to uncaught-exception messages.
-st.markdown(
-    """
-    <style>
-      header[data-testid="stHeader"] { display: none; }
-      [data-testid="stToolbar"] { display: none; }
-      .block-container { padding: 0.35rem 1.1rem 0.2rem; max-width: 100%; }
-      [data-testid="stVerticalBlock"] { gap: 0.25rem; }
-      [data-testid="stHorizontalBlock"] { gap: 0.6rem; }
-      [data-testid="stWidgetLabel"] { margin-bottom: 0.05rem; min-height: 1.1rem; }
-      [data-testid="stWidgetLabel"] p { font-size: 0.78rem; }
-      [data-testid="stNumberInput"] input { padding: 0.15rem 0.5rem; font-size: 0.85rem; }
-      [data-testid="stNumberInput"] div[data-baseweb="input"] { height: 1.75rem; }
-      [data-testid="stNumberInputStepDown"], [data-testid="stNumberInputStepUp"] { display: none; }
-      .stButton button { min-height: 1.9rem; padding: 0.15rem 0.75rem; }
-      [data-testid="stTable"] table { font-size: 0.78rem; table-layout: fixed; width: 100%; }
-      [data-testid="stTable"] th, [data-testid="stTable"] td {
-        padding: 0.15rem 0.4rem;
-        overflow-wrap: break-word;
-        word-break: break-word;
-        white-space: normal;
-      }
-      [data-testid="stTable"] thead th {
-        font-weight: 700;
-        text-transform: uppercase;
-        font-size: 0.66rem;
-        letter-spacing: 0.02em;
-        background: rgba(120, 120, 120, 0.35);
-        border-bottom: 2px solid rgba(120, 120, 120, 0.6);
-      }
-      /* Results panel: a fixed min-height (verified against a real render,
-         since st.container(height="stretch") does not actually stretch
-         inside an st.columns() cell - it only matches content height) makes
-         the panel visibly span down to the rest of the dashboard instead of
-         leaving blank space below a short table. */
-      .st-key-results_panel { min-height: calc(100vh - 120px); }
-      /* Optimizer log: fill everything between the inputs above and the bottom
-         of the viewport. The offset is the measured height of the header +
-         input sections; the dataframe inside stretches to the panel. */
-      .st-key-opt_log_panel {
-        flex: 0 0 calc(100vh - 652px) !important;
-        height: calc(100vh - 652px) !important;
-        min-height: 90px;
-      }
-      /* The status caption sits at natural height; the table container below
-         it absorbs the rest of the panel and the dataframe stretches into it. */
-      .st-key-opt_log_panel { display: flex; flex-direction: column; }
-      /* Streamlit wraps every keyed container in its own non-growing
-         "stLayoutWrapper" div; flexing the inner block is not enough; the
-         wrapper itself must grow, or it caps its child at content height. */
-      .st-key-opt_log_panel > div:has(> .st-key-opt_log_table) { flex: 1 1 0; min-height: 0; }
-      /* flex-basis 0 (not auto): the dataframe's own height is itself a
-         percentage of this container, so sizing from content would be
-         circular - basis 0 makes the browser size this purely from
-         flex-grow first, then percentages below resolve against that. */
-      .st-key-opt_log_table { flex: 1 1 0; min-height: 0; height: 100% !important; }
-      .st-key-opt_log_table [data-testid="stElementContainer"],
-      .st-key-opt_log_table [data-testid="stDataFrame"] { height: 100% !important; }
-      /* Animation fills the middle column so the energy plots below it end at
-         the bottom of the screen; the iframe content sizes itself with 100vh. */
-      /* The energy figure spans the full column width at its natural aspect
-         (12:3.2), so its height scales with the viewport width; the animation
-         panel's height budget subtracts that same width-proportional term. */
-      .st-key-anim_panel {
-        flex: 0 0 calc(100vh - 48px - 13.9vw) !important;
-        height: calc(100vh - 48px - 13.9vw) !important;
-      }
-      /* Streamlit pins the iframe's container to the height= argument via
-         flex-basis; let it grow to the panel instead. */
-      .st-key-anim_panel [data-testid="stElementContainer"] { flex: 1 1 auto !important; }
-      .st-key-anim_panel [data-testid="stElementContainer"],
-      .st-key-anim_panel iframe { height: 100% !important; width: 100%; }
-      .st-key-energy_panel img { width: 100% !important; height: auto !important; display: block; }
-      /* Status alerts float over the animation rather than reflowing it. */
-      .st-key-status_area { position: fixed; top: 42px; left: 25%; width: 50%; z-index: 100; }
-      [data-testid="stCaptionContainer"] p { font-size: 0.72rem; }
-      [data-testid="stCode"] pre { font-size: 0.7rem; padding: 0.35rem 0.55rem; }
-      [data-testid="stHeading"] h3 { font-size: 0.95rem !important; padding: 0.15rem 0 0.1rem 0 !important; }
-      [data-testid="stHeading"] h4 { padding: 0 !important; margin: 0 !important; font-size: 1.05rem !important; }
-      /* Streamlit offsets its default (large) heading padding with a negative
-         bottom margin; with the compact headings above it makes headings
-         overlap the row below them. */
-      [data-testid="stHeading"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
-      [data-testid="stException"] a { display: none; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown(theme.DASHBOARD_CSS, unsafe_allow_html=True)
 
 title_col, unit_col = st.columns([5, 1])
-title_col.markdown("#### 🏰 Trebuchet Physics Simulator")
-imperial = unit_col.toggle(
-    "Imperial", key="imperial_units", help="Show lengths in ft/in, masses in lb, speeds in ft/s."
+title_col.markdown(
+    '<div class="tb-appbar">'
+    '<div class="tb-mark">🏰</div>'
+    "<div><div class=\"tb-title\">Trebuchet Physics Simulator</div>"
+    '<div class="tb-sub">Euler-Lagrange launch dynamics, ballistic flight, and parameter search</div>'
+    "</div></div>",
+    unsafe_allow_html=True,
 )
+imperial = unit_col.toggle(
+    "Imperial units", key="imperial_units", help="Show lengths in ft/in, masses in lb, speeds in ft/s."
+)
+
+# Widget keys whose stored value is a mass, and so means a different number in
+# each unit system (see _sync_mass_units).
+MASS_INPUT_KEYS = ("opt_counter_weight_mass", "fixed_projectile_mass")
+
+
+def _sync_mass_units(imperial: bool) -> None:
+    """Convert the mass boxes in place when the unit toggle flips.
+
+    Length inputs already swap between two separate widgets when the toggle
+    changes - `_length_pair_input` owns its own ft/in keys, which Streamlit
+    seeds fresh on first render - so they convert for free. Mass reuses a
+    single box across both systems, so nothing reseeds it, and without this the
+    box would keep displaying the kilogram figure under a `(lb)` label (and
+    then be read back as if it were pounds).
+
+    Runs before any input renders, so the widgets below see the converted value.
+    """
+    previous = st.session_state.get("_units_were_imperial")
+    if previous is None:
+        st.session_state["_units_were_imperial"] = imperial
+        return
+    if previous == imperial:
+        return
+
+    convert = units.kg_to_lb if imperial else units.lb_to_kg
+    for key in MASS_INPUT_KEYS:
+        value = st.session_state.get(key)
+        if isinstance(value, (int, float)):
+            st.session_state[key] = convert(float(value))
+    st.session_state["_units_were_imperial"] = imperial
+
+
+_sync_mass_units(imperial)
 
 ANIMATION_HEIGHT = 440
 
@@ -135,6 +95,15 @@ ANIMATION_HEIGHT = 440
 # Defaults come straight from the TrebuchetParams dataclass so they can't drift.
 FIXED_PARAM_NAMES = ("pivot_height", "initial_arm_angle", "projectile_mass", "projectile_radius")
 FIXED_DEFAULTS = {f.name: f.default for f in fields(TrebuchetParams) if f.name in FIXED_PARAM_NAMES}
+# initial_arm_angle is the exception: its dataclass default is None, because the
+# cocked position depends on the machine and only resolves in __post_init__ (see
+# config.DEFAULT_INITIAL_ARM_ANGLE). The dashboard builds a pulley machine, so
+# seed the box with that machine's start angle. It has to be a real number: with
+# no default the input renders blank, every run reports "fixed parameters are
+# required", and dropping the key instead makes the lookup below raise outright.
+# Only a saved user_defaults.json hides that, so it shows up first on a fresh
+# install - an empty TREBUCHET_DATA_DIR, i.e. a newly created container volume.
+FIXED_DEFAULTS["initial_arm_angle"] = float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY])
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
 # radians) like TrebuchetParams. TREBUCHET_DATA_DIR picks the directory:
@@ -231,7 +200,9 @@ def _store_result(params: TrebuchetParams, result) -> None:
     st.session_state.result = result
     releasable = "error" not in result.metrics and result.metrics.get("release_occurred", True)
     st.session_state.anim_html = build_trebuchet_3d_html(params, result, height=ANIMATION_HEIGHT) if releasable else None
-    st.session_state.energy_fig = build_energy_figure(result, compact=True) if result.energy_history else None
+    st.session_state.energy_fig = (
+        build_energy_figure(result, compact=True, dark=True) if result.energy_history else None
+    )
 
 
 def _length_pair_input(
@@ -270,7 +241,9 @@ def _length_pair_input(
     if inches_default is not None:
         st.session_state.setdefault(in_key, inches_default)
 
-    sub_feet, sub_inches = container.columns(2)
+    # Keyed so the stylesheet can reclaim width inside the pair (see the
+    # st-key-pair_ rule); the two boxes are the narrowest inputs on the page.
+    sub_feet, sub_inches = container.container(key=f"pair_{key_prefix}").columns(2)
     feet_val = sub_feet.number_input(
         f"{label} (ft)", min_value=0, max_value=feet_max, value=None,
         key=ft_key, step=1, help=help,
@@ -286,9 +259,83 @@ def _length_pair_input(
     return min(combined, max_value) if max_value is not None else combined
 
 
+# --- Unit-aware parameter inputs ---------------------------------------------
+#
+# Every parameter box is "one number plus a conversion between canonical SI
+# (m / kg / rad) and whatever the box displays". The single exception is an
+# imperial length, which is edited as a feet box plus an inches box.
+# `_DisplayUnit` captures both cases, so the three input builders below differ
+# only in where their default comes from and whether they carry a lock toggle -
+# none of them does any unit arithmetic of its own.
+#
+# Everything here takes and returns SI. Keeping the conversion in exactly one
+# place is what stops a display value from reaching the physics: an earlier
+# version returned radians from a helper whose callers then applied
+# math.radians() a second time, so locking the release angle silently simulated
+# a machine ~57x off the number in the box.
+
+
+def _identity(value: float) -> float:
+    return value
+
+
+@dataclass(frozen=True)
+class _DisplayUnit:
+    """How one physical quantity is shown in the active unit system."""
+
+    suffix: str                                    # widget label suffix, e.g. "kg"
+    to_display: "Callable[[float], float]" = _identity   # SI -> box contents
+    to_si: "Callable[[float], float]" = _identity        # box contents -> SI
+    is_pair: bool = False                          # imperial length: ft + in boxes
+
+
+def _display_unit(kind: str, imperial: bool) -> _DisplayUnit:
+    """Display unit for `kind` ("length", "mass" or "angle") in the active system."""
+    if kind == "angle":
+        return _DisplayUnit("deg", math.degrees, math.radians)  # always degrees
+    if kind == "mass":
+        return _DisplayUnit("lb", units.kg_to_lb, units.lb_to_kg) if imperial else _DisplayUnit("kg")
+    if kind == "length":
+        return _DisplayUnit("ft", is_pair=True) if imperial else _DisplayUnit("m")
+    raise ValueError(f"unknown quantity kind: {kind!r}")
+
+
+def _si_input(
+    container, label: str, key: str, unit: _DisplayUnit,
+    si_default: "float | None", si_min: float, si_max: float,
+    clearable: bool, help: str = None,
+) -> "float | None":
+    """One parameter box (or ft/in pair), in canonical SI and out again.
+
+    `clearable` picks between Streamlit's two number_input modes. True routes
+    the initial value through session_state and passes `value=None` on every
+    rerun, which is the only way Streamlit lets a box be emptied - blank is
+    meaningful for the optimizable params (nothing to lock to) and for the
+    optional ones. False passes the default as `value=`, so the box always
+    holds a number; the required fixed params use that.
+
+    Returns None only when the box is blank.
+    """
+    if unit.is_pair:
+        return _length_pair_input(container, label, key, si_default, si_min, si_max, help=help)
+
+    lo, hi = unit.to_display(si_min), unit.to_display(si_max)
+    default = None if si_default is None else min(max(unit.to_display(si_default), lo), hi)
+
+    if clearable:
+        if default is not None:
+            st.session_state.setdefault(key, default)
+        default = None
+
+    shown = container.number_input(
+        f"{label} ({unit.suffix})", min_value=lo, max_value=hi, value=default,
+        key=key, format="%.4f", help=help,
+    )
+    return None if shown is None else unit.to_si(shown)
+
+
 def _optimizable_input(
-    container, label: str, name: str, in_degrees: bool = False,
-    kind: str = "length", imperial: bool = False,
+    container, label: str, name: str, kind: str = "length", imperial: bool = False,
 ) -> "tuple[float | None, float, bool]":
     """Number input for an optimizable parameter, paired with a lock toggle.
 
@@ -296,158 +343,82 @@ def _optimizable_input(
     box no longer implies locking it. On: the optimizer/simulator use
     whatever is currently in the box. Off: they disregard the box entirely
     and treat the parameter as free, even if the box holds a leftover number.
-    The box itself can always be cleared back to blank (see the setdefault/
-    value=None pattern below); a locked-but-blank box has nothing to lock to,
-    so it's treated the same as free.
+    The box itself can always be cleared back to blank; a locked-but-blank box
+    has nothing to lock to, so it's treated the same as free.
 
-    Returns (effective, raw, locked):
-      - effective: canonical-SI value when locked and the box isn't blank,
-        else None - what the rest of the app already expects for
-        simulate/optimize (None = free).
-      - raw: the box's current canonical-SI content, or a fallback default if
-        blank - saved so flipping the toggle back on (or just typing again)
-        later restores something sensible instead of nothing.
+    Returns (effective, raw, locked), all in canonical SI:
+      - effective: the value when locked and the box isn't blank, else None -
+        what the rest of the app expects for simulate/optimize (None = free).
+      - raw: the box's current content, or a fallback default if blank - saved
+        so flipping the toggle back on (or just typing again) later restores
+        something sensible instead of nothing.
       - locked: the toggle's own state, also saved so reloading remembers
         which params were locked.
-
-    `kind` picks the unit conversion for the non-angle case ("length" ->
-    feet+inches, "mass" -> lb) when `imperial`.
     """
-    lo, hi = PARAM_BOUNDS[name]
-    if in_degrees:
-        lo, hi = math.degrees(lo), math.degrees(hi)
+    unit = _display_unit(kind, imperial)
+    si_min, si_max = PARAM_BOUNDS[name]
 
     saved_entry = _load_user_defaults().get("optimizable", {}).get(name)
     if not isinstance(saved_entry, dict):  # stale/pre-toggle save format - fall back to un-locked defaults
         saved_entry = {}
     saved_locked = bool(saved_entry.get("locked", False))
-    # Canonical-SI fallback used both to pre-fill the box and to fall back on
-    # if the box gets cleared - clamped in case bounds changed since saving.
+    # Fallback used both to pre-fill the box and to fall back on if the box gets
+    # cleared - clamped in case bounds changed since the value was saved.
     fallback_si = saved_entry.get("value")
     if fallback_si is None:
         fallback_si = DEFAULT_OPTIMIZABLE_PARAMS[name]
-    fallback_si = min(max(fallback_si, PARAM_BOUNDS[name][0]), PARAM_BOUNDS[name][1])
-    display_default = math.degrees(fallback_si) if in_degrees else fallback_si
-    display_default = min(max(display_default, lo), hi)
+    fallback_si = min(max(fallback_si, si_min), si_max)
 
-    lock_col, box_col = container.columns([1, 7])
+    # Keyed wrapper so the stylesheet can tint the whole row when the lock is
+    # on (see the [class*="st-key-param_"] rule) - a 20px toggle on its own is
+    # too small to read a column of five locks from.
+    row = container.container(key=f"param_{name}")
+    lock_col, box_col = row.columns([1, 7])
     # Spacer matches the input's label row height so the toggle lines up with
     # the box itself, not the label above it.
-    lock_col.markdown("<div style='height:1.1rem'></div>", unsafe_allow_html=True)
+    lock_col.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
     locked = lock_col.toggle(
         f"Lock {label}", key=f"lock_{name}", value=saved_locked, label_visibility="collapsed",
         help="On: lock this parameter to the value in the box. Off: leave it free for the optimizer to search.",
     )
 
-    # Every box below starts pre-filled with display_default but can still be
-    # cleared back to blank afterwards: Streamlit only allows an empty
-    # number_input when its `value` argument is None, so the initial fill goes
-    # through session_state.setdefault() instead of `value=`, and `value=None`
-    # is passed on every call - otherwise a concrete `value=` re-passed each
-    # rerun would make the box snap back to it whenever the user cleared it.
-
-    if in_degrees:
-        key = f"opt_{name}"
-        st.session_state.setdefault(key, display_default)
-        box_value = box_col.number_input(
-            f"{label} (deg)", min_value=lo, max_value=hi, value=None, key=key, format="%.4f",
-        )
-        raw = math.radians(box_value) if box_value is not None else fallback_si
-        effective = math.radians(box_value) if (locked and box_value is not None) else None
-        return effective, raw, locked
-
-    if kind == "mass":
-        lo_disp, hi_disp = (units.kg_to_lb(lo), units.kg_to_lb(hi)) if imperial else (lo, hi)
-        default_disp = units.kg_to_lb(display_default) if imperial else display_default
-        default_disp = min(max(default_disp, lo_disp), hi_disp)
-        unit_label = "lb" if imperial else "kg"
-        key = f"opt_{name}"
-        st.session_state.setdefault(key, default_disp)
-        value_disp = box_col.number_input(
-            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=None,
-            key=key, format="%.4f",
-        )
-        if value_disp is None:
-            return None, fallback_si, locked
-        raw = units.lb_to_kg(value_disp) if imperial else value_disp
-        return (raw if locked else None), raw, locked
-
-    # kind == "length"
-    if imperial:
-        value_m = _length_pair_input(box_col, label, f"opt_{name}", display_default, lo, hi)
-    else:
-        key = f"opt_{name}"
-        st.session_state.setdefault(key, display_default)
-        value_m = box_col.number_input(
-            f"{label} (m)", min_value=lo, max_value=hi, value=None, key=key, format="%.4f",
-        )
-    raw = value_m if value_m is not None else fallback_si
-    effective = value_m if (locked and value_m is not None) else None
+    value_si = _si_input(box_col, label, f"opt_{name}", unit, fallback_si, si_min, si_max, clearable=True)
+    raw = fallback_si if value_si is None else value_si
+    effective = value_si if locked else None
     return effective, raw, locked
 
 
 def _fixed_input(
-    container, label: str, name: str, min_value: float, max_value: float,
-    in_degrees: bool = False, kind: str = "length", imperial: bool = False,
+    container, label: str, name: str, si_min: float, si_max: float,
+    kind: str = "length", imperial: bool = False,
 ) -> "float | None":
-    """Number input for a fixed (never-optimized) system parameter.
+    """Number input for a required fixed (never-optimized) system parameter.
 
-    `kind` picks the unit conversion for the non-angle case ("length" -> a
-    feet+inches sub-widget pair, "mass" -> pounds) when `imperial`; always
-    returns canonical SI (m, kg, or rad) regardless of the display units.
+    Bounds and return value are canonical SI. Returns None only when the box is
+    blank, which the caller treats as "not ready to solve".
     """
     default = _load_user_defaults().get("fixed", {}).get(name)
     if default is None:
         default = FIXED_DEFAULTS[name]
-
-    if in_degrees:
-        default = min(max(math.degrees(default), min_value), max_value)
-        return container.number_input(
-            f"{label} (deg)", min_value=min_value, max_value=max_value, value=default,
-            key=f"fixed_{name}", format="%.4f",
-        )
-
-    if kind == "mass":
-        unit_label = "lb" if imperial else "kg"
-        lo_disp, hi_disp = (units.kg_to_lb(min_value), units.kg_to_lb(max_value)) if imperial else (min_value, max_value)
-        default_disp = min(max(units.kg_to_lb(default) if imperial else default, lo_disp), hi_disp)
-        value_disp = container.number_input(
-            f"{label} ({unit_label})", min_value=lo_disp, max_value=hi_disp, value=default_disp,
-            key=f"fixed_{name}", format="%.4f",
-        )
-        return units.lb_to_kg(value_disp) if imperial else value_disp
-
-    # kind == "length"
-    if imperial:
-        return _length_pair_input(container, label, f"fixed_{name}", default, min_value, max_value)
-    default = min(max(default, min_value), max_value)
-    return container.number_input(
-        f"{label} (m)", min_value=min_value, max_value=max_value, value=default,
-        key=f"fixed_{name}", format="%.4f",
-    )
+    unit = _display_unit(kind, imperial)
+    return _si_input(container, label, f"fixed_{name}", unit, default, si_min, si_max, clearable=False)
 
 
 def _fixed_input_optional(
-    container, label: str, name: str, min_value: float, max_value: float,
-    imperial: bool = False, help: str = None,
+    container, label: str, name: str, si_min: float, si_max: float,
+    kind: str = "length", imperial: bool = False, help: str = None,
 ) -> "float | None":
     """Number input for a fixed system parameter that may be left blank.
 
     Unlike _fixed_input, blank is a legal value here (not "still typing") - it
-    means TrebuchetParams should fall back to its own computed default. Always
-    a length field in practice (CW rope length) - kept simple rather than
-    generalized to mass/angle since there's no such call site today.
+    means TrebuchetParams should fall back to its own computed default.
     """
     saved = _load_user_defaults().get("fixed", {}).get(name)
     if saved is not None:
-        saved = min(max(saved, min_value), max_value)
-
-    if imperial:
-        return _length_pair_input(container, label, f"fixed_{name}", saved, min_value, max_value, help=help)
-
-    return container.number_input(
-        f"{label} (m)", min_value=min_value, max_value=max_value, value=saved,
-        key=f"fixed_{name}", format="%.4f", help=help,
+        saved = min(max(saved, si_min), si_max)
+    unit = _display_unit(kind, imperial)
+    return _si_input(
+        container, label, f"fixed_{name}", unit, saved, si_min, si_max, clearable=True, help=help
     )
 
 
@@ -460,6 +431,30 @@ def _fmt_length(value_m: float, imperial: bool) -> str:
     return f"{feet} ft {inches:.2f} in"
 
 
+def _split_length(value_m: float, imperial: bool) -> "tuple[str, str]":
+    """Length as a (number, unit) pair for the headline readout.
+
+    Decimal feet rather than the feet+inches split `_fmt_length` uses: the hero
+    number is meant to be read at a glance, and a second unit mid-number breaks
+    that (the exact ft+in figure is still in the machine spec list below).
+    """
+    if imperial:
+        return f"{value_m / units.METERS_PER_FOOT:.2f}", "ft"
+    return f"{value_m:.2f}", "m"
+
+
+def _fmt_delta(delta_m: float, target_m: float, imperial: bool) -> str:
+    """HTML note pairing the shot with the target it was aimed at."""
+    unit = "ft" if imperial else "m"
+    scale = units.METERS_PER_FOOT if imperial else 1.0
+    target_disp = target_m / scale
+    miss = abs(delta_m) / scale
+    if miss < 0.005:
+        return f"Target <b>{target_disp:.2f} {unit}</b> &middot; <b>on target</b>"
+    direction = "over" if delta_m > 0 else "short"
+    return f"Target <b>{target_disp:.2f} {unit}</b> &middot; <b>{miss:.2f} {unit} {direction}</b>"
+
+
 def _fmt_mass(value_kg: float, imperial: bool) -> str:
     return f"{units.kg_to_lb(value_kg):.3f} lb" if imperial else f"{value_kg:.3f} kg"
 
@@ -468,30 +463,62 @@ def _fmt_speed(value_mps: float, imperial: bool) -> str:
     return f"{units.mps_to_fps(value_mps):.2f} ft/s" if imperial else f"{value_mps:.2f} m/s"
 
 
-def _render_stat_table(data: dict, columns_per_row: int = 2) -> None:
-    """Render label/value pairs as small fixed-width tables, a few columns at a time.
+def _section(title: str, hint: str = "") -> None:
+    """Small uppercase rule-header used to separate panel sections.
 
-    Putting every metric in one row (one table, N columns) forces horizontal
-    scrolling once N gets past a handful; chunking keeps each table narrow
-    enough to fit the column width with wrapped headers instead.
+    `hint` becomes a native title tooltip rather than a Streamlit help icon:
+    the dashboard is height-constrained, and a tooltip costs no vertical space.
     """
-    items = list(data.items())
-    for start in range(0, len(items), columns_per_row):
-        st.table([dict(items[start : start + columns_per_row])])
+    attr = f' title="{html.escape(hint, quote=True)}"' if hint else ""
+    st.markdown(f'<div class="tb-section"{attr}>{html.escape(title)}</div>', unsafe_allow_html=True)
 
 
-def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
+def _empty_state(mark: str, title: str, hint: str) -> str:
+    """Designed placeholder for a panel with nothing to show yet."""
+    return (
+        f'<div class="tb-empty"><div class="tb-empty-mark">{mark}</div>'
+        f'<div class="tb-empty-title">{html.escape(title)}</div>'
+        f'<div class="tb-empty-hint">{hint}</div></div>'
+    )
+
+
+def _metric_grid(cells: dict) -> None:
+    """Two-column grid of small label/value metric cards.
+
+    Replaces the old chunked `st.table` readout: a table forced every value
+    into a fixed-width grid with wrapped uppercase headers, which scanned
+    poorly and could not give the headline numbers any more weight than
+    `String/arm ratio`.
+    """
+    body = "".join(
+        f'<div class="tb-cell"><span class="tb-k">{html.escape(key)}</span>'
+        f'<span class="tb-v">{html.escape(value)}</span></div>'
+        for key, value in cells.items()
+    )
+    st.markdown(f'<div class="tb-grid">{body}</div>', unsafe_allow_html=True)
+
+
+def _spec_list(specs: dict) -> None:
+    """Dense label/value list for the machine's resolved geometry."""
+    body = "".join(
+        f'<div class="tb-spec"><span>{html.escape(key)}</span><b>{html.escape(value)}</b></div>'
+        for key, value in specs.items()
+    )
+    st.markdown(f'<div class="tb-specs">{body}</div>', unsafe_allow_html=True)
+
+
+def _show_results(params: TrebuchetParams, result, imperial: bool, target_distance: float) -> None:
     if "error" in result.metrics:
         st.error(result.metrics["error"])
         return
 
     if not result.metrics.get("release_occurred", True):
-        st.warning("No release occurred - the arm never reached the release angle within the simulation window.")
-        _render_stat_table(
+        st.warning("No release - the arm never reached the release angle within the simulation window.")
+        _metric_grid(
             {
-                "Simulation time (s)": f"{result.metrics['simulation_time']:.2f}",
-                "Final arm angle (deg)": f"{result.metrics['final_arm_angle_deg']:.1f}",
-                "Total arm rotation (deg)": f"{result.metrics['total_rotation_deg']:.1f}",
+                "Simulation time": f"{result.metrics['simulation_time']:.2f} s",
+                "Final arm angle": f"{result.metrics['final_arm_angle_deg']:.1f} deg",
+                "Total rotation": f"{result.metrics['total_rotation_deg']:.1f} deg",
             }
         )
         return
@@ -515,29 +542,49 @@ def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
             "falling counterweight, so the results are not physical."
         )
 
-    st.markdown("**Solution**")
-    _render_stat_table(
+    # Headline range, with how far it landed from the target the optimizer is
+    # aiming at - the single number most runs are judged by.
+    delta = result.distance - target_distance
+    range_value, range_unit = _split_length(result.distance, imperial)
+    st.markdown(
+        '<div class="tb-hero">'
+        '<div class="tb-hero-label">Range</div>'
+        f'<div class="tb-hero-value">{html.escape(range_value)}'
+        f'<span class="tb-unit">{html.escape(range_unit)}</span></div>'
+        f'<div class="tb-hero-note">{_fmt_delta(delta, target_distance, imperial)}</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    efficiency_pct = result.efficiency * 100
+    st.markdown(
+        '<div class="tb-bar-row"><span>Efficiency</span>'
+        f"<b>{efficiency_pct:.1f}%</b></div>"
+        f'<div class="tb-bar"><div class="tb-bar-fill" style="width:{min(max(efficiency_pct, 0), 100):.1f}%"></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    _metric_grid(
         {
-            "Range": _fmt_length(result.distance, imperial),
-            "Efficiency": f"{result.efficiency * 100:.1f} %",
             "Release velocity": _fmt_speed(result.metrics["release_velocity"], imperial),
             "Release angle": f"{result.metrics['release_angle_deg']:.1f} deg",
             "Release height": _fmt_length(result.metrics["release_height"], imperial),
             "Time to release": f"{result.metrics['t_release']:.3f} s",
             "Flight time": f"{result.metrics.get('flight_time', 0.0):.2f} s",
-            "Projectile KE at release": f"{result.metrics['ke_projectile']:.1f} J",
+            "Projectile KE": f"{result.metrics['ke_projectile']:.1f} J",
             "Total PE spent": f"{result.metrics['total_pe_spent']:.1f} J",
             "Min sling tension": f"{result.metrics.get('min_string_tension', float('nan')):.1f} N",
         }
     )
 
-    st.markdown("**System**")
-    _render_stat_table(
+    _section("Machine")
+    _spec_list(
         {
             "Counterweight mass": _fmt_mass(params.counter_weight_mass, imperial),
             "Pulley radius": _fmt_length(params.pulley_radius, imperial),
             "Arm length": _fmt_length(params.arm_length, imperial),
             "String length": _fmt_length(params.string_length, imperial),
+            "String/arm ratio": f"{params.string_arm_ratio:.3f}",
             "Release angle": f"{math.degrees(params.release_angle):.1f} deg",
             "Pivot height": _fmt_length(params.pivot_height, imperial),
             "Initial arm angle": f"{math.degrees(params.initial_arm_angle):.1f} deg",
@@ -545,7 +592,6 @@ def _show_results(params: TrebuchetParams, result, imperial: bool) -> None:
             "Projectile mass": _fmt_mass(params.projectile_mass, imperial),
             "Projectile radius": _fmt_length(params.projectile_radius, imperial),
             "Total mass": _fmt_mass(params.total_mass, imperial),
-            "String/arm ratio": f"{params.string_arm_ratio:.3f}",
         }
     )
 
@@ -556,11 +602,12 @@ with left:
     # Every input in this column stays visible with no scrolling; the optimizer
     # log at the bottom is the only element that flexes, absorbing whatever
     # vertical space the inputs leave over (see the opt_log_panel CSS).
-    st.subheader("Fixed system parameters", help="Always used as given - the solver won't run without them.")
+    _section("Machine", "Fixed system parameters - always used as given; the solver won't run without them.")
     grid3, grid4 = st.columns(2)
     pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, imperial=imperial)
-    initial_arm_angle_deg = _fixed_input(
-        grid4, "Initial arm angle", "initial_arm_angle", 5.0, 175.0, in_degrees=True
+    initial_arm_angle = _fixed_input(
+        grid4, "Initial arm angle", "initial_arm_angle",
+        math.radians(5.0), math.radians(175.0), kind="angle",
     )
     projectile_mass = _fixed_input(
         grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, kind="mass", imperial=imperial
@@ -574,7 +621,7 @@ with left:
 
     fixed_values = dict(
         pivot_height=pivot_height,
-        initial_arm_angle=math.radians(initial_arm_angle_deg) if initial_arm_angle_deg is not None else None,
+        initial_arm_angle=initial_arm_angle,
         projectile_mass=projectile_mass,
         projectile_radius=projectile_radius,
     )
@@ -586,11 +633,7 @@ with left:
     # it's kept out of the fixed_ready/required check above but still passed through.
     fixed_params_all = dict(fixed_values, counter_weight_rope_length=counter_weight_rope_length)
 
-    st.subheader(
-        "Optimizable parameters",
-        help="Toggle 🔒 on to lock a parameter to the value in its box; off leaves it free for the "
-        "optimizer to search (the box's contents are then ignored).",
-    )
+    _section("Design variables", "Lock a parameter to pin it to the value in its box; unlocked leaves it free for the optimizer to search.")
     grid1, grid2 = st.columns(2)
     cw_mass, cw_mass_raw, cw_mass_locked = _optimizable_input(
         grid1, "Counterweight", "counter_weight_mass", kind="mass", imperial=imperial
@@ -604,8 +647,8 @@ with left:
     string_length, string_length_raw, string_length_locked = _optimizable_input(
         grid2, "String length", "string_length", imperial=imperial
     )
-    release_angle_deg, release_angle_raw_deg, release_angle_locked = _optimizable_input(
-        grid1, "Release angle", "release_angle", in_degrees=True
+    release_angle, release_angle_raw, release_angle_locked = _optimizable_input(
+        grid1, "Release angle", "release_angle", kind="angle"
     )
 
     optimizable_values = dict(
@@ -613,7 +656,7 @@ with left:
         pulley_radius=pulley_radius,
         arm_length=arm_length,
         string_length=string_length,
-        release_angle=math.radians(release_angle_deg) if release_angle_deg is not None else None,
+        release_angle=release_angle,
     )
     # Raw box content (always concrete, regardless of the lock toggle) and lock
     # state, in canonical SI - saved by the 💾 button so unlocking doesn't lose
@@ -623,7 +666,7 @@ with left:
         pulley_radius=pulley_radius_raw,
         arm_length=arm_length_raw,
         string_length=string_length_raw,
-        release_angle=math.radians(release_angle_raw_deg),
+        release_angle=release_angle_raw,
     )
     optimizable_locked = dict(
         counter_weight_mass=cw_mass_locked,
@@ -633,17 +676,20 @@ with left:
         release_angle=release_angle_locked,
     )
 
-    st.subheader(
-        "Optimization target", help="Search for parameters that maximize launch efficiency at a target distance."
-    )
-    # Three columns keep this always-visible section at two input rows high;
-    # a third row would push the buttons/log off-screen at 1366x768.
+    _section("Optimizer target", "Search for parameters that maximize launch efficiency at a target distance.")
+    # Target is the knob that changes per run, so it stays on the surface. The
+    # four search-tuning values are set-once settings and live in a popover:
+    # inline they cost a second input row, and that row is the difference
+    # between a usable optimizer log and a two-line one - the log is the panel
+    # that absorbs whatever vertical space the inputs leave (see theme.py).
+    # Popover children execute on every rerun, so the values below are always
+    # current whether or not it happens to be open.
     saved_target = _load_user_defaults().get("target", {})
-    grid5, grid6, grid7 = st.columns(3)
+    target_col, tuning_col = st.columns([2, 1])
     target_min_m = 1.0
     target_default_m = max(float(saved_target.get("target_distance", 30.0)), target_min_m)
     if imperial:
-        target_distance_ft = grid5.number_input(
+        target_distance_ft = target_col.number_input(
             "Target (ft)",
             min_value=target_min_m / units.METERS_PER_FOOT,
             value=target_default_m / units.METERS_PER_FOOT,
@@ -651,36 +697,40 @@ with left:
         )
         target_distance = target_distance_ft * units.METERS_PER_FOOT
     else:
-        target_distance = grid5.number_input(
+        target_distance = target_col.number_input(
             "Target (m)", min_value=target_min_m, value=target_default_m,
             help="Target distance (m)",
         )
-    efficiency_weight = grid6.number_input(
-        "Eff. weight", min_value=0.0, value=max(float(saved_target.get("efficiency_weight", 5.0)), 0.0),
-        help="Efficiency weight",
-    )
-    distance_weight = grid7.number_input(
-        "Dist. weight", min_value=0.0, value=max(float(saved_target.get("distance_weight", 1.0)), 0.0),
-        help="Distance weight",
-    )
-    population_size = grid5.number_input(
-        "Population",
-        min_value=5,
-        value=max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5),
-        step=5,
-        help="Differential-evolution population per free parameter. No upper cap - larger "
-        "searches more thoroughly, but runtime grows proportionally.",
-    )
-    absolute_tolerance = grid6.number_input(
-        "Tolerance",
-        min_value=0.0,
-        value=max(float(saved_target.get("absolute_tolerance", OptimizationConfig.absolute_tolerance)), 0.0),
-        step=0.00001,
-        format="%.8f",
-        help="Convergence tolerance on the final solution: the search stops once the "
-        "population's objective spread falls below this. Smaller = more precise but slower; "
-        "0 runs until the population fully converges or another stop condition is hit.",
-    )
+
+    tuning_col.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
+    with tuning_col.popover("Tuning", use_container_width=True, help="Search weights and convergence settings"):
+        weight_col, dist_col = st.columns(2)
+        efficiency_weight = weight_col.number_input(
+            "Eff. weight", min_value=0.0, value=max(float(saved_target.get("efficiency_weight", 5.0)), 0.0),
+            help="How strongly the objective rewards launch efficiency.",
+        )
+        distance_weight = dist_col.number_input(
+            "Dist. weight", min_value=0.0, value=max(float(saved_target.get("distance_weight", 1.0)), 0.0),
+            help="How strongly the objective penalizes missing the target distance.",
+        )
+        population_size = weight_col.number_input(
+            "Population",
+            min_value=5,
+            value=max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5),
+            step=5,
+            help="Differential-evolution population per free parameter. No upper cap - larger "
+            "searches more thoroughly, but runtime grows proportionally.",
+        )
+        absolute_tolerance = dist_col.number_input(
+            "Tolerance",
+            min_value=0.0,
+            value=max(float(saved_target.get("absolute_tolerance", OptimizationConfig.absolute_tolerance)), 0.0),
+            step=0.00001,
+            format="%.8f",
+            help="Convergence tolerance on the final solution: the search stops once the "
+            "population's objective spread falls below this. Smaller = more precise but slower; "
+            "0 runs until the population fully converges or another stop condition is hit.",
+        )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
     simulate_clicked = btn_sim.button("Simulate", type="primary", disabled=not fixed_ready, use_container_width=True)
@@ -707,7 +757,7 @@ with left:
         )
         st.toast("Defaults saved")
 
-    st.markdown("**Optimizer log**")
+    _section("Optimizer log")
     with st.container(key="opt_log_panel", border=True):
         # Convergence outcome lives here in the log, not as a status banner.
         # Kept in its own (non-stretching) container so it takes only the
@@ -793,11 +843,27 @@ with mid:
             with st.container(key="energy_panel"):
                 st.pyplot(st.session_state.energy_fig)
     else:
-        st.info("Run a simulation or optimization to see the animation and energy graph.")
+        with st.container(key="empty_stage"):
+            st.markdown(
+                _empty_state(
+                    "🏰",
+                    "No launch yet",
+                    "Set the machine up on the left, then hit <b>Simulate</b> to watch the "
+                    "throw in 3D - or <b>Optimize</b> to search for a machine that hits the target.",
+                ),
+                unsafe_allow_html=True,
+            )
 
 with right:
     with st.container(key="results_panel", border=True):
         if st.session_state.result is not None:
-            _show_results(st.session_state.sim_params, st.session_state.result, imperial)
+            _show_results(st.session_state.sim_params, st.session_state.result, imperial, target_distance)
         else:
-            st.info("Results will appear here after you run a simulation.")
+            st.markdown(
+                _empty_state(
+                    "📐",
+                    "Awaiting a run",
+                    "Range, efficiency, release conditions, and the resolved machine geometry appear here.",
+                ),
+                unsafe_allow_html=True,
+            )
