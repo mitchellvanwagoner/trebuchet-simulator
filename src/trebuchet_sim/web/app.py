@@ -38,6 +38,7 @@ from trebuchet_sim.config import (
 )
 from trebuchet_sim.optimization import (
     PARAM_BOUNDS,
+    PARAM_LIMITS,
     OptimizationConfig,
     optimize_trebuchet,
     param_names,
@@ -62,47 +63,22 @@ imperial = unit_col.toggle(
     "Imperial units", key="imperial_units", help="Show lengths in ft/in, masses in lb, speeds in ft/s."
 )
 
-# Widget keys whose stored value is a mass, and so means a different number in
-# each unit system (see _sync_mass_units). Both machines' boxes are listed: only one
-# machine is on screen at a time, but the other's stored value has to stay in the
-# system it will be read back in.
-MASS_INPUT_KEYS = tuple(
-    f"{prefix}_{machine.value}"
-    for prefix in ("opt_counter_weight_mass", "fixed_projectile_mass")
-    for machine in MachineType
-)
-
-
-def _sync_mass_units(imperial: bool) -> None:
-    """Convert the mass boxes in place when the unit toggle flips.
-
-    Length inputs already swap between two separate widgets when the toggle
-    changes - `_length_pair_input` owns its own ft/in keys, which Streamlit
-    seeds fresh on first render - so they convert for free. Mass reuses a
-    single box across both systems, so nothing reseeds it, and without this the
-    box would keep displaying the kilogram figure under a `(lb)` label (and
-    then be read back as if it were pounds).
-
-    Runs before any input renders, so the widgets below see the converted value.
-    """
-    previous = st.session_state.get("_units_were_imperial")
-    if previous is None:
-        st.session_state["_units_were_imperial"] = imperial
-        return
-    if previous == imperial:
-        return
-
-    convert = units.kg_to_lb if imperial else units.lb_to_kg
-    for key in MASS_INPUT_KEYS:
-        value = st.session_state.get(key)
-        if isinstance(value, (int, float)):
-            st.session_state[key] = convert(float(value))
-    st.session_state["_units_were_imperial"] = imperial
-
-
-_sync_mass_units(imperial)
-
 ANIMATION_HEIGHT = 440
+
+# Decimal places every number box shows. Also what "the user changed this" means for a
+# search range: a value is compared against its default as displayed, because a default
+# that has been through a unit conversion and back no longer equals itself in SI.
+INPUT_DECIMALS = 4
+
+# What each design variable measures, for picking its display unit.
+PARAM_KIND = {
+    "counter_weight_mass": "mass",
+    "release_angle": "angle",
+    "pulley_radius": "length",
+    "length_counterweight": "length",
+    "arm_length": "length",
+    "string_length": "length",
+}
 
 # Fixed system params: required, always used as given, never handed to the optimizer.
 # Defaults come straight from the TrebuchetParams dataclass so they can't drift.
@@ -167,19 +143,28 @@ def _load_user_defaults() -> dict:
     return st.session_state.user_defaults
 
 
-def _save_user_defaults(machine: MachineType, optimizable: dict, fixed: dict, target: dict) -> None:
+def _save_user_defaults(
+    machine: MachineType, optimizable: dict, ranges: dict, fixed: dict, target: dict
+) -> None:
     """Persist the current inputs.
 
     `optimizable` maps each name to {"value": <SI float>, "locked": <bool>} -
     the box's raw content and the lock toggle's own state are saved
     separately (see _optimizable_input) so switching the toggle off and back
-    on later restores the last value instead of resetting it.
+    on later restores the last value instead of resetting it. `ranges` maps each
+    name to {"min": <SI float>, "max": <SI float>}, the search bounds.
 
     The machine is saved with them, and the values only apply back to that machine
     (see _saved_for). A 0.4 m arm is a good pulley machine and a useless traditional
     one, so restoring one set onto the other would just look like a broken default.
     """
-    defaults = {"machine": machine.value, "optimizable": optimizable, "fixed": fixed, "target": target}
+    defaults = {
+        "machine": machine.value,
+        "optimizable": optimizable,
+        "ranges": ranges,
+        "fixed": fixed,
+        "target": target,
+    }
     USER_DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_DEFAULTS_FILE.write_text(json.dumps(defaults, indent=2))
     st.session_state.user_defaults = defaults
@@ -198,6 +183,58 @@ def _saved_for(machine: MachineType, section: str) -> dict:
     if machine is not _saved_machine():
         return {}
     return _load_user_defaults().get(section, {})
+
+
+def _unit_dependent_inputs() -> "list[tuple[str, str]]":
+    """(session-state key, quantity kind) for every single-box input whose stored number
+    means something different in each unit system.
+
+    Metric lengths sit in one box and imperial ones in a `_ft`/`_in` pair, so those
+    widgets reseed themselves across the toggle and need no help. The boxes listed here
+    are the ones that keep a single widget in both systems - masses, and the search-range
+    boxes, which use decimal feet rather than a ft+in pair (a range is a coarse thing,
+    and the same choice the optimizer log and the headline readout already make). Without
+    conversion such a box would keep showing the metric figure under an imperial label,
+    and then be read back as if it were imperial.
+
+    Both machines' keys are listed: only one machine is on screen at a time, but the
+    other's stored value still has to be in the system it will be read back in.
+    """
+    entries = []
+    for machine in MachineType:
+        entries.append((_widget_key("opt", "counter_weight_mass", machine), "mass"))
+        entries.append((_widget_key("fixed", "projectile_mass", machine), "mass"))
+        for name in param_names(machine):
+            if PARAM_KIND[name] == "angle":
+                continue  # angles are degrees in both systems
+            for prefix in ("rmin", "rmax"):
+                entries.append((_widget_key(prefix, name, machine), PARAM_KIND[name]))
+    return entries
+
+
+def _sync_unit_inputs(imperial: bool) -> None:
+    """Convert the single-box unit-dependent inputs in place when the toggle flips.
+
+    Runs before any input renders, so the widgets below see the converted value.
+    """
+    previous = st.session_state.get("_units_were_imperial")
+    if previous is None:
+        st.session_state["_units_were_imperial"] = imperial
+        return
+    if previous == imperial:
+        return
+
+    convert = {
+        "mass": units.kg_to_lb if imperial else units.lb_to_kg,
+        "length": (
+            (lambda v: v / units.METERS_PER_FOOT) if imperial else (lambda v: v * units.METERS_PER_FOOT)
+        ),
+    }
+    for key, kind in _unit_dependent_inputs():
+        value = st.session_state.get(key)
+        if isinstance(value, (int, float)):
+            st.session_state[key] = convert[kind](float(value))
+    st.session_state["_units_were_imperial"] = imperial
 
 
 def _widget_key(prefix: str, name: str, machine: MachineType) -> str:
@@ -365,6 +402,23 @@ def _display_unit(kind: str, imperial: bool) -> _DisplayUnit:
     raise ValueError(f"unknown quantity kind: {kind!r}")
 
 
+def _range_unit(kind: str, imperial: bool) -> _DisplayUnit:
+    """Display unit for a search-range box: like _display_unit, but never a ft+in pair.
+
+    A range end is a coarse bound, not a measurement to build to, and splitting each of
+    ten boxes into feet and inches would double the popover's width for no precision
+    anyone needs. Decimal feet is the same call the optimizer log and the headline range
+    readout already make (see _log_row and _split_length).
+    """
+    if kind == "length" and imperial:
+        return _DisplayUnit(
+            "ft",
+            to_display=lambda metres: metres / units.METERS_PER_FOOT,
+            to_si=lambda feet: feet * units.METERS_PER_FOOT,
+        )
+    return _display_unit(kind, imperial)
+
+
 def _si_input(
     container, label: str, key: str, unit: _DisplayUnit,
     si_default: "float | None", si_min: float, si_max: float,
@@ -394,7 +448,7 @@ def _si_input(
 
     shown = container.number_input(
         f"{label} ({unit.suffix})", min_value=lo, max_value=hi, value=default,
-        key=key, format="%.4f", help=help,
+        key=key, format=f"%.{INPUT_DECIMALS}f", help=help,
     )
     return None if shown is None else unit.to_si(shown)
 
@@ -455,6 +509,54 @@ def _optimizable_input(
     raw = fallback_si if value_si is None else value_si
     effective = value_si if locked else None
     return effective, raw, locked
+
+
+def _range_input(container, label: str, name: str, machine: MachineType, imperial: bool) -> tuple:
+    """Min/max boxes for one design variable's search range, in canonical SI.
+
+    Returns (bounds, is_custom): `bounds` is always a usable (lo, hi) pair - the default
+    when the boxes are untouched - and `is_custom` says whether the user moved either end,
+    which is what the "Ranges" button counts.
+
+    Bounds are clamped to PARAM_LIMITS rather than PARAM_BOUNDS, so the search can be
+    widened past the defaults as well as narrowed; OptimizationConfig enforces the same
+    envelope, and min >= max is corrected here rather than raised, since half of every
+    edit passes through that state as the user types.
+    """
+    unit = _range_unit(PARAM_KIND[name], imperial)
+    default_lo, default_hi = PARAM_BOUNDS[name]
+    limit_lo, limit_hi = PARAM_LIMITS[name]
+
+    saved = _saved_for(machine, "ranges").get(name) or {}
+    seed_lo = saved.get("min", default_lo)
+    seed_hi = saved.get("max", default_hi)
+
+    lo_col, hi_col = container.columns(2)
+    low = _si_input(
+        lo_col, f"{label} min", _widget_key("rmin", name, machine), unit,
+        seed_lo, limit_lo, limit_hi, clearable=False,
+    )
+    high = _si_input(
+        hi_col, "max", _widget_key("rmax", name, machine), unit,
+        seed_hi, limit_lo, limit_hi, clearable=False,
+    )
+
+    low = default_lo if low is None else low
+    high = default_hi if high is None else high
+    if low >= high:
+        # Mid-edit state, not an error: keep the search space non-empty by falling back
+        # to the default span rather than refusing to run.
+        low, high = default_lo, default_hi
+
+    # Compared as displayed, not in SI. A box seeded with the default and left alone
+    # still round-trips through the unit conversion at the box's own precision, so in
+    # imperial a 0.1 m default comes back as 0.10000488 m - equal on screen, unequal in
+    # SI, and an exact test would report every length as customized.
+    def shown(value: float) -> float:
+        return round(unit.to_display(value), INPUT_DECIMALS)
+
+    is_custom = (shown(low), shown(high)) != (shown(default_lo), shown(default_hi))
+    return (low, high), is_custom
 
 
 def _fixed_input(
@@ -680,6 +782,9 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
     )
 
 
+# Must run before any input renders, so the widgets below see converted values.
+_sync_unit_inputs(imperial)
+
 left, mid, right = st.columns([24, 52, 24])
 
 with left:
@@ -775,6 +880,25 @@ with left:
         optimizable_raw[name] = raw
         optimizable_locked[name] = is_locked
 
+    # Search ranges live in a popover rather than inline: two more boxes per row would
+    # not fit this column (each design-variable box is already only ~130px wide), and
+    # grouping them makes the whole search space readable at once. The button carries a
+    # count so a narrowed search is still visible without opening it.
+    param_ranges = {}
+    custom_ranges = []
+    with st.popover(
+        "Search ranges", use_container_width=True,
+        help="Bounds the optimizer searches between. Locked parameters ignore theirs.",
+    ):
+        st.caption("Where the optimizer may look. Locked parameters are pinned, so their range is unused.")
+        for _container, label, name, _kind, _help_text in rows:
+            bounds, is_custom = _range_input(st, label, name, machine, imperial)
+            param_ranges[name] = bounds
+            if is_custom:
+                custom_ranges.append(name)
+    if custom_ranges:
+        st.caption(f"{len(custom_ranges)} custom range{'s' if len(custom_ranges) > 1 else ''}")
+
     _section("Optimizer target", "Search for parameters that maximize launch efficiency at a target distance.")
     # Target is the knob that changes per run, so it stays on the surface. The
     # four search-tuning values are set-once settings and live in a popover:
@@ -846,6 +970,10 @@ with left:
                 name: {"value": optimizable_raw[name], "locked": optimizable_locked[name]}
                 for name in param_names(machine)
             },
+            {
+                name: {"min": bounds[0], "max": bounds[1]}
+                for name, bounds in param_ranges.items()
+            },
             fixed_params_all,
             {
                 "target_distance": target_distance,
@@ -903,6 +1031,11 @@ if optimize_clicked:
     else:
         config = OptimizationConfig(
             machine=machine,
+            # Only the free parameters' ranges: a locked one is pinned, so passing its
+            # range would just be noise in the saved/reported search space.
+            param_bounds={
+                name: bounds for name, bounds in param_ranges.items() if name not in locked
+            },
             target_distance=target_distance,
             efficiency_weight=efficiency_weight,
             distance_weight=distance_weight,

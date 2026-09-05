@@ -118,6 +118,23 @@ def _parse_lock(spec: str) -> tuple:
     return name, float(value)
 
 
+def _parse_range(spec: str) -> tuple:
+    """Parse NAME=MIN:MAX. As with _parse_lock, the name is checked in cmd_optimize.
+
+    Colon-separated rather than a second '=' so a negative bound reads naturally:
+    release_angle=-5.06:-3.14.
+    """
+    name, _, span = spec.partition("=")
+    low, sep, high = span.partition(":")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"Expected NAME=MIN:MAX, got {spec!r}")
+    try:
+        bounds = (float(low), float(high))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"MIN and MAX must be numbers, got {span!r}")
+    return name, bounds
+
+
 def _machine_defaults(machine: MachineType) -> dict:
     """Every value a `simulate` run needs, defaulted for one machine.
 
@@ -235,13 +252,23 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 def cmd_optimize(args: argparse.Namespace) -> int:
     machine = MachineType(args.machine)
     locked = dict(args.lock or [])
+    ranges = dict(args.range or [])
     names = param_names(machine)
-    unknown = set(locked) - set(names)
-    if unknown:
-        # Caught here rather than in _parse_lock, which runs before --machine is known.
+    # Caught here rather than in the parsers, which run before --machine is known.
+    for label, given in (("lock", locked), ("range", ranges)):
+        unknown = set(given) - set(names)
+        if unknown:
+            raise SystemExit(
+                f"Cannot {label} {', '.join(sorted(unknown))} on the {machine.value} machine. "
+                f"Available: {', '.join(names)}"
+            )
+    both = set(locked) & set(ranges)
+    if both:
+        # Not an error in OptimizationConfig - a locked parameter simply isn't searched -
+        # but on a command line it always means one of the two flags was a mistake.
         raise SystemExit(
-            f"Cannot lock {', '.join(sorted(unknown))} on the {machine.value} machine. "
-            f"Available: {', '.join(names)}"
+            f"{', '.join(sorted(both))} is both locked and given a range; a locked "
+            "parameter is pinned, so its range would go unused."
         )
 
     # The machine's own fixed geometry, so `optimize --machine traditional` starts from a
@@ -254,19 +281,32 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     if defaults["counter_weight_rope_length"] is not None:
         fixed["counter_weight_rope_length"] = defaults["counter_weight_rope_length"]
 
-    config = OptimizationConfig(
-        machine=machine,
-        target_distance=args.target_distance,
-        efficiency_weight=args.efficiency_weight,
-        distance_weight=args.distance_weight,
-        mass_weight=args.mass_weight,
-        locked_params=locked,
-        fixed_params=fixed,
-        display_progress=True,
-    )
+    try:
+        config = OptimizationConfig(
+            machine=machine,
+            target_distance=args.target_distance,
+            efficiency_weight=args.efficiency_weight,
+            distance_weight=args.distance_weight,
+            mass_weight=args.mass_weight,
+            locked_params=locked,
+            param_bounds=ranges,
+            fixed_params=fixed,
+            display_progress=True,
+        )
+    except ValueError as exc:  # a bad --range reads better without a traceback
+        raise SystemExit(str(exc))
 
     print(f"Optimizing a {machine.value} machine for {config.target_distance:.0f}m target distance...")
-    print(f"Free parameters: {', '.join(config.free_params)}")
+    print("Search space:")
+    for name in config.free_params:
+        low, high = config.bounds_for(name)
+        marker = " (custom)" if name in config.param_bounds else ""
+        if name == "release_angle":
+            print(f"  {name}: {math.degrees(low):.1f} to {math.degrees(high):.1f} deg{marker}")
+        else:
+            print(f"  {name}: {low:g} to {high:g}{marker}")
+    for name, value in sorted(locked.items()):
+        print(f"  {name}: locked at {value:g}")
 
     optimal_params, sim_result, de_result = optimize_trebuchet(config)
 
@@ -331,6 +371,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lock a parameter to a fixed value. Repeatable. Available: "
              + ", ".join(sorted(set(param_names(MachineType.PULLEY)) | set(param_names(MachineType.TRADITIONAL))))
              + " (the linkage parameter depends on --machine)",
+    )
+    opt_parser.add_argument(
+        "--range",
+        type=_parse_range,
+        action="append",
+        metavar="NAME=MIN:MAX",
+        help="Narrow (or widen) the search range for a parameter, instead of the default "
+             "bounds. Repeatable, same parameter names as --lock. Angles in radians, e.g. "
+             "--range arm_length=0.3:0.8 --range release_angle=-5.0:-4.0",
     )
     _add_output_args(opt_parser)
     opt_parser.set_defaults(func=cmd_optimize)

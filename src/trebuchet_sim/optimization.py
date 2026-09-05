@@ -69,6 +69,20 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     "length_counterweight": (0.05, 1.0),   # m
 }
 
+# How far a caller may move a search range with OptimizationConfig.param_bounds, which is
+# wider than the defaults above: PARAM_BOUNDS is where the search starts looking, while
+# these are the values the model can still be trusted at. The lower ends are what stops a
+# zero or negative length reaching the equations of motion; the upper ends are loose
+# enough for a genuinely large machine. The arm can sweep a full turn before releasing.
+PARAM_LIMITS: Dict[str, Tuple[float, float]] = {
+    "counter_weight_mass": (0.1, 1000.0),           # kg
+    "pulley_radius": (0.001, 2.0),                  # m
+    "arm_length": (0.05, 10.0),                     # m
+    "string_length": (0.05, 10.0),                  # m
+    "release_angle": (np.radians(-360), np.radians(-1)),   # rad
+    "length_counterweight": (0.01, 5.0),            # m
+}
+
 
 @dataclass
 class OptimizationConfig:
@@ -90,6 +104,11 @@ class OptimizationConfig:
     # instead of a fixed_params entry.
     machine: MachineType = MachineType.PULLEY
     locked_params: Dict[str, float] = field(default_factory=dict)
+    # Per-parameter search ranges, overriding PARAM_BOUNDS for the names given. Narrowing
+    # one steers the search at a region worth exploring (and shrinks the space it has to
+    # cover); widening one reaches machines the defaults exclude. A locked parameter is
+    # not searched at all, so a range given for one is simply unused.
+    param_bounds: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     fixed_params: Dict[str, float] = field(default_factory=dict)
     seed: int = 572956
     max_iterations: int = 1000
@@ -117,6 +136,26 @@ class OptimizationConfig:
         if "machine" in self.fixed_params:
             raise ValueError("Set the machine with OptimizationConfig(machine=...), not via fixed_params.")
 
+        unknown_ranges = set(self.param_bounds) - set(names)
+        if unknown_ranges:
+            raise ValueError(
+                f"No such parameter(s) to range on the {self.machine.value} machine: {unknown_ranges}. "
+                f"Available: {names}"
+            )
+        for name, span in self.param_bounds.items():
+            lo, hi = (float(value) for value in span)
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                raise ValueError(f"Range for {name} must be finite, got ({lo}, {hi}).")
+            if lo >= hi:
+                raise ValueError(f"Range for {name} must have min < max, got ({lo}, {hi}).")
+            limit_lo, limit_hi = PARAM_LIMITS[name]
+            if lo < limit_lo or hi > limit_hi:
+                raise ValueError(
+                    f"Range for {name} must lie within {(limit_lo, limit_hi)} (see PARAM_LIMITS), "
+                    f"got ({lo}, {hi})."
+                )
+            self.param_bounds[name] = (lo, hi)
+
         valid_fields = {f.name for f in fields(TrebuchetParams)}
         unknown_fixed = set(self.fixed_params) - valid_fields
         if unknown_fixed:
@@ -137,9 +176,13 @@ class OptimizationConfig:
     def free_params(self) -> List[str]:
         return [name for name in self.param_names if name not in self.locked_params]
 
+    def bounds_for(self, name: str) -> Tuple[float, float]:
+        """The search range for one parameter: the caller's override, else the default."""
+        return tuple(self.param_bounds.get(name, PARAM_BOUNDS[name]))
+
     @property
     def bounds(self) -> List[Tuple[float, float]]:
-        return [PARAM_BOUNDS[name] for name in self.free_params]
+        return [self.bounds_for(name) for name in self.free_params]
 
     def build_params(self, free_values: Sequence[float]) -> TrebuchetParams:
         """Combine fixed, locked, and optimized values into a full TrebuchetParams.

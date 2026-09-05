@@ -20,7 +20,9 @@ The easiest way to explore the simulator, all in your browser: a single-screen
 3-column dashboard. Parameters are on the left, each design variable paired with
 a lock toggle — lock it to pin the parameter to the value in its box, leave it
 unlocked to let the optimizer search it (an unlocked box's contents are
-ignored). Locked rows are tinted so the search space is readable at a glance. A
+ignored). Locked rows are tinted so the search space is readable at a glance.
+"Search ranges" sets the bounds the optimizer looks between for each parameter,
+defaulting to the built-in ones. A
 live 3D animation and energy plot sit in the middle, and the range, efficiency,
 release conditions, and resolved machine geometry on the right. A selector at
 the top picks the counterweight linkage — pulley or traditional. The animation
@@ -135,6 +137,9 @@ trebuchet optimize --target-distance 30 --lock counter_weight_mass=14
 # Either machine, on both commands (see "Machine types" below)
 trebuchet simulate --machine traditional --counterweight-mass 80
 trebuchet optimize --machine traditional --target-distance 60 --lock length_counterweight=0.4
+
+# Narrow (or widen) what the optimizer searches, per parameter
+trebuchet optimize --target-distance 30 --range arm_length=0.3:0.8 --range release_angle=-5.0:-4.0
 
 python -m trebuchet_sim.cli simulate --help
 python -m trebuchet_sim.cli optimize --help
