@@ -117,8 +117,8 @@ machine with the selector above the dashboard's parameters, or with `--machine`
 on either CLI command; switching reloads that machine's defaults, because the
 numbers don't carry across.
 
-The Numba fast engine models the pulley machine only, so optimizing a
-traditional machine falls back to the SciPy objective — correct, just slower.
+The Numba fast engine models both linkages, so either machine optimizes at
+full speed (a 60 m traditional search takes well under a second).
 
 ## Command line
 

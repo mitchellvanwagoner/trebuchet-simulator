@@ -48,6 +48,9 @@ def param_names(machine: MachineType = MachineType.PULLEY) -> List[str]:
 _FASTSIM_FIXED_FIELDS = [
     "pivot_height", "pulley_density", "arm_density", "projectile_mass", "projectile_radius",
     "initial_arm_angle", "arm_drag_coefficient", "projectile_drag_coefficient", "joint_friction_coefficient",
+    # Sets how fast a pinned counterweight swings, so it is part of the traditional
+    # machine's equations of motion rather than just its rendering.
+    "counter_weight_rope_length",
 ]
 
 # Called once per DE generation with (generation, score, params, result); result is None if the
@@ -189,14 +192,21 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
 
 def _fastsim_fixed_scalar(config: "OptimizationConfig", name: str) -> float:
     """A fixed (non-optimizable) TrebuchetParams field as a plain float: the config
-    override if present, otherwise the dataclass default (matches build_params)."""
+    override if present, otherwise the dataclass default (matches build_params).
+
+    Two fields have no usable dataclass default. `initial_arm_angle` resolves per machine
+    in __post_init__, so the machine's cocked angle stands in. `counter_weight_rope_length`
+    defaults to None, meaning "one wrap of the pulley"; numba has no None, so it is passed
+    as 0.0 and fastsim applies the same fallback.
+    """
     default = getattr(TrebuchetParams, name)
-    if default is None and name == "initial_arm_angle":
-        # No single dataclass default any more: the start angle depends on the
-        # machine. The fast engine only models the pulley machine, so that is the
-        # one to fall back on here (see the machine note in optimize_trebuchet).
-        default = DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY]
-    return float(config.fixed_params.get(name, default))
+    if default is None:
+        if name == "initial_arm_angle":
+            default = DEFAULT_INITIAL_ARM_ANGLE[config.machine]
+        elif name == "counter_weight_rope_length":
+            default = 0.0
+    value = config.fixed_params.get(name, default)
+    return float(0.0 if value is None else value)
 
 
 def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.ndarray:
@@ -204,21 +214,32 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
     Numba fast engine. `x` has shape (n_free, S); returns costs of shape (S,)."""
     s = x.shape[1]
     values = {}
-    for name in PARAM_NAMES:
+    for name in config.param_names:
         if name in config.locked_params:
             values[name] = np.full(s, config.locked_params[name], dtype=np.float64)
         else:
             idx = config.free_params.index(name)
             values[name] = np.ascontiguousarray(x[idx], dtype=np.float64)
 
+    # fastsim takes both linkage parameters as arrays and reads the one its machine uses.
+    # Only this machine's is in the search space, so the other is filled with the value a
+    # TrebuchetParams would have carried - unused by the dynamics, but it still has to be
+    # a well-typed array of the right length.
+    unused_linkage = LINKAGE_PARAM[
+        MachineType.TRADITIONAL if config.machine is MachineType.PULLEY else MachineType.PULLEY
+    ]
+    values[unused_linkage] = np.full(s, _fastsim_fixed_scalar(config, unused_linkage), dtype=np.float64)
+
     fixed = {name: _fastsim_fixed_scalar(config, name) for name in _FASTSIM_FIXED_FIELDS}
 
     return fastsim.evaluate_population(
-        values["counter_weight_mass"], values["pulley_radius"], values["arm_length"],
-        values["string_length"], values["release_angle"],
+        values["counter_weight_mass"], values["pulley_radius"], values["length_counterweight"],
+        values["arm_length"], values["string_length"], values["release_angle"],
+        fixed["counter_weight_rope_length"],
         fixed["pivot_height"], fixed["pulley_density"], fixed["arm_density"],
         fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
+        config.machine is MachineType.PULLEY,
         config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
         config.slack_penalty_weight,
     )
@@ -247,12 +268,8 @@ def optimize_trebuchet(
             result = None
         progress_callback(intermediate_result.nit, intermediate_result.fun, params, result)
 
-    # fastsim ports the pulley machine's equations of motion only - it has no
-    # counterweight-swing coordinate - so a traditional machine has to fall back to
-    # the scipy objective, which builds a real TrebuchetParams and honours `machine`.
-    # Left unguarded, the search would score every candidate as a pulley machine and
-    # then report a traditional simulation of the winner: a silently wrong optimum.
-    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE and config.machine is MachineType.PULLEY
+    # fastsim models both linkages, so the machine no longer decides the engine.
+    use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE
     if use_fast:
         de_result = differential_evolution(
             partial(_objective_vectorized, config=config),

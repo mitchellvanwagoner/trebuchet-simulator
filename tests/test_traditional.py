@@ -233,24 +233,18 @@ def _objective_chosen_for(monkeypatch, machine) -> str:
     return captured
 
 
-def test_optimizer_does_not_search_a_traditional_machine_with_the_pulley_fast_engine(monkeypatch):
-    """fastsim ports the pulley equations only.
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_optimizer_uses_the_fast_engine_for_either_machine(machine, monkeypatch):
+    """fastsim models both linkages, so neither is stuck on the slower scipy objective.
 
-    Left unguarded the search scores every candidate as a pulley machine and then reports
-    a traditional simulation of the winner - a wrong answer with nothing to flag it. The
-    guard has to route a traditional machine to the scipy objective instead.
+    The traditional machine used to be routed away from the fast engine, because scoring
+    it there would have simulated a pulley machine and reported a traditional simulation
+    of the winner. Now that fastsim carries the counterweight-swing coordinate too, the
+    machine no longer decides the engine.
     """
-    captured = _objective_chosen_for(monkeypatch, MachineType.TRADITIONAL)
-
-    assert captured["objective"] == "_objective"
-    assert captured["vectorized"] is False
-
-
-def test_optimizer_still_uses_the_fast_engine_for_a_pulley_machine(monkeypatch):
-    """The guard must not cost the machine fastsim does model its fast path."""
     pytest.importorskip("numba")
 
-    captured = _objective_chosen_for(monkeypatch, MachineType.PULLEY)
+    captured = _objective_chosen_for(monkeypatch, machine)
 
     assert captured["objective"] == "_objective_vectorized"
     assert captured["vectorized"] is True
