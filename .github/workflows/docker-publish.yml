@@ -43,33 +43,53 @@ jobs:
           push: false
           tags: trebuchet-smoke-test
 
-      # Boot the freshly built image and require the Streamlit health endpoint to
-      # come up before anything is published. Catches broken CMD/deps/permissions.
+      # Boot the freshly built image and require it to serve, write, and actually run
+      # the dashboard before anything is published. Catches broken CMD/deps/permissions.
       #
       # /app/data is bind-mounted from a host folder deliberately owned by a
       # foreign uid (65534/nobody, never the image's uid 1000) - the same shape
       # as a real DATA_DIR bind mount or Unraid appdata share - and the write
       # check below confirms the entrypoint's chown-then-drop-privileges step
       # actually made it writable, instead of only checking the image boots.
+      #
+      # It also starts empty, which matters: the dashboard falls back to built-in
+      # defaults when there are no saved ones, and that path is the one a newly created
+      # volume takes on a host's very first run.
       - name: Smoke test image
         run: |
+          set -e
           mkdir -p /tmp/smoke-data
           sudo chown 65534:65534 /tmp/smoke-data
           docker run -d --name smoke -p 8501:8501 -v /tmp/smoke-data:/app/data trebuchet-smoke-test
+          trap 'docker rm -f smoke > /dev/null 2>&1 || true' EXIT
+
+          healthy=""
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8501/_stcore/health > /dev/null 2>&1; then
-              echo "Health endpoint responded"
-              docker exec smoke sh -c 'echo ok > /app/data/permission-check.tmp && rm /app/data/permission-check.tmp'
-              echo "/app/data is writable with a foreign-owned bind mount"
-              docker rm -f smoke
-              exit 0
+              healthy=yes
+              break
             fi
             sleep 2
           done
-          echo "Image failed to become healthy within 60s; container logs:"
-          docker logs smoke
-          docker rm -f smoke
-          exit 1
+          if [ -z "$healthy" ]; then
+            echo "Image failed to become healthy within 60s; container logs:"
+            docker logs smoke
+            exit 1
+          fi
+          echo "Health endpoint responded"
+
+          docker exec smoke sh -c 'echo ok > /app/data/permission-check.tmp && rm /app/data/permission-check.tmp'
+          echo "/app/data is writable with a foreign-owned bind mount"
+
+          # The health endpoint answers as soon as the server is listening - the app
+          # script only runs once a session connects, so an exception while rendering
+          # the dashboard leaves the check above perfectly green. Run the dashboard for
+          # real, as the runtime user, against the mounted data directory.
+          # HOME is set explicitly because `docker exec -u` changes the uid without it,
+          # leaving Streamlit writing config into root's home - the same trap the
+          # entrypoint's privilege drop had to be fixed for.
+          docker cp scripts/container_smoke.py smoke:/tmp/container_smoke.py
+          docker exec -u trebuchet -e HOME=/home/trebuchet smoke python /tmp/container_smoke.py
 
       # Same context and builder as the smoke-test build, so this is a cache hit.
       - name: Push image
