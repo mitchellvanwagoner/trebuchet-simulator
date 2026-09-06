@@ -143,35 +143,63 @@ def _load_user_defaults() -> dict:
     return st.session_state.user_defaults
 
 
+# Section names inside one machine's saved block. `optimizable` maps each parameter to
+# {"value": <SI float>, "locked": <bool>} - the box's raw content and the lock toggle's
+# own state are saved separately (see _optimizable_input) so switching the toggle off and
+# back on later restores the last value instead of resetting it. `ranges` maps each to
+# {"min": <SI float>, "max": <SI float>}, the search bounds. `target` holds the optimizer
+# target and its search weights.
+_SAVED_SECTIONS = ("optimizable", "ranges", "fixed", "target")
+
+
+def _saved_machines() -> dict:
+    """Every machine's saved block, keyed by machine value.
+
+    Also the migration point for the original one-machine file, which held the sections
+    at the top level next to a single `machine` key. Such a file is read as that
+    machine's block and left alone on disk; the next save rewrites it in this shape,
+    which is why the legacy keys are only consulted when `machines` is absent.
+    """
+    defaults = _load_user_defaults()
+    saved = defaults.get("machines")
+    if isinstance(saved, dict):
+        return saved
+    legacy = {section: defaults[section] for section in _SAVED_SECTIONS if section in defaults}
+    if not legacy:
+        return {}
+    try:
+        owner = MachineType(defaults.get("machine", MachineType.PULLEY))
+    except ValueError:
+        owner = MachineType.PULLEY
+    return {owner.value: legacy}
+
+
 def _save_user_defaults(
     machine: MachineType, optimizable: dict, ranges: dict, fixed: dict, target: dict
 ) -> None:
-    """Persist the current inputs.
+    """Persist the current inputs as this machine's defaults.
 
-    `optimizable` maps each name to {"value": <SI float>, "locked": <bool>} -
-    the box's raw content and the lock toggle's own state are saved
-    separately (see _optimizable_input) so switching the toggle off and back
-    on later restores the last value instead of resetting it. `ranges` maps each
-    name to {"min": <SI float>, "max": <SI float>}, the search bounds.
-
-    The machine is saved with them, and the values only apply back to that machine
-    (see _saved_for). A 0.4 m arm is a good pulley machine and a useless traditional
-    one, so restoring one set onto the other would just look like a broken default.
+    Each machine keeps its own block, and saving one leaves the other's untouched: a
+    0.4 m arm is a good pulley machine and a useless traditional one, so the two sets
+    are not interchangeable and never were (see _saved_for) - but until they were stored
+    separately, saving either one also threw the other away. The top-level `machine` is
+    which was saved last, and only decides which the dashboard opens on.
     """
-    defaults = {
-        "machine": machine.value,
+    machines = dict(_saved_machines())
+    machines[machine.value] = {
         "optimizable": optimizable,
         "ranges": ranges,
         "fixed": fixed,
         "target": target,
     }
+    defaults = {"machine": machine.value, "machines": machines}
     USER_DEFAULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     USER_DEFAULTS_FILE.write_text(json.dumps(defaults, indent=2))
     st.session_state.user_defaults = defaults
 
 
 def _saved_machine() -> MachineType:
-    """The machine the saved defaults were written for; pulley when there are none."""
+    """The machine saved last, which the dashboard opens on; pulley when there are none."""
     try:
         return MachineType(_load_user_defaults().get("machine", MachineType.PULLEY))
     except ValueError:  # unrecognized value in a hand-edited file
@@ -179,10 +207,9 @@ def _saved_machine() -> MachineType:
 
 
 def _saved_for(machine: MachineType, section: str) -> dict:
-    """A section of the saved defaults, but only when it belongs to `machine`."""
-    if machine is not _saved_machine():
-        return {}
-    return _load_user_defaults().get(section, {})
+    """One section of one machine's saved defaults; {} when that machine has none."""
+    block = _saved_machines().get(machine.value)
+    return block.get(section, {}) if isinstance(block, dict) else {}
 
 
 def _unit_dependent_inputs() -> "list[tuple[str, str]]":
@@ -919,7 +946,13 @@ with left:
     # that absorbs whatever vertical space the inputs leave (see theme.py).
     # Popover children execute on every rerun, so the values below are always
     # current whether or not it happens to be open.
-    saved_target = _load_user_defaults().get("target", {})
+    # Scoped to the machine like every other saved section: the two reach different
+    # distances (a plain pulley machine tops out around 120 m, a traditional one around
+    # 100 m) and want different weights to get there, so one target carried across would
+    # be as wrong as one arm length. The boxes below are keyed per machine for the same
+    # reason the parameter boxes are - a keyed widget survives a rerun, so it can only
+    # be re-seeded by becoming a different widget (see _widget_key).
+    saved_target = _saved_for(machine, "target")
     target_col, tuning_col = st.columns([2, 1])
     target_min_m = 1.0
     target_default_m = max(float(saved_target.get("target_distance", 30.0)), target_min_m)
@@ -928,12 +961,17 @@ with left:
             "Target (ft)",
             min_value=target_min_m / units.METERS_PER_FOOT,
             value=target_default_m / units.METERS_PER_FOOT,
+            # Separate key per unit as well as per machine, so the box reseeds across the
+            # units toggle instead of showing feet under a metres label - the same split
+            # the length inputs make (see _unit_dependent_inputs).
+            key=_widget_key("target", "distance_ft", machine),
             help="Target distance (ft)",
         )
         target_distance = target_distance_ft * units.METERS_PER_FOOT
     else:
         target_distance = target_col.number_input(
             "Target (m)", min_value=target_min_m, value=target_default_m,
+            key=_widget_key("target", "distance_m", machine),
             help="Target distance (m)",
         )
 
@@ -942,10 +980,12 @@ with left:
         weight_col, dist_col = st.columns(2)
         efficiency_weight = weight_col.number_input(
             "Eff. weight", min_value=0.0, value=max(float(saved_target.get("efficiency_weight", 5.0)), 0.0),
+            key=_widget_key("tune", "efficiency_weight", machine),
             help="How strongly the objective rewards launch efficiency.",
         )
         distance_weight = dist_col.number_input(
             "Dist. weight", min_value=0.0, value=max(float(saved_target.get("distance_weight", 1.0)), 0.0),
+            key=_widget_key("tune", "distance_weight", machine),
             help="How strongly the objective penalizes missing the target distance.",
         )
         population_size = weight_col.number_input(
@@ -953,6 +993,7 @@ with left:
             min_value=5,
             value=max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5),
             step=5,
+            key=_widget_key("tune", "population_size", machine),
             help="Differential-evolution population per free parameter. No upper cap - larger "
             "searches more thoroughly, but runtime grows proportionally.",
         )
@@ -962,6 +1003,7 @@ with left:
             value=max(float(saved_target.get("absolute_tolerance", OptimizationConfig.absolute_tolerance)), 0.0),
             step=0.00001,
             format="%.8f",
+            key=_widget_key("tune", "absolute_tolerance", machine),
             help="Convergence tolerance on the final solution: the search stops once the "
             "population's objective spread falls below this. Smaller = more precise but slower; "
             "0 runs until the population fully converges or another stop condition is hit.",
@@ -976,6 +1018,7 @@ with left:
                 float(saved_target.get("snap_penalty_weight", OptimizationConfig.snap_penalty_weight)), 0.0
             ),
             step=50.0,
+            key=_widget_key("tune", "snap_penalty_weight", machine),
             help="How strongly the objective avoids designs whose sling runs close to slack. "
             "Raise it if the winner still jerks; 0 optimizes on range and efficiency alone.",
         )
@@ -985,7 +1028,9 @@ with left:
     optimize_clicked = btn_opt.button("Optimize", disabled=not fixed_ready, use_container_width=True)
     if btn_save.button(
         "💾",
-        help="Save the current fixed, optimizable, and optimization-target parameters as this dashboard's defaults",
+        help="Save the current fixed, optimizable, and optimization-target parameters as "
+        "this machine's defaults. Each machine keeps its own set; saving one leaves the "
+        "other's alone",
         disabled=not fixed_ready,
         use_container_width=True,
     ):

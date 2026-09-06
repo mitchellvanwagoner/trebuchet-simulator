@@ -48,8 +48,14 @@ not a `fixed_params` entry (it decides the search space rather than being search
 CLI/UI both resolve their defaults, bounds and labels through it. In the dashboard every input's
 session-state key is scoped to the machine (`_widget_key`): Streamlit keeps a keyed widget's value
 across reruns, so a box can only be re-defaulted by becoming a different widget - the same trick
-the length inputs use across the unit toggle. Saved defaults record the machine they were written
-for and only reload onto that machine. Both animation frontends draw the linkage from the `cw_pin`
+the length inputs use across the unit toggle - the optimizer target and its search weights
+included, so a machine's target distance and weights are its own. Saved defaults are stored per
+machine to match: `user_defaults.json` holds a `machines` map, so each machine keeps its own
+optimizable values, ranges, fixed geometry and target block, and saving one leaves the other's
+alone; the top-level `machine` key is only which was saved last, i.e. which the dashboard opens
+on. `_saved_machines()` migrates the original one-machine file - sections at the top level beside
+a single `machine` key - by reading them as that machine's block, and the next save rewrites it in
+the new shape. Both animation frontends draw the linkage from the `cw_pin`
 track that `sample_component_positions()` returns, and skip the pulley disc when there is none.
 
 The Docker image (multi-stage, non-root, healthcheck) installs the wheel with the `[fast]` extra and starts via the `trebuchet-web` console script; deps are pinned in `docker-constraints.txt`. Saved dashboard defaults go to `TREBUCHET_DATA_DIR` (run.py sets the repo root, Docker sets `/app/data`, bare `trebuchet-web` falls back to `~/.trebuchet-sim`).
