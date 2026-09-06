@@ -60,14 +60,26 @@ def test_objective_penalizes_slack_sling_solutions():
 
 # Copied from tests/test_physics.py: a sling that never detaches but runs on almost no
 # load. Every signal the objective had before this one - slack fraction, snap count,
-# snap energy, both compression impulses - reads exactly zero for it.
+# snap energy, both compression impulses - reads exactly zero for it. The raised pivot
+# is part of the fixture; see the copy in test_physics.py for why.
 MARGINAL_SLING_PARAMS = {
     "counter_weight_mass": 21.396,
     "pulley_radius": 0.0229,
     "arm_length": 0.9,
     "string_length": 0.416,
     "release_angle": -4.064,
+    "pivot_height": 1.5,
 }
+
+# The five design variables and the geometry they were measured on, in the two shapes
+# the objective wants them: the search space is five names wide, so the pivot height has
+# to reach the objective as fixed geometry or the run is a different machine.
+MARGINAL_FREE_VALUES = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
+MARGINAL_FIXED = {"pivot_height": MARGINAL_SLING_PARAMS["pivot_height"]}
+
+
+def _marginal_config(**overrides) -> OptimizationConfig:
+    return OptimizationConfig(fixed_params=dict(MARGINAL_FIXED), **overrides)
 
 
 def test_objective_penalizes_a_jerky_sling_that_never_actually_goes_slack():
@@ -78,13 +90,12 @@ def test_objective_penalizes_a_jerky_sling_that_never_actually_goes_slack():
     together it is the same number - and a search whose objective is flat across the
     approach to a cliff will happily park on the edge of it.
     """
-    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
     metrics = simulate_trebuchet(TrebuchetParams(**MARGINAL_SLING_PARAMS)).metrics
     assert metrics["cw_rope_compression_impulse"] == 0.0  # nothing for the slack penalty to charge
     assert metrics["sling_snap_count"] == 0
 
-    unpenalized = _objective(free_values, OptimizationConfig(snap_penalty_weight=0.0))
-    penalized = _objective(free_values, OptimizationConfig(snap_penalty_weight=300.0))
+    unpenalized = _objective(MARGINAL_FREE_VALUES, _marginal_config(snap_penalty_weight=0.0))
+    penalized = _objective(MARGINAL_FREE_VALUES, _marginal_config(snap_penalty_weight=300.0))
 
     # The charge is the deficit at the objective's own rtol=1e-6, which sums the
     # trapezoid over a slightly coarser step grid than the rtol=1e-8 metrics above.
@@ -99,13 +110,12 @@ def test_both_engines_charge_the_same_snap_penalty():
     different sling models entirely - so this holds where it matters, on a design that
     stays attached and that both engines therefore agree about.
     """
-    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
-    population = np.array([[value] for value in free_values])
+    population = np.array([[value] for value in MARGINAL_FREE_VALUES])
 
     scipy_costs, fast_costs = [], []
     for weight in (0.0, 300.0):
-        config = OptimizationConfig(snap_penalty_weight=weight)
-        scipy_costs.append(_objective(free_values, config))
+        config = _marginal_config(snap_penalty_weight=weight)
+        scipy_costs.append(_objective(MARGINAL_FREE_VALUES, config))
         fast_costs.append(float(_objective_vectorized(population, config)[0]))
 
     scipy_charge = scipy_costs[1] - scipy_costs[0]
@@ -116,13 +126,12 @@ def test_both_engines_charge_the_same_snap_penalty():
 
 def test_snap_penalty_weight_of_zero_leaves_the_objective_alone():
     """The knob has to be a knob: at 0 the score is exactly what it was without it."""
-    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
-    population = np.array([[value] for value in free_values])
-    config = OptimizationConfig(snap_penalty_weight=0.0)
+    population = np.array([[value] for value in MARGINAL_FREE_VALUES])
+    config = _marginal_config(snap_penalty_weight=0.0)
 
     # Same point, both engines, no penalty: the two objectives are one formula.
     assert float(_objective_vectorized(population, config)[0]) == pytest.approx(
-        _objective(free_values, config), rel=1e-3
+        _objective(MARGINAL_FREE_VALUES, config), rel=1e-3
     )
 
 

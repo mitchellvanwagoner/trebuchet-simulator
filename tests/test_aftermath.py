@@ -1,5 +1,3 @@
-import math
-
 import numpy as np
 import pytest
 
@@ -142,7 +140,11 @@ def test_sample_full_timeline_clamps_grounded_counterweight_bottom_face_to_groun
 def test_longer_cw_rope_length_starts_aftermath_already_grounded():
     # A long enough rope means the counterweight is already resting on the ground at
     # release, so the aftermath should start directly in "slack" with no touchdown event.
-    params = default_params(counter_weight_rope_length=1.5)
+    # "Long enough" is a rope that reaches from the axle to the floor, written against the
+    # pivot height rather than as a bare number: the weight hangs `rope` below the axle
+    # (see weight_position_velocity), so a fixed length quietly stops reaching the ground
+    # the moment the machine is stood up taller.
+    params = default_params(counter_weight_rope_length=TrebuchetParams.pivot_height)
     result = simulate_trebuchet(params, simulate_aftermath=True)
 
     _theta0, _theta_dot0, regime0 = result.aftermath.state_at(0.0)

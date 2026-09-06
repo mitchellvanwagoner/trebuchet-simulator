@@ -108,6 +108,17 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
                 "Raise --snap-penalty-weight when optimizing to trade a little range for a "
                 "sling that stays loaded."
             )
+        # A projectile that falls back to the ground mid-launch, as opposed to one merely
+        # lifted off it at the start - the machine is loaded on the ground, so time spent
+        # there is only a fault once it has been in the air and come back.
+        if result.metrics.get("projectile_ground_contacts", 0):
+            print(
+                f"  [WARNING] Projectile hits the ground "
+                f"{result.metrics['projectile_ground_contacts']} time(s) during the launch, "
+                f"losing {result.metrics.get('projectile_ground_energy', 0.0):.1f} J, and drags "
+                f"along it for {result.metrics.get('projectile_ground_fraction', 0.0) * 100:.0f}% "
+                "of the throw. Raise --pivot-height or shorten the sling."
+            )
         # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
         if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
             print(

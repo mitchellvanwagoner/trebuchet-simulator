@@ -45,10 +45,11 @@ def test_string_length_ratio_derived_property():
 # both the sling and the counterweight rope taut throughout - the rigid-link model is
 # physically valid for it, so its compression impulses must be exactly zero.
 #
-# It carries its own pivot height because it predates the ground: PARAM_BOUNDS allows an
-# arm up to 2.5 m and `pivot_height` defaults to 1 m, so this 1.78 m arm now reaches the
-# ground partway round and the launch ends there. Standing the machine tall enough to
-# swing keeps the fixture about what it was written for, which is rope tension.
+# It states its own pivot height rather than leaning on the default. It was added when the
+# default was 1 m and this 1.78 m arm dug itself into the ground partway round, ending the
+# launch; the default has since risen to 2.5 m and would clear it anyway, but a fixture
+# about rope tension should not quietly become a fixture about something else the next
+# time a default moves.
 ALWAYS_TAUT_PARAMS = {
     "counter_weight_mass": 31.382616,
     "pulley_radius": 0.154871,
@@ -88,12 +89,22 @@ def test_tension_metrics_report_no_slack_for_an_always_taut_launch():
 # only fires on detachment reads exactly as clean as the always-taut set above, yet
 # 4 of 10 one-parameter +-10% perturbations of it do snap. The gap between those two
 # facts is what sling_tension_deficit exists to close.
+#
+# Like the always-taut set it states its own pivot height, but for the projectile rather
+# than the beam: this design swings the stone down to 1.234 m below the pivot, so under
+# the 1 m default in force when this was written it ploughed into the ground, landed,
+# dragged and detached - a launch about the ground rather than about a marginal sling. A
+# pulley machine's equations of motion do not contain the pivot height at all (it only
+# shifts where everything is drawn), so any height that clears reproduces exactly the
+# launch this was picked for, to the last digit of tension. 1.5 m does, with 0.27 m to
+# spare, and pins the fixture where a later default cannot move it.
 MARGINAL_SLING_PARAMS = {
     "counter_weight_mass": 21.396,
     "pulley_radius": 0.0229,
     "arm_length": 0.9,
     "string_length": 0.416,
     "release_angle": -4.064,
+    "pivot_height": 1.5,
 }
 
 

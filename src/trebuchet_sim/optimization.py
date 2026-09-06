@@ -60,8 +60,21 @@ ProgressCallback = Callable[[int, float, TrebuchetParams, Optional[SimulationRes
 PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     "counter_weight_mass": (5.0, 60.0),    # kg
     "pulley_radius": (0.01, 1.0),          # m
-    "arm_length": (0.1, 2.5),              # m
-    "string_length": (0.1, 2.5),           # m
+    # Capped below the shorter of the two machines' default pivot heights (2.5 m on the
+    # pulley machine, 2.6 m on the traditional one), so a search run with the shipped
+    # defaults can never return a beam that digs itself into the ground - see
+    # physics._first_arm_ground_angle, which ends such a launch with no throw at all. The
+    # floor is the traditional machine's own 1.8 m default arm, which has to stay inside
+    # its own search range. PARAM_LIMITS still reaches 10 m for anyone who raises the pivot
+    # to match, but there is not much waiting up there: holding this cap and sweeping the
+    # pivot, a pulley machine measures 93.8 / 93.5 / 105.0 / 105.9 / 106.1 / 107.6 m at
+    # 1.0 / 1.5 / 2.0 / 2.5 / 3.0 / 4.0 m, and the winning arm stops growing at about
+    # 1.65 m - past a 2 m pivot the ground has stopped deciding the design at all.
+    "arm_length": (0.1, 2.0),              # m
+    # Capped with the arm: the objective rejects a sling longer than 0.95 of its arm
+    # outright, so with the arm at 2.0 m nothing above 1.9 m can ever be scored, and a
+    # bound of 2.5 m was search space that only ever produced invalid designs.
+    "string_length": (0.1, 2.0),           # m
     "release_angle": (np.radians(-290), np.radians(-180)),  # rad (-290 to -180 deg)
     # Traditional machine only, in the linkage slot where pulley_radius sits otherwise.
     # Capped well under the arm-length bound: a short arm approaching the long one is a
@@ -125,8 +138,8 @@ class OptimizationConfig:
     #
     # This is the term that decides how much range the design is allowed to buy with the
     # sling's own health, and on the pulley machine that is a real trade rather than a
-    # rounding: left unpenalized, a plain pulley machine reaches 191 m with the sling limp
-    # for two thirds of the launch, against 105 m with it loaded throughout - a 45% range
+    # rounding: left unpenalized, a plain pulley machine reaches 182 m with the sling limp
+    # for over half the launch, against 106 m with it loaded throughout - a 42% range
     # premium for a machine that beats itself up, and 39-60% across the pulley benchmark.
     # The traditional machine pays nothing for the same promise (0-2%), because its
     # geometry keeps the sling loaded anyway.

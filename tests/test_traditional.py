@@ -248,3 +248,53 @@ def test_optimizer_uses_the_fast_engine_for_either_machine(machine, monkeypatch)
 
     assert captured["objective"] == "_objective_vectorized"
     assert captured["vectorized"] is True
+
+
+def test_an_unset_counterweight_link_falls_back_to_the_machines_own_linkage():
+    """The traditional machine has no pulley, so no pulley parameter may size its link.
+
+    It used to inherit the pulley machine's fallback - twice `pulley_radius`, whose default
+    is whatever the *other* machine's search last landed on - which made a traditional
+    machine's counterweight swing (and so its whole launch) move whenever the pulley
+    defaults were re-tuned. That is not a hypothetical: re-sweeping the pulley defaults
+    silently changed two fixtures built this way.
+    """
+    values = dict(DEFAULT_TRADITIONAL_PARAMS)
+    params = TrebuchetParams(machine=MachineType.TRADITIONAL, **values)
+
+    assert params.counter_weight_rope_length is None  # nothing explicit to fall back from
+    assert params.initial_cw_rope_length == params.length_counterweight
+    # And it does not move when the pulley machine's design variables do.
+    shifted = TrebuchetParams(
+        machine=MachineType.TRADITIONAL, pulley_radius=TrebuchetParams.pulley_radius * 3, **values
+    )
+    assert shifted.initial_cw_rope_length == params.initial_cw_rope_length
+    assert simulate_trebuchet(shifted).distance == simulate_trebuchet(params).distance
+
+    # The pulley machine keeps its own fallback: one wrap of the rope over the axle.
+    pulley = TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS)
+    assert pulley.initial_cw_rope_length == 2 * pulley.pulley_radius
+
+
+def test_both_engines_agree_on_the_fallback_link_length():
+    """A fallback that only one engine applies would be a silent fork in the physics."""
+    pytest.importorskip("numba")
+    from trebuchet_sim import fastsim
+
+    values = dict(DEFAULT_TRADITIONAL_PARAMS)
+    params = TrebuchetParams(machine=MachineType.TRADITIONAL, **values)
+    reference = simulate_trebuchet(params, rtol=1e-6, dense_output=False)
+
+    fast = fastsim.simulate_fast(
+        values["counter_weight_mass"], TrebuchetParams.pulley_radius,
+        values["length_counterweight"],
+        0.0,  # fastsim's "unset" sentinel: numba has no None
+        values["arm_length"], values["string_length"], values["release_angle"],
+        params.pivot_height, params.pulley_density, params.arm_density,
+        params.projectile_mass, params.projectile_radius, params.initial_arm_angle,
+        params.arm_drag_coefficient, params.projectile_drag_coefficient,
+        params.joint_friction_coefficient, False,
+    )
+
+    assert fast[0] is reference.metrics["release_occurred"]
+    assert fast[1] == pytest.approx(reference.distance, rel=1e-3)

@@ -24,14 +24,21 @@ SLING_TENSION_FLOOR = 1.0
 # Canonical defaults for the five optimizable parameters, shared by the CLI,
 # the web UI, and the tests so they can't drift apart. Optimizer output for the
 # 30 m target with the rope-slack penalty active: the sling stays taut for the
-# whole launch (min tension ~5 N), so the rigid-link model - and the ~91%
-# efficiency it reports - is physically valid for this set.
+# whole launch and the projectile never touches the ground, so nothing here is
+# resting on a regime the model handles but a builder would not want.
+#
+# Re-swept when `pivot_height` rose to 2.5 m. The pulley machine's equations of motion
+# do not contain the pivot height, so the previous set still launched identically - it
+# just released 1.5 m higher and landed 31.37 m out, overshooting the target it was named
+# for by 4.6%. The re-swept set costs 0.5 points of efficiency (90.4% against 90.9%) and
+# buys back the 1.37 m, which is the trade the shipped weights ask for: distance 10
+# against efficiency 5.
 DEFAULT_OPTIMIZABLE_PARAMS = {
-    "counter_weight_mass": 54.989,  # kg
-    "pulley_radius": 0.0173,        # m
-    "arm_length": 0.406,            # m
-    "string_length": 0.235,         # m
-    "release_angle": -4.228,        # radians
+    "counter_weight_mass": 46.111,  # kg
+    "pulley_radius": 0.0197,        # m
+    "arm_length": 0.4322,           # m
+    "string_length": 0.2502,        # m
+    "release_angle": -4.3237,       # radians
 }
 
 
@@ -59,12 +66,13 @@ class MachineType(str, Enum):
 
 
 # Canonical defaults for the traditional machine. The arm starts cocked at -135
-# degrees (long arm down and forward, counterweight raised behind the pivot) with
-# the sling hanging below the tip, and the counterweight rides the arm rather than
-# a pulley - so `length_counterweight` replaces `pulley_radius` as the linkage
-# parameter. Geometry is chosen so the projectile starts at ground level: the tip
-# sits at pivot_height - arm_length*sin(45 deg) and the sling hangs string_length
-# below it.
+# degrees (long arm down and forward, counterweight raised behind the pivot) and the
+# counterweight rides the arm rather than a pulley - so `length_counterweight` replaces
+# `pulley_radius` as the linkage parameter. Geometry is chosen so the tip stands one sling
+# length above the ground, which is what lets the machine be loaded the way a real one is:
+# the projectile lies on the ground at the far end of a sling stretched back behind the
+# pivot (see physics.ground_start_state), rather than dangling from the tip - which on this
+# geometry put it 23 mm underground.
 # Cocked positions. The pulley machine starts with the arm raised at 45 degrees;
 # the traditional one starts at -135 degrees, long arm down and forward with the
 # counterweight raised behind the pivot, which is the mirror image about the
@@ -80,7 +88,11 @@ DEFAULT_TRADITIONAL_PARAMS = {
     "length_counterweight": 0.35,    # m
     "arm_length": 1.8,               # m
     "string_length": 1.35,           # m
-    "release_angle": -4.94,          # radians; swept for maximum range on this geometry
+    # Swept for maximum range on this geometry, which means the pose above: laid back
+    # along the ground rather than hanging. The two differ by 10.5 degrees of initial sling
+    # lean and the sweep by 4.4 degrees of arm - -4.94 was the answer for the hanging pose,
+    # and reads 63.9 m on the real one against this angle's 70.2 m.
+    "release_angle": -5.016,         # radians
 }
 
 # Fixed (never-optimized) fields whose defaults also differ per machine. The pivot
@@ -134,7 +146,12 @@ class TrebuchetParams:
     pulley_radius: float = DEFAULT_OPTIMIZABLE_PARAMS["pulley_radius"]      # m; PULLEY only
     length_counterweight: float = 0.35                                       # m; TRADITIONAL only
 
-    pivot_height: float = 1.0                          # m (height of the arm pivot above the ground)
+    # Tall enough to swing every arm in PARAM_BOUNDS, which is the point of the number:
+    # a beam longer than its pivot is tall reaches the ground partway round and the launch
+    # ends there, so a shorter default would put most of the search range out of reach (at
+    # the old 1 m it put all but the bottom 40% of it there). The traditional machine
+    # overrides it upward again for its own geometry - see DEFAULT_TRADITIONAL_FIXED.
+    pivot_height: float = 2.5                          # m (height of the arm pivot above the ground)
     pulley_density: float = 1250                      # kg/m^3
     arm_density: float = 530                          # kg/m^3
     counter_weight_density: float = 7850               # kg/m^3, steel - sizes the counterweight's cube for ground collision
@@ -159,14 +176,20 @@ class TrebuchetParams:
 
     @property
     def initial_cw_rope_length(self) -> float:
-        """Rope length from the pivot axle to the counterweight at t=0.
+        """Length of the link the counterweight hangs on at t=0.
 
-        Defaults to twice the pulley radius (a single wrap) when
-        `counter_weight_rope_length` isn't explicitly set.
+        Explicit when `counter_weight_rope_length` is set; otherwise each machine falls
+        back to its own linkage. The pulley machine hangs its weight from a rope over the
+        axle, so one wrap of the pulley is the natural length. The traditional machine has
+        no pulley at all, and used to inherit that same expression anyway - which meant its
+        counterweight swung on a length derived from `pulley_radius`, a parameter it does
+        not use, whose default is whatever the *other* machine's search last landed on. Its
+        own short arm is the length that sizes its counterweight linkage, so that is what
+        it falls back to.
         """
         if self.counter_weight_rope_length is not None:
             return self.counter_weight_rope_length
-        return 2 * self.pulley_radius
+        return 2 * self.pulley_radius if self.has_pulley else self.length_counterweight
 
     def __post_init__(self) -> None:
         # Accept a plain string (e.g. from saved defaults JSON) as the machine.
@@ -266,10 +289,3 @@ class TrebuchetParams:
     def string_arm_ratio(self) -> float:
         """String to arm length ratio."""
         return self.string_length / self.arm_length
-
-    @property
-    def arm_string_clearance(self) -> float:
-        """Ground clearance when arm + sling hang straight down, minus a 0.1 m
-        safety margin. Negative means the projectile could strike the ground
-        during the swing."""
-        return self.pivot_height - (self.arm_length + self.string_length + 0.1)

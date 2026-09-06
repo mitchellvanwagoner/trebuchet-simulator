@@ -761,6 +761,19 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             "would make it snap. Raising the snap penalty when optimizing trades a little range "
             "for a sling that stays loaded."
         )
+    # Its own warning rather than a branch of the sling ones: a projectile on the ground
+    # and a sling with no load in it are two different faults with two different fixes, and
+    # a design can have either without the other. Only a projectile that has come *back* to
+    # the ground counts - the machine is loaded on it, so starting there is the normal pose
+    # (see physics.ground_start_state), not something to warn about.
+    if result.metrics.get("projectile_ground_contacts", 0):
+        st.warning(
+            f"Projectile hits the ground {result.metrics['projectile_ground_contacts']} time(s) "
+            f"during the launch, losing "
+            f"{result.metrics.get('projectile_ground_energy', 0.0):.1f} J, and drags along it for "
+            f"{result.metrics.get('projectile_ground_fraction', 0.0) * 100:.0f}% of the throw. "
+            "Raise the pivot height or shorten the sling to swing it clear."
+        )
     # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
     if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
         st.warning(
