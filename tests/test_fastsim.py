@@ -108,6 +108,10 @@ _SNAP_ENERGY_NOISE_FLOOR = 0.01
 # second); the counts below are what these seeds actually produce.
 _GRID_DRAWS = {MachineType.PULLEY: 100, MachineType.TRADITIONAL: 300}
 
+# How far above the swept arm the sweep stands its pivot. Any positive margin does; this
+# one keeps the tip clear of the ground by a quarter metre at the bottom of its turn.
+_PIVOT_CLEARANCE = 0.25
+
 
 def _parameter_grid(machine=MachineType.PULLEY, seed: int = 42, draws: int = None):
     """Yield (values, reference result, fast result) over a random sweep of the bounds.
@@ -116,16 +120,24 @@ def _parameter_grid(machine=MachineType.PULLEY, seed: int = 42, draws: int = Non
     parameter it actually uses. Geometries whose string nearly equals the arm are
     skipped: they are outside the region the optimizer searches and integrate poorly in
     both engines.
+
+    The pivot is raised to clear whatever arm was drawn. `PARAM_BOUNDS` allows arms up to
+    2.5 m while `pivot_height` defaults to 1 m, so most of that range is a beam that
+    reaches the ground and stops there - a real answer (see test_arm_ground_contact...)
+    but a useless one to compare engines on, since a launch that ends in the first
+    fraction of a turn exercises almost nothing. Standing the machine tall enough to
+    swing gets the sweep back to comparing whole launches.
     """
     draws = _GRID_DRAWS[machine] if draws is None else draws
     rng = np.random.default_rng(seed)
     for _ in range(draws):
         values = {name: rng.uniform(*PARAM_BOUNDS[name]) for name in param_names(machine)}
-        params = _reference_params(values, machine)
+        pivot = max(TrebuchetParams.pivot_height, values["arm_length"] + _PIVOT_CLEARANCE)
+        params = _reference_params(values, machine, pivot_height=pivot)
         if params.string_length > 0.95 * params.arm_length:
             continue
         ref = simulate_trebuchet(params, rtol=1e-6, dense_output=False)
-        yield values, ref, _simulate_fast(values, machine)
+        yield values, ref, _simulate_fast(values, machine, pivot_height=pivot)
 
 
 def test_fast_engine_matches_scipy_engine_for_default_params():
@@ -283,6 +295,42 @@ def test_fast_engine_reproduces_the_energy_a_snap_destroys(machine):
         assert fast[6] == pytest.approx(ref_energy, rel=5e-2, abs=_SNAP_ENERGY_NOISE_FLOOR), values
 
     assert snapping_cases > 10
+
+
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_both_engines_stop_the_launch_where_the_beam_reaches_the_ground(machine):
+    """An arm longer than its pivot is tall digs into the ground partway round.
+
+    Both engines have to end the launch there and report no throw, and they have to do it
+    on the same geometries - this is a terminal event like any other, and an engine that
+    missed it would carry on and report a throw the machine never got to make.
+
+    It is deliberately not a clearance test. The beam's clearance dips below zero and
+    comes back within a fraction of a turn, so a solver checking its sign at step
+    endpoints can step over the whole excursion; both engines compare the arm angle
+    against the angle at which the beam first touches, which is monotonic in the only
+    direction the arm turns (see physics._first_arm_ground_angle).
+    """
+    values = dict(DEFAULT_MACHINE_PARAMS[machine])
+    arm = values["arm_length"]
+    linkage = values.get("length_counterweight", 0.0)
+
+    # Tall enough to swing, then short enough that it cannot.
+    clears = _reference_params(values, machine, pivot_height=arm + linkage + 0.5)
+    digs = _reference_params(values, machine, pivot_height=arm / 2.0)
+
+    ref_clears = simulate_trebuchet(clears, rtol=1e-6, dense_output=False)
+    ref_digs = simulate_trebuchet(digs, rtol=1e-6, dense_output=False)
+    assert ref_clears.metrics["arm_ground_contact"] is False
+    assert ref_digs.metrics["arm_ground_contact"] is True
+    assert ref_digs.metrics["release_occurred"] is False
+    assert ref_digs.distance == 0.0
+
+    fast_clears = _simulate_fast(values, machine, pivot_height=arm + linkage + 0.5)
+    fast_digs = _simulate_fast(values, machine, pivot_height=arm / 2.0)
+    assert fast_clears[0] == ref_clears.metrics["release_occurred"]
+    assert fast_digs[0] is False
+    assert fast_digs[1] == 0.0
 
 
 def test_fast_engine_reports_no_release_for_geometry_that_never_releases():

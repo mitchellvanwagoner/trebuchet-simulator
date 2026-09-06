@@ -118,6 +118,7 @@ class LaunchSolution:
         self.release_swing_state: Optional[Tuple[float, float]] = None  # psi, psi_dot
         self.snap_times: List[float] = []
         self.snap_energy_losses: List[float] = []
+        self.arm_ground_contact: bool = False   # the beam struck the ground; the launch ended there
 
     @property
     def t_end(self) -> float:
@@ -336,6 +337,14 @@ class TrebuchetSimulator:
         self._M_taut = self._cw_inertia + p.moi_pulley + p.moi_arm
         self._M_slack = p.moi_pulley + p.moi_arm
         self._cw_half_size = p.counter_weight_size / 2
+        # Half-lengths of the beam either side of the pivot. The beam is a straight line
+        # through the pivot, so whichever end is lower is the whole beam's lowest point,
+        # and that is what can reach the ground. A pulley machine has no arm behind the
+        # pivot at all.
+        self._arm_back_length = 0.0 if p.has_pulley else p.length_counterweight
+        # The arm angle at which the beam first reaches the ground on the way round, or
+        # -inf when it never can. See _first_arm_ground_angle.
+        self._theta_arm_ground = self._first_arm_ground_angle()
         # Arm angle at which the counterweight's bottom face reaches the ground.
         # Only the pulley machine needs it: there the weight descends linearly with
         # theta and the rope goes slack on touchdown. The traditional machine's
@@ -613,6 +622,51 @@ class TrebuchetSimulator:
 
         return [theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot]
 
+    def _first_arm_ground_angle(self) -> float:
+        """The largest arm angle below the cocked one at which the beam touches the ground.
+
+        The beam is straight and turns about the pivot, so an end at radius r is at
+        height h_T +/- r*sin(theta) and reaches the ground at a fixed set of angles - the
+        tip where sin(theta) = -h_T/l_a, the short end behind the pivot (traditional
+        machine only) where sin(theta) = +h_T/l_back. An end shorter than the pivot is
+        tall never gets there at all.
+
+        The launch turns in one direction (decreasing theta), so the first of those
+        angles below the start is the one that ends it, and comparing against it is a
+        monotonic test no solver can step over. Returns -inf when the beam cannot reach
+        the ground, which leaves the event unarmed.
+        """
+        h_T = self._h_T
+        candidates: List[float] = []
+        for radius, sign in ((self._l_a, -1.0), (self._arm_back_length, 1.0)):
+            if radius < h_T or radius <= 0.0:
+                continue  # this end cannot reach the ground however far the arm turns
+            # sin(theta) = sign * h_T / radius, whose solutions repeat every turn.
+            base = math.asin(max(-1.0, min(1.0, sign * h_T / radius)))
+            for root in (base, math.pi - base):
+                # Step the root back by whole turns until it sits below the start angle.
+                turns = math.ceil((root - self.params.initial_arm_angle) / (2 * math.pi))
+                candidates.append(root - 2 * math.pi * turns)
+        return max(candidates) if candidates else -math.inf
+
+    def arm_ground_clearance(self, theta: float) -> float:
+        """Height of the lowest point of the beam above the ground, in metres.
+
+        The beam is straight and passes through the pivot, so its lowest point is
+        whichever end is lower; a pulley machine has only the one, a traditional machine
+        also carries the short end behind the pivot. Zero means the arm is touching the
+        ground - which for a real machine is the end of it, and here is a terminal event
+        (see _integrate_launch).
+
+        Only the beam is checked. The counterweight has its own ground handling in the
+        aftermath (see _theta_ground) and the projectile has its own contact model, but
+        neither is what this reports.
+        """
+        sin_t = math.sin(theta)
+        tip_y = self._l_a * sin_t + self._h_T
+        back_y = -self._arm_back_length * sin_t + self._h_T
+        return min(tip_y, back_y)
+
     def constraint_tensions(self, t: float, y: State) -> Tuple[float, float]:
         """(string tension, counterweight rope tension) at the current state, in newtons.
 
@@ -738,6 +792,15 @@ class TrebuchetSimulator:
                 float(sling_deficit / (tension_floor * duration))
                 if duration > 0 and tension_floor > 0 else 0.0
             ),
+            # True means the launch ended because the beam reached the ground, not
+            # because the arm ran out of time - a design that cannot be built rather
+            # than one that merely throws badly.
+            "arm_ground_contact": launch.arm_ground_contact,
+            "min_arm_ground_clearance": float(min(
+                self.arm_ground_clearance(float(seg.sol.y[0, i]))
+                for seg in launch.segments
+                for i in range(len(seg.sol.t))
+            )),
         }
         if track_cw:
             metrics["min_cw_rope_tension"] = float(cw_T_min)
@@ -889,6 +952,18 @@ class TrebuchetSimulator:
         retension_event.terminal = True
         retension_event.direction = 1
 
+        # The beam striking the ground ends the launch wherever it happens: a real arm
+        # that reaches the ground at speed destroys the machine, so there is no release
+        # after it and no trajectory to report. Armed in both regimes, because the arm
+        # keeps swinging whether or not the sling is still attached to anything.
+        theta_arm_ground = self._theta_arm_ground
+
+        def arm_ground_event(t, y):
+            return y[0] - theta_arm_ground
+
+        arm_ground_event.terminal = True
+        arm_ground_event.direction = -1
+
         t = 0.0
         y = self.initial_state()
         regime = "taut" if self.constraint_tensions(0.0, y)[0] >= 0.0 else "slack"
@@ -899,15 +974,25 @@ class TrebuchetSimulator:
             if t >= t_max:
                 break
 
+            # Unarmed when the beam can never reach the ground, and when it is already
+            # at or past that angle - scipy would otherwise fire at t0 and return a
+            # zero-length segment forever.
+            ground_armed = math.isfinite(theta_arm_ground) and y[0] > theta_arm_ground
             if regime == "taut":
+                events = [release_event, slack_event]
+                if ground_armed:
+                    events.append(arm_ground_event)
                 sol = solve_ivp(
                     self.trebuchet_dynamics, (t, t_max), y,
-                    events=[release_event, slack_event], dense_output=dense_output, rtol=rtol,
+                    events=events, dense_output=dense_output, rtol=rtol,
                 )
             else:
+                events = [release_event, retension_event]
+                if ground_armed:
+                    events.append(arm_ground_event)
                 sol = solve_ivp(
                     self._launch_slack_dynamics, (t, t_max), y,
-                    events=[release_event, retension_event], dense_output=dense_output, rtol=rtol,
+                    events=events, dense_output=dense_output, rtol=rtol,
                 )
             launch.segments.append(LaunchSegment(sol=sol, t0=t, t1=float(sol.t[-1]), regime=regime))
 
@@ -927,6 +1012,10 @@ class TrebuchetSimulator:
                         (float(y_release[2]), float(y_release[3])),
                         (float(y_release[4]), float(y_release[5])),
                     )
+                break
+
+            if len(sol.t_events) > 2 and sol.t_events[2].size > 0:  # beam hit the ground
+                launch.arm_ground_contact = True
                 break
 
             if sol.t_events[1].size > 0:  # regime switch
@@ -1188,13 +1277,19 @@ class TrebuchetSimulator:
         return alpha, alpha_dot
 
     def _no_release_result(self, launch: LaunchSolution, t_max: float) -> SimulationResult:
-        """Result when the arm never reaches the release angle within t_max."""
+        """Result when the launch ends without the projectile being released.
+
+        Two ways to get here: the arm ran the full t_max without reaching the release
+        angle, or it reached the ground first and the launch ended there (see
+        `arm_ground_contact`). `simulation_time` is when the launch actually stopped,
+        which is t_max only in the first case.
+        """
         theta, theta_dot = launch.machine_state(launch.t_end)
         final_pos, final_vel = launch.projectile_state(launch.t_end)
         alpha, alpha_dot = self._effective_string_state(theta, theta_dot, final_pos, final_vel)
 
         metrics = {
-            "simulation_time": t_max,
+            "simulation_time": launch.t_end,
             "final_arm_angle_deg": theta * 180 / np.pi,
             "final_string_angle_deg": alpha * 180 / np.pi,
             "arm_angular_velocity": theta_dot,

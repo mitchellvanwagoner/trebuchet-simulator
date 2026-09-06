@@ -717,7 +717,18 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
         return
 
     if not result.metrics.get("release_occurred", True):
-        st.warning("No release - the arm never reached the release angle within the simulation window.")
+        if result.metrics.get("arm_ground_contact"):
+            st.warning(
+                f"No release - the arm reached the ground "
+                f"{result.metrics.get('total_rotation_deg', 0.0):.0f}° into the throw and the "
+                "launch ended there. The beam is longer than the pivot is tall, so it cannot "
+                "swing past the bottom: raise the pivot height above the arm length, or shorten "
+                "the arm."
+            )
+        else:
+            st.warning(
+                "No release - the arm never reached the release angle within the simulation window."
+            )
         _metric_grid(
             {
                 "Simulation time": f"{result.metrics['simulation_time']:.2f} s",

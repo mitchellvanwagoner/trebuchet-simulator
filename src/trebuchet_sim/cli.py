@@ -61,7 +61,15 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
 
     if not result.metrics.get("release_occurred", True):
         print("\nResults:")
-        print("  **NO RELEASE OCCURRED** - simulation ran for the full duration")
+        if result.metrics.get("arm_ground_contact"):
+            print("  **NO RELEASE OCCURRED** - the arm reached the ground and the launch ended there")
+            print(
+                f"  The beam struck {result.metrics['total_rotation_deg']:.0f} deg into the throw: "
+                "it is longer than the pivot is tall, so it cannot swing past the bottom."
+            )
+            print("  Raise --pivot-height above the arm length, or shorten the arm.")
+        else:
+            print("  **NO RELEASE OCCURRED** - simulation ran for the full duration")
         print(f"  Simulation time: {result.metrics['simulation_time']:.1f} s")
         print(f"  Final arm angle: {result.metrics['final_arm_angle_deg']:.1f} deg")
         print(f"  Total arm rotation: {result.metrics['total_rotation_deg']:.1f} deg")

@@ -72,6 +72,7 @@ E7 = -1 / 40
 _SEG_TMAX = 0
 _SEG_RELEASE = 1
 _SEG_SWITCH = 2
+_SEG_ARM_GROUND = 3
 
 # Cap on taut/slack regime switches, matching physics.MAX_LAUNCH_SEGMENTS. Each snap
 # destroys energy so the switching always dies out; the cap only guards numerical
@@ -103,6 +104,7 @@ def _hermite(y0, y1, f0, f1, h, s):
 #   2 M11                 8 proj_drag_k          14 proj_gravity_alpha_k
 #   3 M22                 9 cw_torque_const      15 joint_friction
 #   4 M33                10 cw_torque_cos          16 M_taut
+#                                                  17 arm_back_length
 #   5 coupling           11 cw_swing_gravity_k
 
 
@@ -116,7 +118,7 @@ def _trebuchet_dynamics(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c):
     """
     (l_a, l_s, M11, M22, M33, coupling, cw_swing_coupling, arm_drag_k, proj_drag_k,
      cw_torque_const, cw_torque_cos, cw_swing_gravity_k, arm_gravity_k,
-     proj_gravity_theta_k, proj_gravity_alpha_k, joint_friction, _M_taut) = c
+     proj_gravity_theta_k, proj_gravity_alpha_k, joint_friction, _M_taut, _back) = c
 
     sin_t, cos_t = np.sin(theta), np.cos(theta)
     sin_a, cos_a = np.sin(alpha), np.cos(alpha)
@@ -169,6 +171,41 @@ def _trebuchet_dynamics(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c):
     return theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot
 
 
+@njit(cache=True, fastmath=True)
+def _first_arm_ground_angle(l_a, l_back, h_T, initial_arm_angle):
+    """The largest arm angle below the cocked one at which the beam touches the ground.
+
+    Scalar port of physics.TrebuchetSimulator._first_arm_ground_angle. The test has to be
+    on the angle rather than on the beam's clearance: clearance dips below zero and comes
+    back within a fraction of a turn, and a solver that checks its sign at step endpoints
+    can step over the whole excursion - which it does, during a slack stretch, where the
+    machine is a smooth pendulum and RK45 stretches its step past the width of the dip.
+    An arm that turns one way either reaches this angle or does not.
+
+    Returns -inf when neither end of the beam can reach the ground, which leaves the
+    event unarmed.
+    """
+    best = -np.inf
+    for k in range(2):
+        radius = l_a if k == 0 else l_back
+        sign = -1.0 if k == 0 else 1.0
+        if radius < h_T or radius <= 0.0:
+            continue
+        ratio = sign * h_T / radius
+        if ratio > 1.0:
+            ratio = 1.0
+        elif ratio < -1.0:
+            ratio = -1.0
+        base = np.arcsin(ratio)
+        for j in range(2):
+            root = base if j == 0 else np.pi - base
+            turns = np.ceil((root - initial_arm_angle) / (2.0 * np.pi))
+            candidate = root - 2.0 * np.pi * turns
+            if candidate > best:
+                best = candidate
+    return best
+
+
 @njit(cache=True, fastmath=True, inline="always")
 def _machine_only_accelerations(theta, theta_dot, psi, psi_dot, c):
     """(theta_ddot, psi_ddot) for the machine carrying no projectile.
@@ -180,7 +217,7 @@ def _machine_only_accelerations(theta, theta_dot, psi, psi_dot, c):
     """
     (_l_a, _l_s, _M11, _M22, M33, _coupling, cw_swing_coupling, arm_drag_k, _proj_drag_k,
      cw_torque_const, cw_torque_cos, cw_swing_gravity_k, arm_gravity_k,
-     _pgt, _pga, joint_friction, M_taut) = c
+     _pgt, _pga, joint_friction, M_taut, _back) = c
 
     sin_t, cos_t = np.sin(theta), np.cos(theta)
     sin_p, cos_p = np.sin(psi), np.cos(psi)
@@ -343,7 +380,7 @@ def _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot, l_a, l_s, proj_dra
 def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
                             c, release_angle, t_max, rtol, atol,
                             projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
-                            tension_floor, out):
+                            tension_floor, h_T, initial_arm_angle, out):
     """Integrate one taut-sling stretch, until release, slack onset, or t_max.
 
     Mirrors the taut arm of physics.TrebuchetSimulator._integrate_launch, whose taut
@@ -369,6 +406,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     """
     l_a, l_s = c[0], c[1]
     proj_drag_k = c[8]
+    theta_arm_ground = _first_arm_ground_angle(l_a, c[17], h_T, initial_arm_angle)
 
     t = t0
     f0_1, f0_2, f0_3, f0_4, f0_5, f0_6 = _trebuchet_dynamics(
@@ -377,6 +415,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
 
     h = 1e-3
     g_prev = theta - release_angle
+    gg_prev = theta - theta_arm_ground
 
     string_impulse = 0.0
     cw_impulse = 0.0
@@ -484,6 +523,20 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                         hi = mid
                 s_release = 0.5 * (lo + hi)
 
+            # The beam reaching the ground is a third terminal event on this step,
+            # localized on the arm angle exactly as the release is.
+            gg_new = yn_1 - theta_arm_ground
+            s_ground = 2.0
+            if gg_prev > 0.0 and gg_new <= 0.0:
+                lo, hi = 0.0, 1.0
+                for _ in range(50):
+                    mid = 0.5 * (lo + hi)
+                    if _hermite(theta, yn_1, f0_1, k7_1, h, mid) - theta_arm_ground > 0.0:
+                        lo = mid
+                    else:
+                        hi = mid
+                s_ground = 0.5 * (lo + hi)
+
             s_switch = 2.0
             if string_T_prev > 0.0 and string_T_new <= 0.0:
                 lo, hi = 0.0, 1.0
@@ -505,9 +558,14 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                         hi = mid
                 s_switch = 0.5 * (lo + hi)
 
-            if s_release <= 1.0 or s_switch <= 1.0:
-                s = min(s_release, s_switch)
-                status = _SEG_RELEASE if s_release <= s_switch else _SEG_SWITCH
+            if s_release <= 1.0 or s_switch <= 1.0 or s_ground <= 1.0:
+                s = min(s_release, min(s_switch, s_ground))
+                if s_release <= s_switch and s_release <= s_ground:
+                    status = _SEG_RELEASE
+                elif s_switch <= s_ground:
+                    status = _SEG_SWITCH
+                else:
+                    status = _SEG_ARM_GROUND
                 theta_r = _hermite(theta, yn_1, f0_1, k7_1, h, s)
                 theta_dot_r = _hermite(theta_dot, yn_2, f0_2, k7_2, h, s)
                 alpha_r = _hermite(alpha, yn_3, f0_3, k7_3, h, s)
@@ -543,6 +601,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
             theta, theta_dot, alpha, alpha_dot, psi, psi_dot = yn_1, yn_2, yn_3, yn_4, yn_5, yn_6
             f0_1, f0_2, f0_3, f0_4, f0_5, f0_6 = k7_1, k7_2, k7_3, k7_4, k7_5, k7_6
             g_prev = g_new
+            gg_prev = gg_new
 
             factor = MAX_FACTOR if err_norm == 0.0 else min(MAX_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
@@ -558,7 +617,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
 @njit(cache=True, fastmath=True)
 def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
                              projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
-                             h_T, tension_floor, out):
+                             h_T, tension_floor, initial_arm_angle, out):
     """Integrate one slack-sling stretch, until release, re-tension, or t_max.
 
     The slack arm of physics.TrebuchetSimulator._integrate_launch: the projectile flies
@@ -578,6 +637,7 @@ def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
     records for a slack segment.
     """
     l_a, l_s = c[0], c[1]
+    theta_arm_ground = _first_arm_ground_angle(l_a, c[17], h_T, initial_arm_angle)
     n = 8
     k1 = np.empty(n); k2 = np.empty(n); k3 = np.empty(n); k4 = np.empty(n)
     k5 = np.empty(n); k6 = np.empty(n); k7 = np.empty(n)
@@ -588,6 +648,7 @@ def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
 
     h = 1e-3
     g_prev = y[0] - release_angle
+    gg_prev = y[0] - theta_arm_ground
 
     cw_impulse = 0.0
     sling_deficit = 0.0
@@ -643,6 +704,18 @@ def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
                         hi = mid
                 s_release = 0.5 * (lo + hi)
 
+            gg_new = yn[0] - theta_arm_ground
+            s_ground = 2.0
+            if gg_prev > 0.0 and gg_new <= 0.0:
+                lo, hi = 0.0, 1.0
+                for _ in range(50):
+                    mid = 0.5 * (lo + hi)
+                    if _hermite(y[0], yn[0], k1[0], k7[0], h, mid) - theta_arm_ground > 0.0:
+                        lo = mid
+                    else:
+                        hi = mid
+                s_ground = 0.5 * (lo + hi)
+
             sep_prev = _tip_separation(y, l_a, l_s, h_T)
             sep_new = _tip_separation(yn, l_a, l_s, h_T)
             s_switch = 2.0
@@ -658,9 +731,14 @@ def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
                         hi = mid
                 s_switch = 0.5 * (lo + hi)
 
-            if s_release <= 1.0 or s_switch <= 1.0:
-                s = min(s_release, s_switch)
-                status = _SEG_RELEASE if s_release <= s_switch else _SEG_SWITCH
+            if s_release <= 1.0 or s_switch <= 1.0 or s_ground <= 1.0:
+                s = min(s_release, min(s_switch, s_ground))
+                if s_release <= s_switch and s_release <= s_ground:
+                    status = _SEG_RELEASE
+                elif s_switch <= s_ground:
+                    status = _SEG_SWITCH
+                else:
+                    status = _SEG_ARM_GROUND
                 for i in range(n):
                     out[i] = _hermite(y[i], yn[i], k1[i], k7[i], h, s)
                 cw_T_e = _slack_cw_tension(out, c, counter_weight_mass, pulley_radius, has_pulley)
@@ -678,6 +756,7 @@ def _integrate_slack_segment(t0, y, c, release_angle, t_max, rtol, atol,
                 y[i] = yn[i]
                 k1[i] = k7[i]
             g_prev = g_new
+            gg_prev = gg_new
 
             factor = MAX_FACTOR if err_norm == 0.0 else min(MAX_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
@@ -729,10 +808,14 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
     post-snap tension decides whether the string stays taut or goes straight back to
     slack.
 
+    A launch also ends for good if the beam reaches the ground, in either regime: that
+    is a machine destroying itself, so there is no release after it and nothing to throw.
+
     Returns (released, t, theta, theta_dot, psi, px, py, pvx, pvy, string_impulse,
-    cw_impulse, sling_deficit, snap_energy). The projectile is reported as position and
-    velocity rather than a sling angle, because a release out of a slack stretch has no
-    sling angle to report - which is exactly how physics.LaunchSolution hands it over.
+    cw_impulse, sling_deficit, snap_energy, arm_ground). The projectile is reported as
+    position and velocity rather than a sling angle, because a release out of a slack
+    stretch has no sling angle to report - which is exactly how physics.LaunchSolution
+    hands it over.
     """
     l_a, l_s = c[0], c[1]
     taut = np.empty(6)
@@ -748,6 +831,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
     cw_impulse = 0.0
     sling_deficit = 0.0
     snap_energy = 0.0
+    arm_ground = False
     t = 0.0
 
     # Which regime the launch starts in, decided the way physics.py decides it: by the
@@ -771,7 +855,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             status, t, seg_str, seg_cw, seg_def = _integrate_taut_segment(
                 t, theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c, release_angle,
                 t_max, rtol, atol, projectile_mass, counter_weight_mass, pulley_radius,
-                has_pulley, tension_floor, taut,
+                has_pulley, tension_floor, h_T, theta0, taut,
             )
             string_impulse += seg_str
             cw_impulse += seg_cw
@@ -788,7 +872,10 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                         l_a * sin_t + l_s * sin_a + h_T,
                         -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a,
                         l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a,
-                        string_impulse, cw_impulse, sling_deficit, snap_energy)
+                        string_impulse, cw_impulse, sling_deficit, snap_energy, arm_ground)
+            if status == _SEG_ARM_GROUND:
+                arm_ground = True
+                break
             if status == _SEG_TMAX:
                 break
             _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
@@ -798,7 +885,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
 
         status, t, seg_cw, seg_def = _integrate_slack_segment(
             t, slack, c, release_angle, t_max, rtol, atol, projectile_mass,
-            counter_weight_mass, pulley_radius, has_pulley, h_T, tension_floor, slack,
+            counter_weight_mass, pulley_radius, has_pulley, h_T, tension_floor, theta0, slack,
         )
         cw_impulse += seg_cw
         sling_deficit += seg_def
@@ -807,7 +894,10 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
         if status == _SEG_RELEASE:
             return (True, t, slack[0], slack[1], slack[6], slack[2], slack[3],
                     slack[4], slack[5], string_impulse, cw_impulse, sling_deficit,
-                    snap_energy)
+                    snap_energy, arm_ground)
+        if status == _SEG_ARM_GROUND:
+            arm_ground = True
+            break
         if status == _SEG_TMAX:
             break
 
@@ -838,9 +928,9 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                 l_a * cos_t + l_s * cos_a, l_a * sin_t + l_s * sin_a + h_T,
                 -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a,
                 l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a,
-                string_impulse, cw_impulse, sling_deficit, snap_energy)
+                string_impulse, cw_impulse, sling_deficit, snap_energy, arm_ground)
     return (False, t, slack[0], slack[1], slack[6], slack[2], slack[3], slack[4], slack[5],
-            string_impulse, cw_impulse, sling_deficit, snap_energy)
+            string_impulse, cw_impulse, sling_deficit, snap_energy, arm_ground)
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -1020,7 +1110,7 @@ def _machine_constants(counter_weight_mass, pulley_radius, length_counterweight,
         arm_length, string_length, M11, M22, M33, coupling, cw_swing_coupling,
         arm_drag_k, proj_drag_k, cw_torque_const, cw_torque_cos, cw_swing_gravity_k,
         arm_gravity_k, proj_gravity_theta_k, proj_gravity_alpha_k, joint_friction_coefficient,
-        M_taut,
+        M_taut, arm_back_length,
     )
     return c, (arm_mass, pulley_mass, projectile_area, arm_cm_offset, l_w)
 
@@ -1077,7 +1167,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     tension_floor = SLING_TENSION_FLOOR * projectile_mass * G
 
     (released, t_rel, theta_r, theta_dot_r, psi_r, x0, y0, vx0, vy0,
-     string_impulse, cw_impulse, sling_deficit, snap_energy) = _integrate_launch(
+     string_impulse, cw_impulse, sling_deficit, snap_energy, _arm_ground) = _integrate_launch(
         theta0, alpha0, psi0, c, release_angle, 10.0, 1e-6, 1e-6,
         projectile_mass, counter_weight_mass, pulley_radius, has_pulley, tension_floor,
         pivot_height,

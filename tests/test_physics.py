@@ -44,12 +44,18 @@ def test_string_length_ratio_derived_property():
 # A parameter set (found by random search, seed 3 over PARAM_BOUNDS) whose launch keeps
 # both the sling and the counterweight rope taut throughout - the rigid-link model is
 # physically valid for it, so its compression impulses must be exactly zero.
+#
+# It carries its own pivot height because it predates the ground: PARAM_BOUNDS allows an
+# arm up to 2.5 m and `pivot_height` defaults to 1 m, so this 1.78 m arm now reaches the
+# ground partway round and the launch ends there. Standing the machine tall enough to
+# swing keeps the fixture about what it was written for, which is rope tension.
 ALWAYS_TAUT_PARAMS = {
     "counter_weight_mass": 31.382616,
     "pulley_radius": 0.154871,
     "arm_length": 1.776223,
     "string_length": 0.800749,
     "release_angle": -3.388988,
+    "pivot_height": 2.5,
 }
 
 
@@ -74,6 +80,8 @@ def test_tension_metrics_report_no_slack_for_an_always_taut_launch():
     # tell apart. The shipped defaults keep enough margin to sit at exactly zero.
     assert result.metrics["sling_tension_deficit"] < 0.01
     assert simulate_trebuchet(default_params()).metrics["sling_tension_deficit"] == 0.0
+    # Standing clear of the ground is part of what makes this launch uneventful.
+    assert result.metrics["arm_ground_contact"] is False
 
 
 # A sling that holds on by its fingernails: it never detaches, so every metric that
