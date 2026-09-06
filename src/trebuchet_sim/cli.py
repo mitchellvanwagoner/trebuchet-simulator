@@ -371,10 +371,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     opt_parser = subparsers.add_parser("optimize", help="Search for optimal parameters via differential evolution")
     _add_machine_arg(opt_parser)
-    opt_parser.add_argument("--target-distance", type=float, default=30.0, help="m (default: 30.0)")
-    opt_parser.add_argument("--efficiency-weight", type=float, default=5.0)
-    opt_parser.add_argument("--distance-weight", type=float, default=1.0)
-    opt_parser.add_argument("--mass-weight", type=float, default=0.15)
+    # Objective weights default to the dataclass's own, so the CLI cannot drift from it
+    # (and from the dashboard, which reads the same fields).
+    opt_parser.add_argument(
+        "--target-distance", type=float, default=OptimizationConfig.target_distance,
+        help=f"m (default: {OptimizationConfig.target_distance:g})",
+    )
+    opt_parser.add_argument(
+        "--efficiency-weight", type=float, default=OptimizationConfig.efficiency_weight,
+        help="How strongly the objective rewards launch efficiency (default: "
+             f"{OptimizationConfig.efficiency_weight:g})",
+    )
+    opt_parser.add_argument(
+        "--distance-weight", type=float, default=OptimizationConfig.distance_weight,
+        help="How strongly the objective penalizes missing the target (default: "
+             f"{OptimizationConfig.distance_weight:g}). Against the efficiency weight this is "
+             "the exchange rate: efficiency points the search will give up per 1% of target "
+             "distance. Lower it to be shown the most efficient machine near the target "
+             "rather than one that hits it",
+    )
+    opt_parser.add_argument(
+        "--mass-weight", type=float, default=OptimizationConfig.mass_weight,
+        help=f"How strongly the objective penalizes total mass (default: {OptimizationConfig.mass_weight:g})",
+    )
     opt_parser.add_argument(
         "--snap-penalty-weight",
         type=float,

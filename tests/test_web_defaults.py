@@ -17,6 +17,7 @@ pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest
 
 import trebuchet_sim.web
+from trebuchet_sim.optimization import OptimizationConfig
 
 APP_PATH = str((__import__("pathlib").Path(trebuchet_sim.web.__file__).parent / "app.py"))
 TIMEOUT = 120
@@ -65,8 +66,8 @@ def test_each_machine_keeps_its_own_target_and_weights(data_dir):
 
     # Switching machines must not carry them over - that is the whole point.
     app = _set_machine(app, "traditional")
-    assert _box(app, "Target (m)").value == 30.0
-    assert _box(app, "Dist. weight").value == 1.0
+    assert _box(app, "Target (m)").value == OptimizationConfig.target_distance
+    assert _box(app, "Dist. weight").value == OptimizationConfig.distance_weight
 
     app = _run(_box(app, "Target (m)").set_value(88.0))
     app = _run(_box(app, "Dist. weight").set_value(3.0))
@@ -115,8 +116,8 @@ def test_a_one_machine_defaults_file_still_loads_and_survives_the_next_save(data
 
     # ...and they stay with it rather than leaking onto the other machine.
     app = _set_machine(app, "pulley")
-    assert _box(app, "Target (m)").value == 30.0
-    assert _box(app, "Eff. weight").value == 5.0
+    assert _box(app, "Target (m)").value == OptimizationConfig.target_distance
+    assert _box(app, "Eff. weight").value == OptimizationConfig.efficiency_weight
 
     app = _run(_box(app, "Target (m)").set_value(25.0))
     app = _save(app)

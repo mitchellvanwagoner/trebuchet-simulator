@@ -89,8 +89,24 @@ class OptimizationConfig:
     """Optimization objective weights, search bounds, and parameter locks."""
 
     target_distance: float = 30.0
+    # These two are one setting in two parts: their *ratio* is the exchange rate the
+    # search trades on, in efficiency points per 1% of target distance. The absolute
+    # scale only decides how much the mass term and the two penalties below can move
+    # things, so at a fixed ratio the numbers here barely change the answer.
+    #
+    # 10:5 = 2.0 is measured. Over 60 problem/seed pairs whose targets are known
+    # reachable (40/70/95% of each machine's own maximum range, both machines, with and
+    # without locks), the share landing within 2% of the target runs 27 / 47 / 82 / 95 /
+    # 100% at distance weights of 1 / 2 / 5 / 10 / 20 against this efficiency weight.
+    # The old 1.0 - an exchange rate of 0.2, where the search would miss by 5% to buy a
+    # single point of efficiency - hit 27% of reachable targets and missed by a median
+    # 23.6%, and at the demanding end (95% of a machine's range) it hit none of them.
+    # Weights past 10 hit no better and start buying imaginary throws instead: see
+    # snap_penalty_weight. Measured against the best efficiency any weighting reached at
+    # the same requested distance, 10 gives up 1.3 points, which is what a target that
+    # is actually hit costs.
     efficiency_weight: float = 5.0
-    distance_weight: float = 1.0
+    distance_weight: float = 10.0
     mass_weight: float = 0.15
     # Cost per N*s of rope "compression impulse". The fast engine keeps the rigid-link
     # sling model, which can push where a real rope would go slack and lose energy in
@@ -107,17 +123,27 @@ class OptimizationConfig:
     # still hold together it is flat, and differential evolution has nothing to descend.
     # The deficit is graded all the way down, so the search feels the cliff coming.
     #
-    # 300 is measured, not guessed. Over 24 randomized problems (both machines, random
-    # targets, locks and projectile masses), scoring each winner by how many +-10%
-    # one-parameter perturbations tip it into snapping: 14.2% of perturbations for the
-    # unpenalized objective, then 10.4 / 7.5 / 5.4 / 1.3% at weights of 100 / 200 / 300
-    # / 600. Mean efficiency is flat across all of them (0.891 -> 0.883), so most of
-    # that robustness is free. The ceiling is where it starts costing throws for
-    # nothing: at 600 a problem that was never fragile drops from 12.1 m to 3.8 m, and
-    # at 100 another does the same without buying the robustness back. At 300 the only
-    # two throws that move are the two that were snapping (80% and 90% fragile), which
-    # is the trade this weight is for.
-    snap_penalty_weight: float = 300.0
+    # Two measurements set this, and the second is why it is not 300.
+    #
+    # Robustness: over 24 randomized problems (both machines, random targets, locks and
+    # projectile masses), scoring each winner by how many +-10% one-parameter
+    # perturbations tip it into snapping, 14.2% of perturbations for the unpenalized
+    # objective falls to 10.4 / 7.5 / 5.4 / 1.3% at 100 / 200 / 300 / 600, with mean
+    # efficiency flat throughout (0.891 -> 0.883). That alone would argue for ~300.
+    #
+    # Holding the wall: this penalty is what keeps the search inside the region where
+    # the fast engine is faithful, so it has to outbid the distance term - and that term
+    # scales with distance_weight, which 300 was calibrated against at its old value of
+    # 1. It no longer holds at 10. Given a target beyond the machine's reach, the
+    # distance term is worth ~2000 and buys a trajectory the rigid-sling model only
+    # imagines: at 300 the search returns a design the fast engine scores at the target
+    # exactly while physics.py throws a fifth as far, with the sling slack for 39% of
+    # the launch. At 1000 that stops - the same problem returns 92% of the machine's
+    # true maximum range with both engines agreeing and the sling intact - and it costs
+    # nothing where the target is reachable, where the winner's deficit is 0.0005 either
+    # way. Raising it further does not help; raising distance_weight instead of this
+    # reopens the hole (25% of unreachable-target runs at 20/300, 15% at 40/1000).
+    snap_penalty_weight: float = 1000.0
     # Which counterweight linkage to design for. It decides the search space (see
     # param_names) rather than being searched itself, so it is a field of its own
     # instead of a fixed_params entry.

@@ -979,14 +979,19 @@ with left:
     with tuning_col.popover("Tuning", use_container_width=True, help="Search weights and convergence settings"):
         weight_col, dist_col = st.columns(2)
         efficiency_weight = weight_col.number_input(
-            "Eff. weight", min_value=0.0, value=max(float(saved_target.get("efficiency_weight", 5.0)), 0.0),
+            "Eff. weight", min_value=0.0,
+            value=max(float(saved_target.get("efficiency_weight", OptimizationConfig.efficiency_weight)), 0.0),
             key=_widget_key("tune", "efficiency_weight", machine),
             help="How strongly the objective rewards launch efficiency.",
         )
         distance_weight = dist_col.number_input(
-            "Dist. weight", min_value=0.0, value=max(float(saved_target.get("distance_weight", 1.0)), 0.0),
+            "Dist. weight", min_value=0.0,
+            value=max(float(saved_target.get("distance_weight", OptimizationConfig.distance_weight)), 0.0),
             key=_widget_key("tune", "distance_weight", machine),
-            help="How strongly the objective penalizes missing the target distance.",
+            help="How strongly the objective penalizes missing the target. Against the "
+            "efficiency weight this is the exchange rate: efficiency points the search will "
+            "give up per 1% of target distance. Lower it to be shown the most efficient "
+            "machine near the target rather than one that hits it.",
         )
         population_size = weight_col.number_input(
             "Population",
