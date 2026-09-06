@@ -83,11 +83,22 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
     if "min_string_tension" in result.metrics:
         print(f"  Min sling tension: {result.metrics['min_string_tension']:.1f} N")
         snap_energy = result.metrics.get("sling_snap_energy", 0.0)
+        deficit = result.metrics.get("sling_tension_deficit", 0.0)
         if result.metrics.get("string_slack_fraction", 0.0) > 1e-3 or snap_energy > 1e-3:
             print(
                 f"  [WARNING] Sling goes slack for {result.metrics['string_slack_fraction'] * 100:.0f}% "
                 f"of the launch and snaps taut {result.metrics.get('sling_snap_count', 0)} time(s), "
                 f"dissipating {snap_energy:.1f} J."
+            )
+        # Below 0.01 the two engines can't tell a marginal launch from a clean one
+        # (see tests/test_fastsim.py), so there is nothing to report. Reported only when
+        # the sling held: if it actually detached, the warning above is the bigger news.
+        elif deficit > 0.01:
+            print(
+                f"  [WARNING] Sling stays taut but runs marginal for {deficit * 100:.0f}% of the "
+                "launch - it never detaches here, yet a small change in the build would make it. "
+                "Raise --snap-penalty-weight when optimizing to trade a little range for a "
+                "sling that stays loaded."
             )
         # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
         if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
@@ -288,6 +299,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             efficiency_weight=args.efficiency_weight,
             distance_weight=args.distance_weight,
             mass_weight=args.mass_weight,
+            snap_penalty_weight=args.snap_penalty_weight,
             locked_params=locked,
             param_bounds=ranges,
             fixed_params=fixed,
@@ -363,6 +375,14 @@ def build_parser() -> argparse.ArgumentParser:
     opt_parser.add_argument("--efficiency-weight", type=float, default=5.0)
     opt_parser.add_argument("--distance-weight", type=float, default=1.0)
     opt_parser.add_argument("--mass-weight", type=float, default=0.15)
+    opt_parser.add_argument(
+        "--snap-penalty-weight",
+        type=float,
+        default=OptimizationConfig.snap_penalty_weight,
+        help="How hard to push the search away from designs whose sling runs close to "
+             f"slack (default: {OptimizationConfig.snap_penalty_weight:g}). Raise it if the "
+             "winner still jerks; drop it to 0 to optimize on range and efficiency alone",
+    )
     opt_parser.add_argument(
         "--lock",
         type=_parse_lock,

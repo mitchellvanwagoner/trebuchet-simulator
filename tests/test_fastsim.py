@@ -124,13 +124,18 @@ def test_fast_engine_matches_scipy_engine_for_default_params():
     ref = simulate_trebuchet(TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS), rtol=1e-6, dense_output=False)
     assert ref.metrics["string_slack_fraction"] == 0.0  # defaults stay taut: models coincide
 
-    released, distance, efficiency, string_impulse, cw_impulse = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
+    (released, distance, efficiency, string_impulse, cw_impulse,
+     sling_deficit) = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
 
     assert released is True
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
     # Rigid-link tension never went negative either, so there is no compression to report.
     assert string_impulse == 0.0
+    # The defaults keep real tension margin, so they owe nothing on the snap penalty
+    # either - and both engines have to agree on that, not just on the distance.
+    assert sling_deficit == 0.0
+    assert ref.metrics["sling_tension_deficit"] == 0.0
     # The cw impulse comes from trapezoid sums over each engine's own accepted steps,
     # so it agrees only to the ~0.05 N*s noise floor (see the parameter-grid test).
     assert cw_impulse == pytest.approx(ref.metrics["cw_rope_compression_impulse"], rel=3e-1, abs=5e-2)
@@ -143,12 +148,15 @@ def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
     ref = simulate_trebuchet(_reference_params(values, machine), rtol=1e-6, dense_output=False)
     assert ref.metrics["string_slack_fraction"] == 0.0
 
-    released, distance, efficiency, string_impulse, cw_impulse = _simulate_fast(values, machine)
+    (released, distance, efficiency, string_impulse, cw_impulse,
+     sling_deficit) = _simulate_fast(values, machine)
 
     assert released is True
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
     assert string_impulse == 0.0
+    assert sling_deficit == 0.0
+    assert ref.metrics["sling_tension_deficit"] == 0.0
     # A pinned link is rigid by construction, so there is no rope tension to report and
     # the counterweight impulse is identically zero rather than merely small.
     assert cw_impulse == 0.0
@@ -165,11 +173,27 @@ def test_fast_engine_matches_scipy_engine_on_always_taut_launches(machine):
         taut_cases += 1
 
         ref_released = ref.metrics.get("release_occurred", False)
-        released, distance, efficiency, string_impulse, cw_impulse = fast
+        released, distance, efficiency, string_impulse, cw_impulse, sling_deficit = fast
 
         assert released == ref_released, values
         # No slack in the reference means the rigid model barely had to push either.
         assert string_impulse < _IMPULSE_NOISE_FLOOR, values
+        # The snap penalty's input is a shared quantity, not a fast-engine invention:
+        # in the regime where the two engines model the same physics they must also
+        # agree about how close to slack the sling ran, or the search would be steered
+        # by a number the reference engine would score differently. Same trapezoid
+        # caveat as the counterweight impulse below - the integrand kinks where the
+        # tension crosses the floor, so two adaptive step grids sum it slightly
+        # differently: a median 1.3% relative across this sweep on the pulley machine
+        # and 0.2% on the traditional one. Most designs sit at exactly zero on both
+        # engines (96 of the 106 taut traditional draws), which is the agreement the
+        # penalty most needs. The 1e-2 absolute floor covers the same boundary band
+        # _IMPULSE_NOISE_FLOOR does - one traditional draw releases straight out of the
+        # taut regime here while the fast engine reads a sliver of slack first, and
+        # they land 9.2e-3 apart on a launch that is 1-2% marginal either way.
+        assert sling_deficit == pytest.approx(
+            ref.metrics["sling_tension_deficit"], rel=3e-1, abs=1e-2
+        ), values
 
         if ref_released:
             # Same equations of motion, two integrators: agreement is limited only by
@@ -235,7 +259,7 @@ def test_fast_engine_reports_no_release_for_geometry_that_never_releases():
     )
     assert ref.metrics.get("release_occurred") is False  # sanity-check the fixture against the reference engine
 
-    released, distance, efficiency, _string_impulse, _cw_impulse = _simulate_fast(
+    released, distance, efficiency, _string_impulse, _cw_impulse, _deficit = _simulate_fast(
         values, joint_friction_coefficient=huge_friction
     )
 
@@ -281,7 +305,7 @@ def test_evaluate_population_matches_per_individual_score(machine):
         fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
         fixed["joint_friction_coefficient"], has_pulley,
-        30.0, 5.0, 1.0, 0.15, 200.0,
+        30.0, 5.0, 1.0, 0.15, 200.0, 300.0,
     )
 
     for i in range(s):
@@ -293,6 +317,6 @@ def test_evaluate_population_matches_per_individual_score(machine):
             fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
             fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
             fixed["joint_friction_coefficient"], has_pulley,
-            30.0, 5.0, 1.0, 0.15, 200.0,
+            30.0, 5.0, 1.0, 0.15, 200.0, 300.0,
         )
         assert costs[i] == pytest.approx(expected)

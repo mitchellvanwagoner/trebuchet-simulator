@@ -27,6 +27,12 @@ penalizes (`slack_penalty_weight`). The two models coincide exactly on trajector
 whose ropes stay taut - which is precisely where the penalty drives the optimizer, so
 the search result is always in the regime where this engine is faithful.
 
+`sling_deficit` is what keeps it there. A compression impulse is zero right up to the
+instant the sling detaches, so on its own it gives the search nothing to descend until
+the design has already failed; the deficit measures how close to slack the sling ran
+(physics._tension_metrics computes the identical quantity from the reference engine's
+own steps) and so charges a jerky design before it snaps.
+
 The integrator mirrors scipy's RK45: same Dormand-Prince tableau, same step-size
 control. Events (release angle, ground impact) are localized with a cubic Hermite
 interpolant built from the bracketing step's endpoint states/derivatives, refined by
@@ -37,7 +43,7 @@ optimizer's tolerance (see the `rtol=1e-6` note in `optimization._objective`).
 import numpy as np
 from numba import njit, prange
 
-from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR
+from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, SLING_TENSION_FLOOR
 
 PULLEY_THICKNESS = 0.0254  # m; matches TrebuchetParams.PULLEY_THICKNESS
 
@@ -181,14 +187,22 @@ def _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot, l_a, l_s, proj_dra
 
 @njit(cache=True, fastmath=True)
 def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
-                      projectile_mass, counter_weight_mass, pulley_radius, has_pulley):
+                      projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
+                      tension_floor):
     """Integrate launch dynamics until the release-angle event fires.
 
     Returns (released, t, theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
-    string_impulse, cw_impulse): the state at release (or the final state at t_max if
-    the arm never reached the release angle) plus the string/cw-rope compression
-    impulses (trapezoid rule over accepted steps, mirroring
+    string_impulse, cw_impulse, sling_deficit): the state at release (or the final
+    state at t_max if the arm never reached the release angle) plus the string/cw-rope
+    compression impulses and the integral of (tension_floor - clamp(T_string, 0,
+    tension_floor)) dt (trapezoid rule over accepted steps, mirroring
     physics.TrebuchetSimulator._tension_metrics).
+
+    Clamping at zero is what keeps the two penalties from measuring the same thing: a
+    rope that has gone slack is exactly as limp at -400 N of rigid-link compression as
+    at 0, and how deep into the impossible the rigid model went is what string_impulse
+    is for. Without the clamp the deficit would grow without bound down there and stop
+    being the [0, 1] share of the launch that physics.py reports.
 
     The six components run through the Dormand-Prince tableau unrolled, matching the
     reference engine's state layout - including on the pulley machine, where psi stays
@@ -208,6 +222,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
 
     string_impulse = 0.0
     cw_impulse = 0.0
+    sling_deficit = 0.0
     string_T_prev, cw_T_prev = _tensions(
         theta, theta_dot, alpha, alpha_dot, f0_2, l_a, l_s, proj_drag_k,
         projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
@@ -216,7 +231,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
     for _ in range(MAX_STEPS):
         if t >= t_max:
             return (False, t, theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
-                    string_impulse, cw_impulse)
+                    string_impulse, cw_impulse, sling_deficit)
         if t + h > t_max:
             h = t_max - t
 
@@ -314,8 +329,12 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                 )
                 string_impulse += 0.5 * (max(0.0, -string_T_prev) + max(0.0, -string_T_r)) * h * s
                 cw_impulse += 0.5 * (max(0.0, -cw_T_prev) + max(0.0, -cw_T_r)) * h * s
+                sling_deficit += 0.5 * (
+                    tension_floor - min(tension_floor, max(0.0, string_T_prev))
+                    + tension_floor - min(tension_floor, max(0.0, string_T_r))
+                ) * h * s
                 return (True, t + h * s, theta_r, theta_dot_r, alpha_r, alpha_dot_r,
-                        psi_r, psi_dot_r, string_impulse, cw_impulse)
+                        psi_r, psi_dot_r, string_impulse, cw_impulse, sling_deficit)
 
             string_T_new, cw_T_new = _tensions(
                 yn_1, yn_2, yn_3, yn_4, k7_2, l_a, l_s, proj_drag_k,
@@ -323,6 +342,10 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             )
             string_impulse += 0.5 * (max(0.0, -string_T_prev) + max(0.0, -string_T_new)) * h
             cw_impulse += 0.5 * (max(0.0, -cw_T_prev) + max(0.0, -cw_T_new)) * h
+            sling_deficit += 0.5 * (
+                tension_floor - min(tension_floor, max(0.0, string_T_prev))
+                + tension_floor - min(tension_floor, max(0.0, string_T_new))
+            ) * h
             string_T_prev, cw_T_prev = string_T_new, cw_T_new
 
             t = t + h
@@ -337,7 +360,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             h = h * factor
 
     return (False, t, theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
-            string_impulse, cw_impulse)
+            string_impulse, cw_impulse, sling_deficit)
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -525,10 +548,13 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
                    joint_friction_coefficient, has_pulley):
     """Scalar port of simulate_trebuchet's rtol=1e-6/dense_output=False path.
 
-    Returns (released, distance, efficiency, string_impulse, cw_impulse); the last two
-    are the rope compression impulses (N*s, see physics._tension_metrics) used by the
-    objective's slack penalty. (False, 0.0, 0.0, 0.0, 0.0) if release never occurs or
-    the geometry/result is invalid (mirrors physics.py's degenerate cases).
+    Returns (released, distance, efficiency, string_impulse, cw_impulse,
+    sling_deficit). The two impulses are the rope compression impulses (N*s, see
+    physics._tension_metrics) used by the objective's slack penalty; sling_deficit is
+    the dimensionless share of the launch the sling spent under-loaded, weighted by how
+    far under (physics.py reports the same number as `sling_tension_deficit`), used by
+    its snap penalty. (False, 0.0, 0.0, 0.0, 0.0, 0.0) if release never occurs or the
+    geometry/result is invalid (mirrors physics.py's degenerate cases).
 
     `has_pulley` selects the linkage; the machine's own linkage parameter is read and the
     other one ignored, exactly as TrebuchetParams does. A non-positive
@@ -549,7 +575,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
         # Sling tucked alongside the arm, angled just far enough off it to clear.
         arcsin_arg = projectile_radius / string_length
         if arcsin_arg > 1.0 or arcsin_arg < -1.0:
-            return False, 0.0, 0.0, 0.0, 0.0
+            return False, 0.0, 0.0, 0.0, 0.0, 0.0
         alpha0 = theta0 + np.pi - np.arcsin(arcsin_arg)
         psi0 = 0.0
     else:
@@ -557,13 +583,23 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
         alpha0 = psi_rest
         psi0 = psi_rest
 
-    (released, _t_rel, theta_r, theta_dot_r, alpha_r, alpha_dot_r, psi_r, _psi_dot_r,
-     string_impulse, cw_impulse) = _integrate_launch(
+    # Absolute floor in newtons; the deficit is normalized by it below, so the metric
+    # means the same thing on a 0.15 kg stone as on a 20 kg one.
+    tension_floor = SLING_TENSION_FLOOR * projectile_mass * G
+
+    (released, t_rel, theta_r, theta_dot_r, alpha_r, alpha_dot_r, psi_r, _psi_dot_r,
+     string_impulse, cw_impulse, sling_deficit) = _integrate_launch(
         theta0, alpha0, psi0, c, release_angle, 10.0, 1e-6, 1e-6,
-        projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
+        projectile_mass, counter_weight_mass, pulley_radius, has_pulley, tension_floor,
     )
+    # Same guard physics._tension_metrics uses: no clock or no projectile weight means
+    # there is no share of the launch to report.
+    if t_rel > 0.0 and tension_floor > 0.0:
+        sling_deficit = sling_deficit / (tension_floor * t_rel)
+    else:
+        sling_deficit = 0.0
     if not released:
-        return False, 0.0, 0.0, string_impulse, cw_impulse
+        return False, 0.0, 0.0, string_impulse, cw_impulse, sling_deficit
 
     x0 = arm_length * np.cos(theta_r) + string_length * np.cos(alpha_r)
     y0 = arm_length * np.sin(theta_r) + string_length * np.sin(alpha_r) + pivot_height
@@ -571,7 +607,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     vy0 = arm_length * theta_dot_r * np.cos(theta_r) + string_length * alpha_dot_r * np.cos(alpha_r)
 
     if np.isnan(x0) or np.isnan(y0) or np.isnan(vx0) or np.isnan(vy0):
-        return False, 0.0, 0.0, string_impulse, cw_impulse
+        return False, 0.0, 0.0, string_impulse, cw_impulse, sling_deficit
 
     proj_speed2 = vx0 * vx0 + vy0 * vy0
     proj_KE = 0.5 * projectile_mass * proj_speed2
@@ -605,7 +641,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     efficiency = proj_KE / total_PE_spent if total_PE_spent > 0.0 else 0.0
     efficiency = max(0.0, efficiency)
 
-    return True, distance, efficiency, string_impulse, cw_impulse
+    return True, distance, efficiency, string_impulse, cw_impulse, sling_deficit
 
 
 @njit(cache=True, fastmath=True)
@@ -615,12 +651,12 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
            initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
            joint_friction_coefficient, has_pulley,
            target_distance, efficiency_weight, distance_weight, mass_weight,
-           slack_penalty_weight):
+           slack_penalty_weight, snap_penalty_weight):
     """Scalar port of optimization._objective's cost formula for one individual."""
     if string_length > 0.95 * arm_length:
         return INVALID_COST
 
-    released, distance, efficiency, string_impulse, cw_impulse = simulate_fast(
+    released, distance, efficiency, string_impulse, cw_impulse, sling_deficit = simulate_fast(
         counter_weight_mass, pulley_radius, length_counterweight, counter_weight_rope_length,
         arm_length, string_length, release_angle,
         pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -640,11 +676,19 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     efficiency_cost = -efficiency * 100.0
     distance_cost = abs(distance - target_distance) / target_distance * 100.0
     mass_cost = (total_mass / 30.0) * 100.0
+    # Two terms, two jobs, and they are not redundant even though max(0, floor - T)
+    # contains max(0, -T). The impulses are absolute (N*s) and unbounded, and mark a run
+    # this engine can no longer model at all - past the first negative tension the rigid
+    # link is pushing where a rope would have let go, so the trajectory is fiction; they
+    # have to stay big enough to be a wall. The deficit is normalized to [0, 1], which is
+    # what makes it comparable across projectile sizes and therefore usable as a gradient,
+    # but that same bound is why it cannot double as the wall.
     slack_cost = slack_penalty_weight * (string_impulse + cw_impulse)
+    snap_cost = snap_penalty_weight * sling_deficit
 
     return (
         efficiency_weight * efficiency_cost + distance_weight * distance_cost
-        + mass_weight * mass_cost + slack_cost
+        + mass_weight * mass_cost + slack_cost + snap_cost
     )
 
 
@@ -655,7 +699,7 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
                          pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
                          initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
                          joint_friction_coefficient, has_pulley, target_distance, efficiency_weight,
-                         distance_weight, mass_weight, slack_penalty_weight):
+                         distance_weight, mass_weight, slack_penalty_weight, snap_penalty_weight):
     """Cost for an entire DE population in one call.
 
     The six per-individual args are arrays of shape (S,); everything else is a scalar
@@ -673,6 +717,7 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
             pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
             initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
             joint_friction_coefficient, has_pulley,
-            target_distance, efficiency_weight, distance_weight, mass_weight, slack_penalty_weight,
+            target_distance, efficiency_weight, distance_weight, mass_weight,
+            slack_penalty_weight, snap_penalty_weight,
         )
     return costs

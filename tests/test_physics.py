@@ -69,6 +69,56 @@ def test_tension_metrics_report_no_slack_for_an_always_taut_launch():
     # regime never switches, so the rigid-link model is exact here.
     assert [seg.regime for seg in sol.segments] == ["taut"]
     assert sol.slack_time == 0
+    # This set was picked for taut ropes rather than for margin, and it does graze the
+    # floor - but only just, below the 0.01 the UI reports at and the two engines can
+    # tell apart. The shipped defaults keep enough margin to sit at exactly zero.
+    assert result.metrics["sling_tension_deficit"] < 0.01
+    assert simulate_trebuchet(default_params()).metrics["sling_tension_deficit"] == 0.0
+
+
+# A sling that holds on by its fingernails: it never detaches, so every metric that
+# only fires on detachment reads exactly as clean as the always-taut set above, yet
+# 4 of 10 one-parameter +-10% perturbations of it do snap. The gap between those two
+# facts is what sling_tension_deficit exists to close.
+MARGINAL_SLING_PARAMS = {
+    "counter_weight_mass": 21.396,
+    "pulley_radius": 0.0229,
+    "arm_length": 0.9,
+    "string_length": 0.416,
+    "release_angle": -4.064,
+}
+
+
+def test_a_marginal_sling_is_graded_before_it_ever_goes_slack():
+    metrics = simulate_trebuchet(TrebuchetParams(**MARGINAL_SLING_PARAMS)).metrics
+
+    # Every pre-existing sling signal says this launch is fine...
+    assert metrics["min_string_tension"] > 0
+    assert metrics["string_slack_fraction"] == 0.0
+    assert metrics["sling_snap_count"] == 0
+    assert metrics["sling_snap_energy"] == 0.0
+
+    # ...but it spent a tenth of the launch with barely any load in the rope. Only a
+    # graded measure can say so, which is why the optimizer steers by this one and not
+    # by the snap energy: the snap energy of a launch that never snaps is zero however
+    # close it came (see optimization.snap_penalty_weight).
+    assert metrics["sling_tension_deficit"] > 0.1
+    assert metrics["min_string_tension"] < 0.15  # newtons, on a 1.5 N projectile
+
+
+def test_sling_tension_deficit_is_a_share_of_the_launch_that_slack_time_bounds():
+    """It is a fraction, and detached time is the part of it that is already known.
+
+    While the sling is slack it carries nothing at all, so every slack second counts
+    in full - the deficit can never come out under the slack fraction, and the extra
+    is precisely the marginal-but-still-attached time that nothing else measures.
+    """
+    for values in (DEFAULT_OPTIMIZABLE_PARAMS, MARGINAL_SLING_PARAMS, JERKY_SLING_PARAMS):
+        metrics = simulate_trebuchet(TrebuchetParams(**values)).metrics
+        deficit = metrics["sling_tension_deficit"]
+
+        assert 0.0 <= deficit <= 1.0, values
+        assert deficit >= metrics["string_slack_fraction"] - 1e-12, values
 
 
 # A jerky parameter set (the pre-slack-penalty optimizer defaults). Under the old

@@ -1,14 +1,18 @@
 import pytest
 
-from trebuchet_sim.config import MachineType
+import numpy as np
+
+from trebuchet_sim.config import MachineType, TrebuchetParams
 from trebuchet_sim.optimization import (
     PARAM_BOUNDS,
     PARAM_LIMITS,
     PARAM_NAMES,
     OptimizationConfig,
     _objective,
+    _objective_vectorized,
     optimize_trebuchet,
 )
+from trebuchet_sim.physics import simulate_trebuchet
 
 pytest.importorskip("numba")
 
@@ -52,6 +56,74 @@ def test_objective_penalizes_slack_sling_solutions():
     penalized = _objective(free_values, OptimizationConfig(slack_penalty_weight=200.0))
 
     assert penalized > base + 100.0  # this set has ~1.2 N*s of compression impulse
+
+
+# Copied from tests/test_physics.py: a sling that never detaches but runs on almost no
+# load. Every signal the objective had before this one - slack fraction, snap count,
+# snap energy, both compression impulses - reads exactly zero for it.
+MARGINAL_SLING_PARAMS = {
+    "counter_weight_mass": 21.396,
+    "pulley_radius": 0.0229,
+    "arm_length": 0.9,
+    "string_length": 0.416,
+    "release_angle": -4.064,
+}
+
+
+def test_objective_penalizes_a_jerky_sling_that_never_actually_goes_slack():
+    """The gap the snap penalty fills: a design one nudge away from snapping.
+
+    The slack penalty cannot price this. It is paid on compression impulse, which is
+    zero until the rope has already let go, so between two designs that both hold
+    together it is the same number - and a search whose objective is flat across the
+    approach to a cliff will happily park on the edge of it.
+    """
+    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
+    metrics = simulate_trebuchet(TrebuchetParams(**MARGINAL_SLING_PARAMS)).metrics
+    assert metrics["cw_rope_compression_impulse"] == 0.0  # nothing for the slack penalty to charge
+    assert metrics["sling_snap_count"] == 0
+
+    unpenalized = _objective(free_values, OptimizationConfig(snap_penalty_weight=0.0))
+    penalized = _objective(free_values, OptimizationConfig(snap_penalty_weight=300.0))
+
+    # The charge is the deficit at the objective's own rtol=1e-6, which sums the
+    # trapezoid over a slightly coarser step grid than the rtol=1e-8 metrics above.
+    assert penalized - unpenalized == pytest.approx(300.0 * metrics["sling_tension_deficit"], rel=0.1)
+    assert penalized > unpenalized + 25.0
+
+
+def test_both_engines_charge_the_same_snap_penalty():
+    """Whichever engine scores it, a jerky design has to cost about the same.
+
+    They compute the deficit from their own step grids and, past a detachment, from
+    different sling models entirely - so this holds where it matters, on a design that
+    stays attached and that both engines therefore agree about.
+    """
+    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
+    population = np.array([[value] for value in free_values])
+
+    scipy_costs, fast_costs = [], []
+    for weight in (0.0, 300.0):
+        config = OptimizationConfig(snap_penalty_weight=weight)
+        scipy_costs.append(_objective(free_values, config))
+        fast_costs.append(float(_objective_vectorized(population, config)[0]))
+
+    scipy_charge = scipy_costs[1] - scipy_costs[0]
+    fast_charge = fast_costs[1] - fast_costs[0]
+    assert scipy_charge > 25.0
+    assert fast_charge == pytest.approx(scipy_charge, rel=0.1)
+
+
+def test_snap_penalty_weight_of_zero_leaves_the_objective_alone():
+    """The knob has to be a knob: at 0 the score is exactly what it was without it."""
+    free_values = [MARGINAL_SLING_PARAMS[name] for name in PARAM_NAMES]
+    population = np.array([[value] for value in free_values])
+    config = OptimizationConfig(snap_penalty_weight=0.0)
+
+    # Same point, both engines, no penalty: the two objectives are one formula.
+    assert float(_objective_vectorized(population, config)[0]) == pytest.approx(
+        _objective(free_values, config), rel=1e-3
+    )
 
 
 def test_locked_params_are_respected_by_fast_engine():

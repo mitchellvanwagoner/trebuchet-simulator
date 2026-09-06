@@ -10,6 +10,17 @@ G = 9.81                        # gravity (m/s^2)
 RHO_AIR = 1.225                 # air density at sea level (kg/m^3)
 ARM_CROSS_SECTION_WIDTH = 0.05  # arm cross-section width, used for mass and drag (m)
 
+# How hard the sling has to stay loaded before a launch counts as "not snappy", in
+# multiples of the projectile's own weight. It is a design margin, not a physical
+# threshold: a sling only actually goes slack at zero tension, but a launch that runs
+# a hair above zero is one gust - or one build tolerance - away from detaching, and
+# every such solution jerks. Measured across randomized designs that stay taut, the
+# time spent below one projectile weight predicts whether a +-10% parameter change
+# tips the design into snapping (r = 0.81); the compression impulse alone, which is
+# zero until tension actually goes negative, predicts almost nothing (r = 0.23)
+# because it is flat across every design that has not already failed.
+SLING_TENSION_FLOOR = 1.0
+
 # Canonical defaults for the five optimizable parameters, shared by the CLI,
 # the web UI, and the tests so they can't drift apart. Optimizer output for the
 # 30 m target with the rope-slack penalty active: the sling stays taut for the

@@ -702,6 +702,7 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
 
     snap_energy = result.metrics.get("sling_snap_energy", 0.0)
     slack_fraction = result.metrics.get("string_slack_fraction", 0.0)
+    tension_deficit = result.metrics.get("sling_tension_deficit", 0.0)
     if slack_fraction > 1e-3 or snap_energy > 1e-3:
         total_pe = result.metrics.get("total_pe_spent", 0.0)
         loss_share = f" ({snap_energy / total_pe * 100:.0f}% of the PE spent)" if total_pe > 0 else ""
@@ -710,6 +711,17 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             f"flies detached and snaps taut {result.metrics.get('sling_snap_count', 0)} time(s), "
             f"dissipating {snap_energy:.1f} J{loss_share}. The simulated flight is physical, "
             "but a smoother geometry would keep that energy."
+        )
+    # Only when the sling held: a run that actually detached has already said so above,
+    # and two warnings about the same rope would cost a line the one-screen layout
+    # hasn't got. 0.01 is the floor below which the two engines can't tell a marginal
+    # launch from a clean one (see tests/test_fastsim.py).
+    elif tension_deficit > 0.01:
+        st.warning(
+            f"Sling stays taut but runs marginal for {tension_deficit * 100:.0f}% of the launch: "
+            "it never detaches here, but it is close enough that a small change in the build "
+            "would make it snap. Raising the snap penalty when optimizing trades a little range "
+            "for a sling that stays loaded."
         )
     # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
     if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
@@ -954,6 +966,19 @@ with left:
             "population's objective spread falls below this. Smaller = more precise but slower; "
             "0 runs until the population fully converges or another stop condition is hit.",
         )
+        # Full width rather than a third box in either column: its label doesn't fit the
+        # half-width columns above, and the popover floats over the page, so an extra row
+        # here costs the one-screen layout nothing.
+        snap_penalty_weight = st.number_input(
+            "Snap penalty",
+            min_value=0.0,
+            value=max(
+                float(saved_target.get("snap_penalty_weight", OptimizationConfig.snap_penalty_weight)), 0.0
+            ),
+            step=50.0,
+            help="How strongly the objective avoids designs whose sling runs close to slack. "
+            "Raise it if the winner still jerks; 0 optimizes on range and efficiency alone.",
+        )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
     simulate_clicked = btn_sim.button("Simulate", type="primary", disabled=not fixed_ready, use_container_width=True)
@@ -981,6 +1006,7 @@ with left:
                 "distance_weight": distance_weight,
                 "population_size": int(population_size),
                 "absolute_tolerance": absolute_tolerance,
+                "snap_penalty_weight": snap_penalty_weight,
             },
         )
         st.toast("Defaults saved")
@@ -1041,6 +1067,7 @@ if optimize_clicked:
             distance_weight=distance_weight,
             population_size=int(population_size),
             absolute_tolerance=absolute_tolerance,
+            snap_penalty_weight=snap_penalty_weight,
             locked_params=locked,
             fixed_params=fixed_params_all,
             workers=_OPT_WORKERS,

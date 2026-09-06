@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, TrebuchetParams
+from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, SLING_TENSION_FLOOR, TrebuchetParams
 from trebuchet_sim.trajectory import BallisticTrajectory, integrate_ballistic_trajectory
 
 # Launch state, taut sling: theta (arm), alpha (sling), psi (counterweight swing).
@@ -666,14 +666,26 @@ class TrebuchetSimulator:
         The sling is handled physically (slack regime + snap losses), so its metrics
         report what actually happened: `sling_snap_energy` is the kinetic energy
         destroyed by re-tension snaps and `string_slack_fraction` the time share the
-        projectile flew detached. The counterweight rope is still a rigid link, so it
-        keeps the feasibility-style `cw_rope_compression_impulse` (integral of
-        max(0, -T) dt, N*s): nonzero means the arm out-accelerated the falling
-        counterweight and that part of the solution isn't physical.
+        projectile flew detached. Those two only fire once the sling has *already*
+        detached, so `sling_tension_deficit` grades the near misses as well: the share
+        of the launch the sling spent below `SLING_TENSION_FLOOR` projectile weights,
+        weighted by how far below (0 = always comfortably loaded, 1 = dead the whole
+        way, and exactly `string_slack_fraction` for a sling that is either loaded to
+        the floor or fully slack). It is what makes a jerky design cost more than a
+        smooth one *before* it snaps - see optimization.snap_penalty_weight.
+
+        The counterweight rope is still a rigid link, so it keeps the feasibility-style
+        `cw_rope_compression_impulse` (integral of max(0, -T) dt, N*s): nonzero means
+        the arm out-accelerated the falling counterweight and that part of the solution
+        isn't physical.
         """
         string_T_min = math.inf
         cw_T_min = math.inf
         cw_impulse = 0.0
+        # Absolute floor in newtons; the deficit integral below is normalized by it, so
+        # the metric means the same thing on a 0.15 kg stone as on a 20 kg one.
+        tension_floor = SLING_TENSION_FLOOR * self._m_p * G
+        sling_deficit = 0.0
         m_cw, r_pul = self.params.counter_weight_mass, self.params.pulley_radius
         # Counterweight-rope diagnostics only mean something on the pulley machine
         # (see constraint_tensions); a pinned link cannot go slack.
@@ -681,7 +693,8 @@ class TrebuchetSimulator:
 
         for seg in launch.segments:
             ts = seg.sol.t
-            prev_deficit = None
+            prev_cw_deficit = None
+            prev_sling_deficit = None
             for i in range(len(ts)):
                 t_i, y_i = float(ts[i]), seg.sol.y[:, i]
                 if seg.regime == "taut":
@@ -691,13 +704,26 @@ class TrebuchetSimulator:
                     theta_ddot = self._launch_slack_dynamics(t_i, y_i)[1]
                     cw_T = m_cw * (G + r_pul * theta_ddot) if track_cw else math.nan
                 string_T_min = min(string_T_min, string_T)
+
+                # Trapezoid over the same accepted steps as the cw impulse below; a
+                # segment's first step sits exactly on the previous segment's last, so
+                # restarting the rule per segment skips no time. Clamped below at zero
+                # as well as above at the floor: a taut segment's tension only goes
+                # negative by the event solver's own error, and the fast engine - whose
+                # rigid link really does push - has to come out with the same [0, 1]
+                # share of the launch rather than a deeper hole (see fastsim).
+                deficit = tension_floor - min(tension_floor, max(0.0, string_T))
+                if prev_sling_deficit is not None:
+                    sling_deficit += 0.5 * (prev_sling_deficit + deficit) * (t_i - float(ts[i - 1]))
+                prev_sling_deficit = deficit
+
                 if not track_cw:
                     continue
                 cw_T_min = min(cw_T_min, cw_T)
                 deficit = max(0.0, -cw_T)
-                if prev_deficit is not None:
-                    cw_impulse += 0.5 * (prev_deficit + deficit) * (t_i - float(ts[i - 1]))
-                prev_deficit = deficit
+                if prev_cw_deficit is not None:
+                    cw_impulse += 0.5 * (prev_cw_deficit + deficit) * (t_i - float(ts[i - 1]))
+                prev_cw_deficit = deficit
 
         duration = launch.t_end
         metrics = {
@@ -705,6 +731,13 @@ class TrebuchetSimulator:
             "string_slack_fraction": float(launch.slack_time / duration) if duration > 0 else 0.0,
             "sling_snap_count": len(launch.snap_times),
             "sling_snap_energy": float(sum(launch.snap_energy_losses)),
+            # Guarded on the floor as well as the clock: a massless projectile has no
+            # weight to measure a margin against, so there is no deficit to report
+            # rather than a division to blow up on.
+            "sling_tension_deficit": (
+                float(sling_deficit / (tension_floor * duration))
+                if duration > 0 and tension_floor > 0 else 0.0
+            ),
         }
         if track_cw:
             metrics["min_cw_rope_tension"] = float(cw_T_min)

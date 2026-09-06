@@ -99,6 +99,25 @@ class OptimizationConfig:
     # (The scipy fallback objective simulates the snaps for real, so there the sling
     # loss shows up directly in efficiency and only the cw-rope impulse is penalized.)
     slack_penalty_weight: float = 200.0
+    # Cost per unit of `sling_tension_deficit` - the share of the launch the sling spent
+    # below config.SLING_TENSION_FLOOR projectile weights, weighted by how far below
+    # (see physics._tension_metrics). This is the term that makes a *jerky* design cost
+    # more than a smooth one. The slack penalty above cannot: a compression impulse is
+    # identically zero until the rope has already gone slack, so across designs that
+    # still hold together it is flat, and differential evolution has nothing to descend.
+    # The deficit is graded all the way down, so the search feels the cliff coming.
+    #
+    # 300 is measured, not guessed. Over 24 randomized problems (both machines, random
+    # targets, locks and projectile masses), scoring each winner by how many +-10%
+    # one-parameter perturbations tip it into snapping: 14.2% of perturbations for the
+    # unpenalized objective, then 10.4 / 7.5 / 5.4 / 1.3% at weights of 100 / 200 / 300
+    # / 600. Mean efficiency is flat across all of them (0.891 -> 0.883), so most of
+    # that robustness is free. The ceiling is where it starts costing throws for
+    # nothing: at 600 a problem that was never fragile drops from 12.1 m to 3.8 m, and
+    # at 100 another does the same without buying the robustness back. At 300 the only
+    # two throws that move are the two that were snapping (80% and 90% fragile), which
+    # is the trade this weight is for.
+    snap_penalty_weight: float = 300.0
     # Which counterweight linkage to design for. It decides the search space (see
     # param_names) rather than being searched itself, so it is a field of its own
     # instead of a fixed_params entry.
@@ -218,18 +237,24 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
     mass_cost = (params.total_mass / 30.0) * 100
-    # Only the counterweight rope is still a rigid link here. The sling's slack phases
-    # and re-tension snaps are simulated for real by physics.py, so that loss already
-    # shows up in `efficiency` and needs no separate penalty (the key this used to read,
-    # `string_compression_impulse`, is not in the metrics any more). A traditional
-    # machine has no counterweight rope either, leaving this term zero for it.
+    # Only the counterweight rope is still a rigid link here, so it is the only one with
+    # a compression impulse to charge (the key this used to read for the sling,
+    # `string_compression_impulse`, is not in the metrics any more - physics.py lets the
+    # sling go slack for real instead). A traditional machine has no counterweight rope
+    # either, leaving this term zero for it.
     slack_cost = config.slack_penalty_weight * result.metrics.get("cw_rope_compression_impulse", 0.0)
+    # The sling's own loss does land in `efficiency` once it detaches, but only once:
+    # this is what keeps the search off the cliff edge rather than merely off the bottom,
+    # since by the time efficiency has noticed, the run has already lost the energy.
+    # Both engines charge for it, computed the same way from the same floor.
+    snap_cost = config.snap_penalty_weight * result.metrics.get("sling_tension_deficit", 0.0)
 
     return (
         config.efficiency_weight * efficiency_cost
         + config.distance_weight * distance_cost
         + config.mass_weight * mass_cost
         + slack_cost
+        + snap_cost
     )
 
 
@@ -284,7 +309,7 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
         config.machine is MachineType.PULLEY,
         config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
-        config.slack_penalty_weight,
+        config.slack_penalty_weight, config.snap_penalty_weight,
     )
 
 
