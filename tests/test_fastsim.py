@@ -77,22 +77,30 @@ def _reference_params(values, machine=MachineType.PULLEY, **overrides) -> Trebuc
     )
 
 
-# The two engines model the sling differently on purpose (see fastsim's module
-# docstring): this one keeps the rigid link and reports the compression impulse the
-# optimizer penalizes, while physics.py lets the sling go slack and snap back. They
-# are therefore only required to agree on always-taut launches - which is exactly the
-# regime the slack penalty drives the search into. `string_slack_fraction == 0` in the
-# reference result is what marks a launch as staying in that shared regime.
+# Both engines model the sling as a rope, so they are held to the same answer on every
+# launch, not merely on the ones that stay taut. A launch that lets go is still the
+# harder case: it turns on two discontinuities - the tension zero-crossing and the
+# re-tension snap - that each engine's own event solver localizes separately, so a hair
+# of difference in *when* a snap lands moves the state it lands on. Measured over these
+# grids that costs about a decimal place against the taut case (a median 0.008%
+# relative on distance and a worst case of 0.35%, against 0.002% and 0.03% taut), which
+# is what the two bounds below are.
+_TAUT_TOLERANCE = dict(rel=1e-3, abs=1e-3)
+_SLACK_TOLERANCE = dict(rel=1e-2, abs=1e-2)
 
+# A rope carries no compression, so neither engine should be reporting any on the sling.
+# This is a self-check on the port rather than a tolerance: it measures 0 exactly on most
+# draws and never worse than machine epsilon on the rest.
+_STRING_COMPRESSION_EPS = 1e-12
 
-# Below this the string impulse is not evidence of anything: it is the same 0.05 N*s
-# floor the optimizer treats as noise. The two engines part company at the instant the
-# rigid-link tension first crosses zero, and when that crossing falls in the last
-# moments before release the reference can release straight out of the taut regime -
-# reporting no slack at all - while this engine still integrates a sliver of negative
-# tension. One draw in 131 lands in that band on the traditional machine (measuring
-# 0.007 N*s); genuinely slack launches measure upwards of 0.014.
-_IMPULSE_NOISE_FLOOR = 0.05
+# Below this a snap is not evidence that a launch went slack, only that its sling grazed
+# zero tension somewhere. Whether a graze counts as a detachment is decided by two event
+# solvers independently, so right at the boundary they can differ - one draw in these 188
+# does, on the traditional machine, where the reference bottoms out at 0.04 N of tension
+# and reports a clean launch while this engine reads a 0.001 J snap. It costs nothing in
+# the answer: the two still land 1 mm apart on a 60.6 m throw. Real snaps on these grids
+# start at 0.006 J and run to 70 J.
+_SNAP_ENERGY_NOISE_FLOOR = 0.01
 
 # A random traditional machine keeps its sling taut far more often than a random pulley
 # one - about 86% of usable draws against 49% - so it needs a bigger sweep to put a
@@ -125,13 +133,15 @@ def test_fast_engine_matches_scipy_engine_for_default_params():
     assert ref.metrics["string_slack_fraction"] == 0.0  # defaults stay taut: models coincide
 
     (released, distance, efficiency, string_impulse, cw_impulse,
-     sling_deficit) = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
+     sling_deficit, snap_energy) = _simulate_fast(DEFAULT_OPTIMIZABLE_PARAMS)
 
     assert released is True
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
-    # Rigid-link tension never went negative either, so there is no compression to report.
-    assert string_impulse == 0.0
+    # The sling never let go, so there is nothing to compress and nothing to snap.
+    assert string_impulse <= _STRING_COMPRESSION_EPS
+    assert snap_energy == 0.0
+    assert ref.metrics["sling_snap_energy"] == 0.0
     # The defaults keep real tension margin, so they owe nothing on the snap penalty
     # either - and both engines have to agree on that, not just on the distance.
     assert sling_deficit == 0.0
@@ -149,12 +159,13 @@ def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
     assert ref.metrics["string_slack_fraction"] == 0.0
 
     (released, distance, efficiency, string_impulse, cw_impulse,
-     sling_deficit) = _simulate_fast(values, machine)
+     sling_deficit, snap_energy) = _simulate_fast(values, machine)
 
     assert released is True
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
-    assert string_impulse == 0.0
+    assert string_impulse <= _STRING_COMPRESSION_EPS
+    assert snap_energy == 0.0
     assert sling_deficit == 0.0
     assert ref.metrics["sling_tension_deficit"] == 0.0
     # A pinned link is rigid by construction, so there is no rope tension to report and
@@ -163,21 +174,40 @@ def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
 
 
 @pytest.mark.parametrize("machine", list(MachineType))
-def test_fast_engine_matches_scipy_engine_on_always_taut_launches(machine):
-    """Where both engines model the same physics, they must agree closely."""
+def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
+    """The two engines answer the same question, so they must give the same answer.
+
+    Both arms of the launch are covered: the ones whose sling stays taut throughout and
+    the ones that let go, detach and snap back. The engines used to be held to the taut
+    arm alone, because this one kept a rigid sling and had no slack physics to compare;
+    a slack launch then measured a median 56% apart on distance and as much as 170%.
+    """
     taut_cases = 0
+    slack_cases = 0
 
     for values, ref, fast in _parameter_grid(machine):
-        if ref.metrics["string_slack_fraction"] != 0.0:
-            continue  # covered by the divergence test below
-        taut_cases += 1
+        went_slack = ref.metrics["string_slack_fraction"] > 0.0
+        if went_slack:
+            slack_cases += 1
+        else:
+            taut_cases += 1
+        tolerance = _SLACK_TOLERANCE if went_slack else _TAUT_TOLERANCE
 
         ref_released = ref.metrics.get("release_occurred", False)
-        released, distance, efficiency, string_impulse, cw_impulse, sling_deficit = fast
+        (released, distance, efficiency, string_impulse, cw_impulse,
+         sling_deficit, snap_energy) = fast
 
         assert released == ref_released, values
-        # No slack in the reference means the rigid model barely had to push either.
-        assert string_impulse < _IMPULSE_NOISE_FLOOR, values
+        # A rope cannot push in either engine now.
+        assert string_impulse <= _STRING_COMPRESSION_EPS, values
+        # Whether the sling let go at all is itself a shared answer: this engine used to
+        # be the one that could not tell, and a launch it thought was fine is exactly
+        # where it used to invent a throw. Only a graze is exempt, and only up to the
+        # noise floor.
+        ref_snap = ref.metrics["sling_snap_energy"]
+        if (snap_energy > 0.0) != (ref_snap > 0.0):
+            assert max(snap_energy, ref_snap) < _SNAP_ENERGY_NOISE_FLOOR, values
+        assert snap_energy == pytest.approx(ref_snap, rel=5e-2, abs=_SNAP_ENERGY_NOISE_FLOOR), values
         # The snap penalty's input is a shared quantity, not a fast-engine invention:
         # in the regime where the two engines model the same physics they must also
         # agree about how close to slack the sling ran, or the search would be steered
@@ -197,17 +227,21 @@ def test_fast_engine_matches_scipy_engine_on_always_taut_launches(machine):
 
         if ref_released:
             # Same equations of motion, two integrators: agreement is limited only by
-            # step-size control. Across this grid it measures a median 6e-6 relative on
-            # the pulley machine and 2e-5 on the traditional one, worst case 3e-4 for any
-            # throw of a metre or more - well inside the ~2e-4 the optimizer already
-            # accepts by running at rtol=1e-6 (see optimization._objective). The
-            # absolute floors cover the releases that go nowhere - the projectile leaves
-            # aimed at the ground and lands a few millimetres away, or not at all - where
-            # a relative tolerance is asking for agreement on a number that isn't a
-            # throw. A millimetre is far below any range worth optimizing for, and real
-            # throws are still held to the relative bound.
-            assert distance == pytest.approx(ref.distance, rel=1e-3, abs=1e-3), values
-            assert efficiency == pytest.approx(ref.efficiency, rel=1e-3, abs=1e-9), values
+            # step-size control, and on a slack launch by where each engine's event
+            # solver puts the snap. Across this grid a taut launch measures a median 6e-6
+            # relative on the pulley machine and 2e-5 on the traditional one; a slack one
+            # a median 8e-5, worst case 3.5e-3 - both inside the ~2e-4 to 1e-2 the
+            # optimizer already accepts by running at rtol=1e-6 (see
+            # optimization._objective). The absolute floors cover the releases that go
+            # nowhere - the projectile leaves aimed at the ground and lands a few
+            # millimetres away, or not at all - where a relative tolerance is asking for
+            # agreement on a number that isn't a throw. A millimetre is far below any
+            # range worth optimizing for, and real throws are still held to the relative
+            # bound.
+            assert distance == pytest.approx(ref.distance, **tolerance), values
+            assert efficiency == pytest.approx(
+                ref.efficiency, rel=tolerance["rel"], abs=1e-9
+            ), values
             if machine is MachineType.PULLEY:
                 # max(0, -T) has kinks at the tension zero-crossings, so trapezoid sums
                 # over the two engines' different step grids agree only loosely when the
@@ -219,34 +253,36 @@ def test_fast_engine_matches_scipy_engine_on_always_taut_launches(machine):
             else:
                 assert cw_impulse == 0.0, values  # no counterweight rope to go slack
 
-    assert taut_cases > 20  # sanity check the grid actually exercised the shared regime
+    # Sanity-check the grid actually exercised both arms of the launch.
+    assert taut_cases > 20
+    assert slack_cases > 20
 
 
 @pytest.mark.parametrize("machine", list(MachineType))
-def test_fast_engine_compression_impulse_predicts_where_the_sling_goes_slack(machine):
-    """The rigid engine's string impulse is the signal that flags the divergence.
+def test_fast_engine_reproduces_the_energy_a_snap_destroys(machine):
+    """The snap is the one place a launch loses energy discontinuously.
 
-    Both engines integrate identical dynamics up to the instant the rigid-link string
-    tension first crosses zero. physics.py switches to a slack regime there; fastsim
-    carries on and accumulates that negative tension into `string_impulse`. So the two
-    have to agree about whether a launch left the shared regime, even though everything
-    downstream of that instant - distance, efficiency, and even whether a release happens
-    at all - is then free to diverge. Only the boundary band is exempt, and only in one
-    direction: see _IMPULSE_NOISE_FLOOR.
+    It is also the piece this engine used to lack entirely, and the reason a slack launch
+    diverged: a rigid sling carries the projectile through a detachment that a rope would
+    have let happen, arriving somewhere the real machine never goes. Getting the same
+    energy out of the same snaps is the strongest single check that the port models the
+    event and not just the dynamics around it.
     """
-    slack_cases = 0
+    snapping_cases = 0
 
     for values, ref, fast in _parameter_grid(machine):
-        string_impulse = fast[3]
-        went_slack = ref.metrics["string_slack_fraction"] > 0
+        ref_energy = ref.metrics["sling_snap_energy"]
+        if ref_energy <= 0.0:
+            # A launch the reference calls clean must cost this engine nothing either,
+            # bar a graze at the boundary (see _SNAP_ENERGY_NOISE_FLOOR).
+            assert fast[6] < _SNAP_ENERGY_NOISE_FLOOR, values
+            continue
+        snapping_cases += 1
+        # A snap only ever removes energy, in both engines (see physics._apply_snap).
+        assert fast[6] > 0.0, values
+        assert fast[6] == pytest.approx(ref_energy, rel=5e-2, abs=_SNAP_ENERGY_NOISE_FLOOR), values
 
-        if went_slack:
-            slack_cases += 1
-            assert string_impulse > 0, values
-        else:
-            assert string_impulse < _IMPULSE_NOISE_FLOOR, values
-
-    assert slack_cases > 20  # sanity check the grid actually exercised the slack regime
+    assert snapping_cases > 10
 
 
 def test_fast_engine_reports_no_release_for_geometry_that_never_releases():
@@ -259,9 +295,8 @@ def test_fast_engine_reports_no_release_for_geometry_that_never_releases():
     )
     assert ref.metrics.get("release_occurred") is False  # sanity-check the fixture against the reference engine
 
-    released, distance, efficiency, _string_impulse, _cw_impulse, _deficit = _simulate_fast(
-        values, joint_friction_coefficient=huge_friction
-    )
+    (released, distance, efficiency, _string_impulse, _cw_impulse, _deficit,
+     _snap_energy) = _simulate_fast(values, joint_friction_coefficient=huge_friction)
 
     assert released is False
     assert distance == 0.0

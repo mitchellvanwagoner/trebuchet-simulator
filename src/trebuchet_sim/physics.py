@@ -709,9 +709,9 @@ class TrebuchetSimulator:
                 # segment's first step sits exactly on the previous segment's last, so
                 # restarting the rule per segment skips no time. Clamped below at zero
                 # as well as above at the floor: a taut segment's tension only goes
-                # negative by the event solver's own error, and the fast engine - whose
-                # rigid link really does push - has to come out with the same [0, 1]
-                # share of the launch rather than a deeper hole (see fastsim).
+                # negative by the event solver's own error, and fastsim, which runs
+                # the same taut/slack alternation, has to come out with the same [0, 1]
+                # share of the launch.
                 deficit = tension_floor - min(tension_floor, max(0.0, string_T))
                 if prev_sling_deficit is not None:
                     sling_deficit += 0.5 * (prev_sling_deficit + deficit) * (t_i - float(ts[i - 1]))

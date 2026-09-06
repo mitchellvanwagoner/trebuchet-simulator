@@ -386,7 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--distance-weight", type=float, default=OptimizationConfig.distance_weight,
         help="How strongly the objective penalizes missing the target (default: "
              f"{OptimizationConfig.distance_weight:g}). Against the efficiency weight this is "
-             "the exchange rate: efficiency points the search will give up per 1% of target "
+             # argparse runs help through %-formatting, so a literal percent must be doubled.
+             "the exchange rate: efficiency points the search will give up per 1%% of target "
              "distance. Lower it to be shown the most efficient machine near the target "
              "rather than one that hits it",
     )

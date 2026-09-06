@@ -94,26 +94,26 @@ class OptimizationConfig:
     # scale only decides how much the mass term and the two penalties below can move
     # things, so at a fixed ratio the numbers here barely change the answer.
     #
-    # 10:5 = 2.0 is measured. Over 60 problem/seed pairs whose targets are known
-    # reachable (40/70/95% of each machine's own maximum range, both machines, with and
-    # without locks), the share landing within 2% of the target runs 27 / 47 / 82 / 95 /
-    # 100% at distance weights of 1 / 2 / 5 / 10 / 20 against this efficiency weight.
-    # The old 1.0 - an exchange rate of 0.2, where the search would miss by 5% to buy a
-    # single point of efficiency - hit 27% of reachable targets and missed by a median
-    # 23.6%, and at the demanding end (95% of a machine's range) it hit none of them.
-    # Weights past 10 hit no better and start buying imaginary throws instead: see
-    # snap_penalty_weight. Measured against the best efficiency any weighting reached at
-    # the same requested distance, 10 gives up 1.3 points, which is what a target that
-    # is actually hit costs.
+    # 10:5 = 2.0 is measured. The benchmark is 60 problem/seed pairs over both machines
+    # with and without locks, each aimed at 40/70/95% of the range that machine can
+    # honestly reach - "honestly" meaning with the snap penalty active, since a machine
+    # is allowed to throw much further by wrecking its own sling (see
+    # snap_penalty_weight) and targets drawn from that would be unreachable by anything
+    # worth building. Against those, the share landing within 2% of the target is 37% at
+    # a distance weight of 1, 88% at 5, and 100% at 10. The old 1.0 - an exchange rate of
+    # 0.2, where the search would miss by 5% to buy a single point of efficiency - missed
+    # by a median 17.9%, which is to say it mostly ignored the target it was given.
+    # Past 10 there is nothing left to buy: everything is already being hit.
     efficiency_weight: float = 5.0
     distance_weight: float = 10.0
     mass_weight: float = 0.15
-    # Cost per N*s of rope "compression impulse". The fast engine keeps the rigid-link
-    # sling model, which can push where a real rope would go slack and lose energy in
-    # re-tensioning snaps; penalizing the impulse steers the search to always-taut
-    # solutions, where the rigid model matches physics.py's slack/snap model exactly.
-    # (The scipy fallback objective simulates the snaps for real, so there the sling
-    # loss shows up directly in efficiency and only the cw-rope impulse is penalized.)
+    # Cost per N*s of counterweight-rope "compression impulse". That rope is still a
+    # rigid link in both engines - unlike the sling, which is a rope in both - so it can
+    # push where a real rope would go slack, and a run where it does is unphysical from
+    # that moment on. Penalizing the impulse keeps the search out of there. It is a
+    # feasibility term, not a design preference: there is no version of the machine the
+    # answer describes. A traditional machine has no counterweight rope at all, which
+    # leaves this term zero for it.
     slack_penalty_weight: float = 200.0
     # Cost per unit of `sling_tension_deficit` - the share of the launch the sling spent
     # below config.SLING_TENSION_FLOOR projectile weights, weighted by how far below
@@ -123,26 +123,28 @@ class OptimizationConfig:
     # still hold together it is flat, and differential evolution has nothing to descend.
     # The deficit is graded all the way down, so the search feels the cliff coming.
     #
-    # Two measurements set this, and the second is why it is not 300.
+    # This is the term that decides how much range the design is allowed to buy with the
+    # sling's own health, and on the pulley machine that is a real trade rather than a
+    # rounding: left unpenalized, a plain pulley machine reaches 191 m with the sling limp
+    # for two thirds of the launch, against 105 m with it loaded throughout - a 45% range
+    # premium for a machine that beats itself up, and 39-60% across the pulley benchmark.
+    # The traditional machine pays nothing for the same promise (0-2%), because its
+    # geometry keeps the sling loaded anyway.
     #
-    # Robustness: over 24 randomized problems (both machines, random targets, locks and
-    # projectile masses), scoring each winner by how many +-10% one-parameter
-    # perturbations tip it into snapping, 14.2% of perturbations for the unpenalized
-    # objective falls to 10.4 / 7.5 / 5.4 / 1.3% at 100 / 200 / 300 / 600, with mean
-    # efficiency flat throughout (0.891 -> 0.883). That alone would argue for ~300.
+    # Two measurements set the value. Robustness: over 24 randomized problems, scoring
+    # each winner by how many +-10% one-parameter perturbations tip it into snapping,
+    # 14.2% of perturbations for the unpenalized objective falls to 10.4 / 7.5 / 5.4 /
+    # 1.3% at 100 / 200 / 300 / 600, with mean efficiency flat throughout. Then, against
+    # the reachable-target benchmark above at a distance weight of 10, 300 leaves a mean
+    # tension deficit of 0.0082 and 2.0% fragility with one winner in 60 actually
+    # snapping, while 1000 leaves 0.0004 and 0.5% with none - for 0.008 of mean
+    # efficiency. The margin is small because the distance term is no longer pulling
+    # against a broken engine; it is consistent, and it is nearly free.
     #
-    # Holding the wall: this penalty is what keeps the search inside the region where
-    # the fast engine is faithful, so it has to outbid the distance term - and that term
-    # scales with distance_weight, which 300 was calibrated against at its old value of
-    # 1. It no longer holds at 10. Given a target beyond the machine's reach, the
-    # distance term is worth ~2000 and buys a trajectory the rigid-sling model only
-    # imagines: at 300 the search returns a design the fast engine scores at the target
-    # exactly while physics.py throws a fifth as far, with the sling slack for 39% of
-    # the launch. At 1000 that stops - the same problem returns 92% of the machine's
-    # true maximum range with both engines agreeing and the sling intact - and it costs
-    # nothing where the target is reachable, where the winner's deficit is 0.0005 either
-    # way. Raising it further does not help; raising distance_weight instead of this
-    # reopens the hole (25% of unreachable-target runs at 20/300, 15% at 40/1000).
+    # (Before fastsim modelled the sling as a rope, this weight was also load-bearing in
+    # a way it is not now: it was what kept the search inside the region where that
+    # engine was faithful. It no longer has that job - the engines agree everywhere - so
+    # what is left is the design preference above.)
     snap_penalty_weight: float = 1000.0
     # Which counterweight linkage to design for. It decides the search space (see
     # param_names) rather than being searched itself, so it is a field of its own
@@ -263,9 +265,9 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
     mass_cost = (params.total_mass / 30.0) * 100
-    # Only the counterweight rope is still a rigid link here, so it is the only one with
-    # a compression impulse to charge (the key this used to read for the sling,
-    # `string_compression_impulse`, is not in the metrics any more - physics.py lets the
+    # Only the counterweight rope is still a rigid link, so it is the only one with a
+    # compression impulse to charge (the key this used to read for the sling,
+    # `string_compression_impulse`, is not in the metrics any more - both engines let the
     # sling go slack for real instead). A traditional machine has no counterweight rope
     # either, leaving this term zero for it.
     slack_cost = config.slack_penalty_weight * result.metrics.get("cw_rope_compression_impulse", 0.0)
