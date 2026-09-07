@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from trebuchet_sim.config import (
+    G,
     DEFAULT_INITIAL_ARM_ANGLE,
     DEFAULT_OPTIMIZABLE_PARAMS,
     DEFAULT_TRADITIONAL_FIXED,
@@ -48,9 +49,10 @@ def test_traditional_machine_releases_and_throws():
     assert result.metrics["release_occurred"] is True
     assert result.distance > 0
     assert 0 < result.efficiency < 1
-    # A 50 kg weight on a 1.8 m arm is a real machine's worth of energy, not a toy:
-    # a range this far off would mean the linkage torque has the wrong sign or scale.
-    assert 40 < result.distance < 150
+    # The defaults are optimizer output for the 30 m target, the same as the pulley
+    # machine's: landing this far off it would mean the linkage torque has the wrong sign
+    # or scale rather than that the search had a bad day.
+    assert 25 < result.distance < 36
 
 
 def test_traditional_launch_conserves_energy_with_dissipation_switched_off():
@@ -129,14 +131,24 @@ def test_pinned_counterweight_hangs_from_the_arm_not_the_axle():
     assert pin_y > params.pivot_height
 
 
-def test_counterweight_rope_metrics_are_omitted_for_a_pinned_weight():
-    """A pinned link is rigid by construction - there is no rope that could go slack,
-    so reporting a tension or a compression impulse for one would be meaningless."""
+def test_the_pinned_counterweight_link_is_graded_like_the_pulley_machine_s_rope():
+    """A pin holds the link's end, not its length.
+
+    These metrics were reported for the pulley machine alone, on the reading that a pinned
+    counterweight has no rope to go slack. It has: the weight hangs a further
+    `counter_weight_rope_length` below that pin, on a link this model holds rigid exactly
+    as it holds the pulley machine's rope rigid, and a rigid link pushes where a rope would
+    let go. Nothing measured that, so the optimizer designed straight into it - every
+    traditional winner across a target sweep came back with the link in compression, down
+    to -1212 N, while the pulley machine's equivalent was penalized to zero.
+
+    The shipped defaults keep it loaded the whole way, which is the point of measuring it.
+    """
     result = simulate_trebuchet(traditional_params())
 
-    assert "min_cw_rope_tension" not in result.metrics
-    assert "cw_rope_compression_impulse" not in result.metrics
-    assert "min_string_tension" in result.metrics  # the sling is still a real rope
+    assert result.metrics["min_cw_rope_tension"] > 0.0
+    assert result.metrics["cw_rope_compression_impulse"] == 0.0
+    assert result.metrics["min_string_tension"] > 0.0
 
 
 def test_traditional_aftermath_runs_as_one_regime_and_stops_at_the_ground():
@@ -298,3 +310,107 @@ def test_both_engines_agree_on_the_fallback_link_length():
 
     assert fast[0] is reference.metrics["release_occurred"]
     assert fast[1] == pytest.approx(reference.distance, rel=1e-3)
+
+
+def test_the_counterweight_link_tension_matches_the_measured_acceleration():
+    """The link tension is a constraint force, so it has to agree with the motion.
+
+    The weight rides a massless link pinned to the arm - a two-force member, so the whole
+    of its tension acts along the link. `_cw_link_tension` writes that out in closed form;
+    this measures the weight's acceleration off the solved launch by central difference and
+    projects Newton onto the same line, which is the same statement arrived at without the
+    algebra. Anchored at rest, too, where a hanging weight must read exactly its own weight.
+    """
+    params = traditional_params()
+    simulator = TrebuchetSimulator(params)
+    result = simulator.simulate()
+    sol = result.solution
+    m, l_w = params.counter_weight_mass, params.initial_cw_rope_length
+
+    at_rest = simulator._cw_link_tension(
+        params.initial_arm_angle, 0.0, 0.0, -np.pi / 2, 0.0
+    )
+    assert at_rest == pytest.approx(m * G)
+
+    def weight_velocity(t):
+        theta, theta_dot, _pos, _vel, psi, psi_dot = sol.full_state(t)
+        return np.array(
+            simulator.weight_position_velocity((theta, theta_dot, 0.0, 0.0, psi, psi_dot))[1]
+        )
+
+    # Differencing the analytic velocity once rather than the position twice: scipy's
+    # dense output is a 4th-order interpolant, so its second derivative is the noisiest
+    # thing in reach and dividing that noise by h^2 swamps the comparison whatever the
+    # solver's rtol. One difference of a velocity the model states in closed form leaves
+    # the interpolant as the only error left, which is what the 0.2% bound is - the
+    # formula itself is pinned exactly by the at-rest anchor above.
+    h = 1e-5
+    checked = 0
+    for t in np.linspace(4 * h, sol.t_end - 4 * h, 40):
+        t = float(t)
+        y = sol._y_at(t)[1]
+        theta, theta_dot, psi, psi_dot = y[0], y[1], y[4], y[5]
+        closed_form = simulator._cw_link_tension(
+            theta, theta_dot, simulator.trebuchet_dynamics(t, y)[1], psi, psi_dot
+        )
+        accel = (weight_velocity(t + h) - weight_velocity(t - h)) / (2 * h)
+        link = np.array([np.cos(psi), np.sin(psi)])  # pin -> weight
+        # m a = -T * link + m g, projected on the link.
+        measured = m * (np.array([0.0, -G]) @ link - accel @ link)
+        assert closed_form == pytest.approx(measured, rel=2e-3, abs=1e-2)
+        checked += 1
+
+    assert checked == 40
+    assert l_w > 0  # there is a link to have a tension at all
+
+
+def test_a_whipping_counterweight_pushes_its_link_and_is_reported_for_it():
+    """The failure mode the pulley machine has always been graded on, on this linkage.
+
+    A short lever swinging a weight on a long link whips it past the pin, and the link has
+    to push to keep up - which a rope cannot do. It is the region the optimizer used to
+    walk straight into, so the metrics have to see it.
+    """
+    params = traditional_params(
+        counter_weight_mass=50.0, length_counterweight=0.35, arm_length=1.8,
+        string_length=1.35, release_angle=-5.016,
+    )
+    result = simulate_trebuchet(params)
+
+    assert result.metrics["release_occurred"] is True
+    assert result.metrics["min_cw_rope_tension"] < -100.0
+    assert result.metrics["cw_rope_compression_impulse"] > 1.0
+    # And nothing else about the launch complains: the sling is loaded the whole way and
+    # the stone never touches the ground, so this is the only term that can catch it.
+    assert result.metrics["sling_tension_deficit"] == 0.0
+    assert result.metrics["projectile_ground_contacts"] == 0
+
+
+def test_the_aftermath_carries_the_counterweight_swing_across_release():
+    """psi is a live coordinate on this machine, and the launch leaves it mid-swing.
+
+    The post-release machine used never to be handed it, so it restarted the weight hanging
+    straight down at rest - a 323 mm jump in the counterweight's position at the instant the
+    projectile left, in every animation and in the dynamics that follow it.
+    """
+    params = traditional_params()
+    simulator = TrebuchetSimulator(params)
+    result = simulator.simulate(simulate_aftermath=True)
+
+    psi_release, psi_dot_release = result.solution.release_swing_state
+    psi_after, psi_dot_after = result.aftermath.swing_at(0.0)
+
+    assert psi_after == pytest.approx(psi_release)
+    assert psi_dot_after == pytest.approx(psi_dot_release)
+    # The pose it left is not the resting one, so this is a real continuity check rather
+    # than two ways of spelling the same number.
+    assert psi_release != pytest.approx(-np.pi / 2)
+
+    theta, theta_dot = result.solution.release_machine_state
+    before = simulator.weight_position_velocity(
+        (theta, theta_dot, 0.0, 0.0, psi_release, psi_dot_release)
+    )[0]
+    after = simulator.weight_position_velocity(
+        (theta, theta_dot, 0.0, 0.0, psi_after, psi_dot_after)
+    )[0]
+    assert np.hypot(before[0] - after[0], before[1] - after[1]) == pytest.approx(0.0, abs=1e-9)

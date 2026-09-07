@@ -120,13 +120,20 @@ class OptimizationConfig:
     efficiency_weight: float = 5.0
     distance_weight: float = 10.0
     mass_weight: float = 0.15
-    # Cost per N*s of counterweight-rope "compression impulse". That rope is still a
-    # rigid link in both engines - unlike the sling, which is a rope in both - so it can
-    # push where a real rope would go slack, and a run where it does is unphysical from
-    # that moment on. Penalizing the impulse keeps the search out of there. It is a
-    # feasibility term, not a design preference: there is no version of the machine the
-    # answer describes. A traditional machine has no counterweight rope at all, which
-    # leaves this term zero for it.
+    # Cost per N*s of counterweight-link "compression impulse". Whatever carries the
+    # weight - a rope over the axle, or the link a pinned weight hangs on - is still a
+    # rigid link in both engines, unlike the sling, which is a rope in both. So it can
+    # push where a real rope or chain would go slack, and a run where it does is
+    # unphysical from that moment on. Penalizing the impulse keeps the search out of
+    # there. It is a feasibility term, not a design preference: there is no version of
+    # the machine the answer describes.
+    #
+    # It is charged on both machines now. It used to be zero for a traditional one - not
+    # because that machine has nothing to charge, but because nothing measured its link
+    # (see physics._cw_link_tension) - and the search went straight for the gap: across a
+    # target sweep every traditional winner came back with the link in compression, down
+    # to -1212 N and 7.9 N*s, while the pulley machine's identical failure mode was
+    # penalized to zero. The same sweep now returns a worst case of -2 N and 0.0014 N*s.
     slack_penalty_weight: float = 200.0
     # Cost per unit of `sling_tension_deficit` - the share of the launch the sling spent
     # below config.SLING_TENSION_FLOOR projectile weights, weighted by how far below
@@ -138,9 +145,12 @@ class OptimizationConfig:
     #
     # This is the term that decides how much range the design is allowed to buy with the
     # sling's own health, and on the pulley machine that is a real trade rather than a
-    # rounding: left unpenalized, a plain pulley machine reaches 182 m with the sling limp
+    # rounding: left unpenalized, a plain pulley machine reached 182 m with the sling limp
     # for over half the launch, against 106 m with it loaded throughout - a 42% range
     # premium for a machine that beats itself up, and 39-60% across the pulley benchmark.
+    # (Those figures, and the calibration below, were measured before the arm's drag
+    # torque was corrected and the defaults re-derived; the trade they describe is the
+    # same, and every winner in the post-fix sweep still scores a zero deficit.)
     # The traditional machine pays nothing for the same promise (0-2%), because its
     # geometry keeps the sling loaded anyway.
     #
@@ -159,6 +169,32 @@ class OptimizationConfig:
     # engine was faithful. It no longer has that job - the engines agree everywhere - so
     # what is left is the design preference above.)
     snap_penalty_weight: float = 1000.0
+    # Cost per joule the launch destroys in a discontinuity: `sling_snap_energy` (a rope
+    # that let go and came back) plus `projectile_ground_energy` (a stone that hit the
+    # dirt mid-throw). Those are the two jerks that have already happened, and until this
+    # term existed the objective only saw them through `efficiency`, which prices a lost
+    # joule exactly like a joule spent on air drag. It is not the same thing: a launch
+    # that throws its stone into the ground and snatches it back out is a machine that
+    # shakes itself apart, not merely a lossy one.
+    #
+    # The two terms above cannot cover it. `sling_tension_deficit` grades how close the
+    # *sling* runs to slack and says nothing about the ground, and the counterweight
+    # impulse is a different link again. With the shipped pivot heights nothing lands here
+    # anyway, so this changes no default answer; it bites where the geometry is forced -
+    # a pulley machine on a 0.6 m pivot aiming at 45 m won by driving the projectile into
+    # the ground and paying 17.2 J for it, which the old objective accepted because the
+    # throw still reached the target.
+    #
+    # Priced in joules, the way the counterweight impulse is priced in N*s. Measured over
+    # 30 problems spanning both machines - the shipped geometry, pivots forced down to
+    # 0.6/0.9/1.2 m, and locked linkages - the joules the winners throw away in total run
+    # 47.1 / 9.9 / 1.3 / 0.3 at a weight of 0 / 5 / 20 / 100. 20 removes 97% of it. It
+    # costs nothing to buy: mean efficiency over those problems is 0.801 unpenalized
+    # against 0.818 at 20, the median distance miss stays at 0.002% of target, and over
+    # the shipped-geometry problems alone mean efficiency is 0.863 at every weight
+    # including 0 - the term is identically zero for a design that never lands or snaps,
+    # so a clean winner's score is untouched.
+    jerk_penalty_weight: float = 20.0
     # Which counterweight linkage to design for. It decides the search space (see
     # param_names) rather than being searched itself, so it is a field of its own
     # instead of a fixed_params entry.
@@ -278,17 +314,23 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
     mass_cost = (params.total_mass / 30.0) * 100
-    # Only the counterweight rope is still a rigid link, so it is the only one with a
-    # compression impulse to charge (the key this used to read for the sling,
+    # Only the counterweight's link is still a rigid one, so it is the only connector
+    # with a compression impulse to charge (the key this used to read for the sling,
     # `string_compression_impulse`, is not in the metrics any more - both engines let the
-    # sling go slack for real instead). A traditional machine has no counterweight rope
-    # either, leaving this term zero for it.
+    # sling go slack for real instead). Both machines report one: the pulley machine's
+    # rope over the axle, and the link a pinned weight hangs from.
     slack_cost = config.slack_penalty_weight * result.metrics.get("cw_rope_compression_impulse", 0.0)
     # The sling's own loss does land in `efficiency` once it detaches, but only once:
     # this is what keeps the search off the cliff edge rather than merely off the bottom,
     # since by the time efficiency has noticed, the run has already lost the energy.
     # Both engines charge for it, computed the same way from the same floor.
     snap_cost = config.snap_penalty_weight * result.metrics.get("sling_tension_deficit", 0.0)
+    # What the launch actually threw away in its discontinuities. Both engines report the
+    # same two numbers; the fast one used to compute them and discard them here.
+    jerk_cost = config.jerk_penalty_weight * (
+        result.metrics.get("sling_snap_energy", 0.0)
+        + result.metrics.get("projectile_ground_energy", 0.0)
+    )
 
     return (
         config.efficiency_weight * efficiency_cost
@@ -296,6 +338,7 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
         + config.mass_weight * mass_cost
         + slack_cost
         + snap_cost
+        + jerk_cost
     )
 
 
@@ -350,7 +393,7 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
         config.machine is MachineType.PULLEY,
         config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
-        config.slack_penalty_weight, config.snap_penalty_weight,
+        config.slack_penalty_weight, config.snap_penalty_weight, config.jerk_penalty_weight,
     )
 
 

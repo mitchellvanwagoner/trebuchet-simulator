@@ -652,14 +652,31 @@ def _taut_state_from_grounded(y, c, h_T, out):
 
 
 @njit(cache=True, fastmath=True, inline="always")
-def _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot, l_a, l_s, proj_drag_k,
-              projectile_mass, counter_weight_mass, pulley_radius, has_pulley):
-    """Scalar port of physics.TrebuchetSimulator.constraint_tensions (theta_ddot passed in).
+def _cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot, c,
+                     counter_weight_mass, pulley_radius, has_pulley):
+    """Scalar port of physics.TrebuchetSimulator._cw_link_tension.
 
-    The counterweight rope only exists on the pulley machine; a pinned link is rigid by
-    construction and can't go slack, so 0.0 is returned for it - which contributes
-    nothing to the compression impulse the caller accumulates.
+    Both linkages hold the counterweight on a link this model keeps rigid, so on both a
+    negative value marks the run unphysical from there on and the objective charges for
+    the impulse it accumulates.
     """
+    if has_pulley:
+        return counter_weight_mass * (G + pulley_radius * theta_ddot)
+    l_w, l_cw = c[18], c[20]
+    sin_pt = np.sin(psi - theta)
+    cos_pt = np.cos(psi - theta)
+    return counter_weight_mass * (
+        l_w * psi_dot * psi_dot
+        + l_cw * (theta_ddot * sin_pt - theta_dot * theta_dot * cos_pt)
+        - G * np.sin(psi)
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _tensions(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, theta_ddot, c,
+              projectile_mass, counter_weight_mass, pulley_radius, has_pulley):
+    """Scalar port of physics.TrebuchetSimulator.constraint_tensions (theta_ddot passed in)."""
+    l_a, l_s, proj_drag_k = c[0], c[1], c[8]
     sin_t, cos_t = np.sin(theta), np.cos(theta)
     sin_a, cos_a = np.sin(alpha), np.cos(alpha)
     sin_at = sin_a * cos_t - cos_a * sin_t
@@ -675,7 +692,8 @@ def _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot, l_a, l_s, proj_dra
         - drag_scale * (p_vx * cos_a + p_vy * sin_a)
         - projectile_mass * radial_acc
     )
-    cw_tension = counter_weight_mass * (G + pulley_radius * theta_ddot) if has_pulley else 0.0
+    cw_tension = _cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot, c,
+                                  counter_weight_mass, pulley_radius, has_pulley)
     return string_tension, cw_tension
 
 
@@ -708,7 +726,6 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     inert but still counts toward the error norm exactly as it does under scipy.
     """
     l_a, l_s = c[0], c[1]
-    proj_drag_k = c[8]
     theta_arm_ground = _first_arm_ground_angle(l_a, c[17], h_T, initial_arm_angle)
 
     t = t0
@@ -748,7 +765,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     cw_impulse = 0.0
     sling_deficit = 0.0
     string_T_prev, cw_T_prev = _tensions(
-        theta, theta_dot, alpha, alpha_dot, f0_2, l_a, l_s, proj_drag_k,
+        theta, theta_dot, alpha, alpha_dot, psi, psi_dot, f0_2, c,
         projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
     )
 
@@ -829,7 +846,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
 
         if err_norm <= 1.0:
             string_T_new, cw_T_new = _tensions(
-                yn_1, yn_2, yn_3, yn_4, k7_2, l_a, l_s, proj_drag_k,
+                yn_1, yn_2, yn_3, yn_4, yn_5, yn_6, k7_2, c,
                 projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
             )
 
@@ -876,7 +893,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                     ps = _hermite(psi, yn_5, f0_5, k7_5, h, mid)
                     ps_d = _hermite(psi_dot, yn_6, f0_6, k7_6, h, mid)
                     _, th_dd, _, _, _, _ = _trebuchet_dynamics(th, th_d, al, al_d, ps, ps_d, c)
-                    T_mid, _ = _tensions(th, th_d, al, al_d, th_dd, l_a, l_s, proj_drag_k,
+                    T_mid, _ = _tensions(th, th_d, al, al_d, ps, ps_d, th_dd, c,
                                          projectile_mass, counter_weight_mass, pulley_radius,
                                          has_pulley)
                     if T_mid > 0.0:
@@ -931,8 +948,8 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                     theta_r, theta_dot_r, alpha_r, alpha_dot_r, psi_r, psi_dot_r, c
                 )
                 string_T_r, cw_T_r = _tensions(
-                    theta_r, theta_dot_r, alpha_r, alpha_dot_r, theta_ddot_r, l_a, l_s,
-                    proj_drag_k, projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
+                    theta_r, theta_dot_r, alpha_r, alpha_dot_r, psi_r, psi_dot_r, theta_ddot_r,
+                    c, projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
                 )
                 string_impulse += 0.5 * (max(0.0, -string_T_prev) + max(0.0, -string_T_r)) * h * s
                 cw_impulse += 0.5 * (max(0.0, -cw_T_prev) + max(0.0, -cw_T_r)) * h * s
@@ -1016,8 +1033,8 @@ def _eight_tensions(y, c, projectile_mass, counter_weight_mass, pulley_radius, h
 
     A sling under load reports its tension whether or not the projectile it is pulling
     happens to be resting on the ground; a slack one carries nothing either way. The
-    counterweight rope is read from whatever angular acceleration the regime produced, and
-    only exists on the pulley machine - exactly the split physics._tension_metrics makes.
+    counterweight link is read from whatever angular acceleration the regime produced -
+    exactly the split physics._tension_metrics makes.
     """
     if regime == _TAUT_GROUND:
         theta_ddot, _psi_ddot, _ax, string_T, _normal = _grounded_taut_solve(
@@ -1026,7 +1043,8 @@ def _eight_tensions(y, c, projectile_mass, counter_weight_mass, pulley_radius, h
     else:
         theta_ddot, _psi_ddot = _machine_only_accelerations(y[0], y[1], y[6], y[7], c)
         string_T = 0.0
-    cw_T = counter_weight_mass * (G + pulley_radius * theta_ddot) if has_pulley else 0.0
+    cw_T = _cw_link_tension(y[0], y[1], theta_ddot, y[6], y[7], c,
+                            counter_weight_mass, pulley_radius, has_pulley)
     return string_T, cw_T
 
 
@@ -1372,9 +1390,9 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
         _, theta_ddot0, _, _, _, _ = _trebuchet_dynamics(
             theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c
         )
-        string_T0, _ = _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot0, l_a, l_s,
-                                 c[8], projectile_mass, counter_weight_mass, pulley_radius,
-                                 has_pulley)
+        string_T0, _ = _tensions(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
+                                 theta_ddot0, c, projectile_mass, counter_weight_mass,
+                                 pulley_radius, has_pulley)
         start_py = l_a * np.sin(theta0) + l_s * np.sin(alpha0) + h_T
         if string_T0 < 0.0:
             _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
@@ -1497,9 +1515,9 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
         _, theta_ddot_s, _, _, _, _ = _trebuchet_dynamics(
             theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c
         )
-        string_T_s, _ = _tensions(theta, theta_dot, alpha, alpha_dot, theta_ddot_s, l_a, l_s,
-                                  c[8], projectile_mass, counter_weight_mass, pulley_radius,
-                                  has_pulley)
+        string_T_s, _ = _tensions(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
+                                  theta_ddot_s, c, projectile_mass, counter_weight_mass,
+                                  pulley_radius, has_pulley)
         # A tiny positive threshold, not zero: at exactly zero tension the next taut
         # segment would trip its own slack event at t0 and return a zero-length segment.
         if string_T_s > 1e-9:
@@ -1690,7 +1708,11 @@ def _machine_constants(counter_weight_mass, pulley_radius, length_counterweight,
         cw_swing_gravity_k = counter_weight_mass * G * l_w
         M33 = counter_weight_mass * l_w * l_w
 
-    arm_drag_k = (1.0 / 6.0) * ARM_CROSS_SECTION_WIDTH * arm_drag_coefficient * RHO_AIR * arm_length**3
+    # Drag torque along the beam: 1/8 rho Cd w L^4 per side (see
+    # physics.TrebuchetSimulator.__init__ for why the moment arm belongs in there).
+    arm_drag_k = (1.0 / 8.0) * ARM_CROSS_SECTION_WIDTH * arm_drag_coefficient * RHO_AIR * (
+        arm_length**4 + arm_back_length**4
+    )
     proj_drag_k = 0.5 * RHO_AIR * projectile_drag_coefficient * projectile_area
     arm_gravity_k = arm_cm_offset * G * arm_mass
     proj_gravity_theta_k = projectile_mass * G * arm_length
@@ -1829,13 +1851,13 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
            initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
            joint_friction_coefficient, has_pulley,
            target_distance, efficiency_weight, distance_weight, mass_weight,
-           slack_penalty_weight, snap_penalty_weight):
+           slack_penalty_weight, snap_penalty_weight, jerk_penalty_weight):
     """Scalar port of optimization._objective's cost formula for one individual."""
     if string_length > 0.95 * arm_length:
         return INVALID_COST
 
     (released, distance, efficiency, _string_impulse, cw_impulse, sling_deficit,
-     _snap_energy, _ground_energy) = simulate_fast(
+     snap_energy, ground_energy) = simulate_fast(
         counter_weight_mass, pulley_radius, length_counterweight, counter_weight_rope_length,
         arm_length, string_length, release_angle,
         pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -1862,10 +1884,14 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     # ends at the zero crossing and there is no sling compression left to bill.
     slack_cost = slack_penalty_weight * cw_impulse
     snap_cost = snap_penalty_weight * sling_deficit
+    # The joules the launch destroyed in its discontinuities - a sling that let go and
+    # came back, and a stone that reached the ground - which this engine has always
+    # measured and, until the objective had a term for them, discarded.
+    jerk_cost = jerk_penalty_weight * (snap_energy + ground_energy)
 
     return (
         efficiency_weight * efficiency_cost + distance_weight * distance_cost
-        + mass_weight * mass_cost + slack_cost + snap_cost
+        + mass_weight * mass_cost + slack_cost + snap_cost + jerk_cost
     )
 
 
@@ -1876,7 +1902,8 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
                          pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
                          initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
                          joint_friction_coefficient, has_pulley, target_distance, efficiency_weight,
-                         distance_weight, mass_weight, slack_penalty_weight, snap_penalty_weight):
+                         distance_weight, mass_weight, slack_penalty_weight, snap_penalty_weight,
+                         jerk_penalty_weight):
     """Cost for an entire DE population in one call.
 
     The six per-individual args are arrays of shape (S,); everything else is a scalar
@@ -1895,6 +1922,6 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
             initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
             joint_friction_coefficient, has_pulley,
             target_distance, efficiency_weight, distance_weight, mass_weight,
-            slack_penalty_weight, snap_penalty_weight,
+            slack_penalty_weight, snap_penalty_weight, jerk_penalty_weight,
         )
     return costs

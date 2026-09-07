@@ -120,6 +120,8 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
                 "of the throw. Raise --pivot-height or shorten the sling."
             )
         # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
+        # Reported on both machines: a pinned weight still hangs on a link this model holds
+        # rigid, and it pushes wherever the weight whips past its pin.
         if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
             print(
                 f"  [WARNING] Counterweight rope goes slack (min tension "
@@ -319,6 +321,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             distance_weight=args.distance_weight,
             mass_weight=args.mass_weight,
             snap_penalty_weight=args.snap_penalty_weight,
+            jerk_penalty_weight=args.jerk_penalty_weight,
             locked_params=locked,
             param_bounds=ranges,
             fixed_params=fixed,
@@ -421,6 +424,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="How hard to push the search away from designs whose sling runs close to "
              f"slack (default: {OptimizationConfig.snap_penalty_weight:g}). Raise it if the "
              "winner still jerks; drop it to 0 to optimize on range and efficiency alone",
+    )
+    opt_parser.add_argument(
+        "--jerk-penalty-weight",
+        type=float,
+        default=OptimizationConfig.jerk_penalty_weight,
+        help="Cost per joule the launch destroys in a sling snap or a ground impact "
+             f"(default: {OptimizationConfig.jerk_penalty_weight:g}). Zero for a design that "
+             "does neither, so raising it only affects machines that already jerk",
     )
     opt_parser.add_argument(
         "--lock",

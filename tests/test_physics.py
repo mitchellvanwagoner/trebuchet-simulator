@@ -1,5 +1,6 @@
 import math
 
+import numpy
 import pytest
 
 from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, TrebuchetParams
@@ -345,3 +346,58 @@ def test_cw_rope_length_shifts_initial_counterweight_height_without_changing_dyn
     result_custom = simulate_trebuchet(custom)
     assert result_default.distance == pytest.approx(result_custom.distance)
     assert result_default.efficiency == pytest.approx(result_custom.efficiency)
+
+
+def test_arm_drag_is_a_torque_integrated_along_both_sides_of_the_beam():
+    """A slice at radius r sees 1/2 rho Cd w (r theta_dot)^2 dr and applies it at arm r.
+
+    Integrating that against its own moment arm gives 1/8 rho Cd w L^4 theta_dot^2, once
+    per side of the pivot. The coefficient used to be 1/6 rho Cd w l_a^3 - the same
+    integral without the moment arm, which is the beam's total drag *force*: short a
+    length, so not a torque at all, and wrong by a factor that moves with the arm length
+    the optimizer is choosing (3.1x too large on a 0.43 m arm, 0.74x on a 1.8 m one).
+
+    Checked against the integral evaluated numerically rather than against the closed
+    form, so the constant is measured rather than restated.
+    """
+    from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, MachineType, RHO_AIR
+    from trebuchet_sim.physics import TrebuchetSimulator
+
+    for params in (
+        default_params(arm_length=0.4182),
+        TrebuchetParams(
+            machine=MachineType.TRADITIONAL, counter_weight_mass=25.0,
+            length_counterweight=0.4, arm_length=1.8, string_length=1.0,
+            release_angle=-4.7, pivot_height=2.6,
+        ),
+    ):
+        k = TrebuchetSimulator(params)._arm_drag_k
+        strip = 0.5 * RHO_AIR * params.arm_drag_coefficient * ARM_CROSS_SECTION_WIDTH
+        expected = 0.0
+        for length in (params.arm_length, params.arm_back_length):
+            if length <= 0:
+                continue
+            r = numpy.linspace(0.0, length, 20001)
+            expected += strip * numpy.trapezoid(r**3, r)  # torque per unit theta_dot^2
+        assert k == pytest.approx(expected, rel=1e-6)
+
+    # A torque grows as the fourth power of the beam, a force as the third: doubling the
+    # arm has to multiply this by 16, which is the check that the moment arm is in there.
+    short = TrebuchetSimulator(default_params(arm_length=0.4))._arm_drag_k
+    long = TrebuchetSimulator(default_params(arm_length=0.8))._arm_drag_k
+    assert long / short == pytest.approx(16.0)
+
+
+def test_arm_drag_torque_always_opposes_the_arm():
+    """Whichever way the beam turns, the air pushes back - not along."""
+    from trebuchet_sim.physics import TrebuchetSimulator
+
+    params = default_params(arm_drag_coefficient=2.0, joint_friction_coefficient=0.0)
+    simulator = TrebuchetSimulator(params)
+    for theta_dot in (-7.0, 7.0):
+        state = (0.3, theta_dot, 0.2, 0.0, 0.0, 0.0)
+        with_drag = simulator.trebuchet_dynamics(0.0, state)[1]
+        simulator._arm_drag_k = 0.0
+        without_drag = simulator.trebuchet_dynamics(0.0, state)[1]
+        simulator = TrebuchetSimulator(params)  # restore
+        assert (with_drag - without_drag) * theta_dot < 0

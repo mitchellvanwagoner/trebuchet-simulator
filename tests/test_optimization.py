@@ -2,7 +2,7 @@ import pytest
 
 import numpy as np
 
-from trebuchet_sim.config import MachineType, TrebuchetParams
+from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, MachineType, TrebuchetParams
 from trebuchet_sim.optimization import (
     PARAM_BOUNDS,
     PARAM_LIMITS,
@@ -15,6 +15,19 @@ from trebuchet_sim.optimization import (
 from trebuchet_sim.physics import simulate_trebuchet
 
 pytest.importorskip("numba")
+
+
+# A pulley machine that both lets its sling go and drops the stone on the ground before
+# throwing it 80 m - the two dissipative discontinuities the jerk penalty prices, in one
+# launch. Shared with tests/test_ground.py, where the four regimes it walks are the point.
+JERK_PARAMS = {
+    "counter_weight_mass": 52.725642457680614,
+    "pulley_radius": 0.6070760857653384,
+    "arm_length": 1.0901717662568329,
+    "string_length": 0.9980417041772385,
+    "release_angle": -4.2438199212106875,
+    "pivot_height": 1.3401717662568329,
+}
 
 
 def _quick_config(**overrides) -> OptimizationConfig:
@@ -222,3 +235,55 @@ def test_a_locked_parameter_ignores_its_range():
     params, _result, _de_result = optimize_trebuchet(config)
 
     assert params.arm_length == 0.45
+
+
+def test_the_objective_charges_for_the_energy_a_launch_throws_away():
+    """Snaps and ground impacts are jerks, not merely losses.
+
+    Efficiency already notices the joules - it divides by the potential energy spent - but
+    it prices a joule lost to a stone hitting the dirt exactly like a joule lost to air
+    drag. This term is what makes the first one worse, and it is identically zero for a
+    design that does neither, so a clean winner's score is untouched by it.
+    """
+    from trebuchet_sim.optimization import _objective
+
+    clean = OptimizationConfig(jerk_penalty_weight=0.0)
+    charged = OptimizationConfig(jerk_penalty_weight=250.0)
+    values = [DEFAULT_OPTIMIZABLE_PARAMS[name] for name in clean.free_params]
+
+    # The shipped machine neither snaps nor lands, so the weight cannot move its score.
+    default_result = simulate_trebuchet(TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS))
+    assert default_result.metrics["sling_snap_energy"] == 0.0
+    assert default_result.metrics["projectile_ground_energy"] == 0.0
+    assert _objective(values, charged) == pytest.approx(_objective(values, clean))
+
+    # One that does both costs strictly more, by exactly the weight times the joules.
+    jerky_free = OptimizationConfig(
+        jerk_penalty_weight=0.0, fixed_params={"pivot_height": JERK_PARAMS["pivot_height"]}
+    )
+    jerky_charged = OptimizationConfig(
+        jerk_penalty_weight=250.0, fixed_params={"pivot_height": JERK_PARAMS["pivot_height"]}
+    )
+    jerky = [JERK_PARAMS[name] for name in jerky_free.free_params]
+    metrics = simulate_trebuchet(TrebuchetParams(**JERK_PARAMS)).metrics
+    thrown_away = metrics["sling_snap_energy"] + metrics["projectile_ground_energy"]
+    assert metrics["sling_snap_energy"] > 0.0
+    assert metrics["projectile_ground_energy"] > 0.0
+    assert _objective(jerky, jerky_charged) - _objective(jerky, jerky_free) == pytest.approx(
+        250.0 * thrown_away, rel=1e-3
+    )
+
+
+def test_both_engines_charge_the_same_jerk_cost():
+    """The fast engine has always measured these two energies and discarded them here."""
+    for weight in (0.0, 250.0):
+        config = OptimizationConfig(
+            jerk_penalty_weight=weight,
+            fixed_params={"pivot_height": JERK_PARAMS["pivot_height"]},
+        )
+        values = np.array(
+            [[JERK_PARAMS[name]] for name in config.free_params], dtype=np.float64
+        )
+        assert _objective_vectorized(values, config)[0] == pytest.approx(
+            _objective([JERK_PARAMS[name] for name in config.free_params], config), rel=1e-3
+        )

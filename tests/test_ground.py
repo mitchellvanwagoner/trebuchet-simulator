@@ -127,8 +127,14 @@ def test_a_sling_that_reaches_the_ground_starts_the_projectile_lying_on_it():
     The projectile goes as far back from the pivot as the sling reaches, on the side the
     cocked tip leans towards - which is the side away from the throw, so the launch sweeps
     it up and across rather than dragging it back through the frame.
+
+    On a machine whose cocked tip stands no higher than its sling is long, which is a
+    property of the geometry rather than of the linkage. The shipped traditional default
+    used to be one and is not any more - it is optimizer output now, and the search picked
+    a short arm under a tall pivot - so this asks the machine that still is (the same one
+    the grounded-start regimes below are checked on).
     """
-    params = default_params(MachineType.TRADITIONAL)
+    params = TrebuchetParams(machine=MachineType.TRADITIONAL, **TAUT_GROUND_START_PARAMS)
     simulator = TrebuchetSimulator(params)
     state = simulator.ground_start_state()
 
@@ -182,8 +188,8 @@ def test_a_machine_can_start_in_the_grounded_regimes_rather_than_reach_them(
     Which grounded regime it starts in is then decided by the constraint forces at that
     cocked pose rather than assumed - a sling laid out slack carries nothing until the arm
     has taken up the slack, while one already at full stretch drags the stone along the
-    ground - and the third answer, a sling that snatches it straight up, is the shipped
-    traditional machine's own (see test_a_sling_that_reaches_the_ground_...).
+    ground. The third answer, a sling that snatches it straight up before it can drag, is
+    what _initial_launch_regime returns TAUT for.
     """
     result = simulate_trebuchet(TrebuchetParams(machine=MachineType.TRADITIONAL, **values))
     regimes = [seg.regime for seg in result.solution.segments]
@@ -267,11 +273,13 @@ def test_a_dragged_projectile_is_pressed_down_and_pulled_along():
 def test_the_projectile_spends_potential_energy_from_where_it_actually_started():
     """Efficiency divides by the potential energy the launch spent, so the pose matters.
 
-    The traditional machine's default geometry used to credit the launch with a fall from
-    23 mm underground, which is where the hanging pose put a projectile that in fact rests
-    on the surface.
+    The traditional machine's original default geometry used to credit the launch with a
+    fall from 23 mm underground, which is where the hanging pose put a projectile that in
+    fact rests on the surface. Asked here of a machine that still loads on the ground; the
+    shipped traditional default hangs its stone (see
+    test_a_sling_that_reaches_the_ground_starts_the_projectile_lying_on_it).
     """
-    params = default_params(MachineType.TRADITIONAL)
+    params = TrebuchetParams(machine=MachineType.TRADITIONAL, **TAUT_GROUND_START_PARAMS)
     result = simulate_trebuchet(params)
 
     assert result.solution.projectile_state(0.0)[0][1] == 0.0

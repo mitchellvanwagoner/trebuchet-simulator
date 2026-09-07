@@ -112,6 +112,11 @@ Two counterweight linkages, sharing one set of equations of motion:
   `length_counterweight` behind the pivot, so it swings around with the arm and
   on its own pin as well. The beam carries mass on both sides of the pivot.
 
+Either way the weight hangs on a link the model holds rigid, and a rigid link
+can push where a real rope or chain would simply go slack — so both machines
+report a minimum tension and a compression impulse for it, and the optimizer
+charges for the impulse. A design that needs the link to push is not a machine.
+
 That one difference propagates: each machine has its own cocked arm angle, its
 own default geometry, and its own linkage parameter in the optimizer's search
 space (`pulley_radius` or `length_counterweight` — never both). Pick the

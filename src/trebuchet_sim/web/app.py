@@ -774,12 +774,15 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             f"{result.metrics.get('projectile_ground_fraction', 0.0) * 100:.0f}% of the throw. "
             "Raise the pivot height or shorten the sling to swing it clear."
         )
-    # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
+    # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope. Both
+    # machines have one - a rope over the axle, or the link a pinned weight hangs on - and
+    # both reach it their own way: the pulley machine by out-accelerating its falling
+    # weight, the traditional one by whipping the weight past its pin.
     if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
         st.warning(
             f"Counterweight rope goes slack (min tension "
-            f"{result.metrics.get('min_cw_rope_tension', 0.0):.1f} N): the arm out-accelerates the "
-            "falling counterweight, so the results are not physical."
+            f"{result.metrics.get('min_cw_rope_tension', 0.0):.1f} N): the link would have to "
+            "push to hold the weight where the model puts it, so the results are not physical."
         )
 
     # Headline range, with how far it landed from the target the optimizer is
@@ -1040,7 +1043,8 @@ with left:
         # Full width rather than a third box in either column: its label doesn't fit the
         # half-width columns above, and the popover floats over the page, so an extra row
         # here costs the one-screen layout nothing.
-        snap_penalty_weight = st.number_input(
+        penalty_snap, penalty_jerk = st.columns(2)
+        snap_penalty_weight = penalty_snap.number_input(
             "Snap penalty",
             min_value=0.0,
             value=max(
@@ -1050,6 +1054,18 @@ with left:
             key=_widget_key("tune", "snap_penalty_weight", machine),
             help="How strongly the objective avoids designs whose sling runs close to slack. "
             "Raise it if the winner still jerks; 0 optimizes on range and efficiency alone.",
+        )
+        jerk_penalty_weight = penalty_jerk.number_input(
+            "Impact penalty",
+            min_value=0.0,
+            value=max(
+                float(saved_target.get("jerk_penalty_weight", OptimizationConfig.jerk_penalty_weight)), 0.0
+            ),
+            step=5.0,
+            key=_widget_key("tune", "jerk_penalty_weight", machine),
+            help="Cost per joule the launch destroys in a sling snap or a ground impact. "
+            "A design that does neither pays nothing, so this only moves machines that "
+            "already jerk - typically ones on a pivot too low to swing the stone clear.",
         )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
@@ -1081,6 +1097,7 @@ with left:
                 "population_size": int(population_size),
                 "absolute_tolerance": absolute_tolerance,
                 "snap_penalty_weight": snap_penalty_weight,
+                "jerk_penalty_weight": jerk_penalty_weight,
             },
         )
         st.toast("Defaults saved")
@@ -1142,6 +1159,7 @@ if optimize_clicked:
             population_size=int(population_size),
             absolute_tolerance=absolute_tolerance,
             snap_penalty_weight=snap_penalty_weight,
+            jerk_penalty_weight=jerk_penalty_weight,
             locked_params=locked,
             fixed_params=fixed_params_all,
             workers=_OPT_WORKERS,

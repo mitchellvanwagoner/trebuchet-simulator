@@ -23,22 +23,25 @@ SLING_TENSION_FLOOR = 1.0
 
 # Canonical defaults for the five optimizable parameters, shared by the CLI,
 # the web UI, and the tests so they can't drift apart. Optimizer output for the
-# 30 m target with the rope-slack penalty active: the sling stays taut for the
-# whole launch and the projectile never touches the ground, so nothing here is
-# resting on a regime the model handles but a builder would not want.
+# 30 m target on the shipped weights and the shipped seed - `trebuchet optimize
+# --target-distance 30` reproduces it - so the sling stays taut for the whole launch,
+# the counterweight rope never pushes and the projectile never touches the ground.
+# Nothing here rests on a regime the model handles but a builder would not want.
 #
-# Re-swept when `pivot_height` rose to 2.5 m. The pulley machine's equations of motion
-# do not contain the pivot height, so the previous set still launched identically - it
-# just released 1.5 m higher and landed 31.37 m out, overshooting the target it was named
-# for by 4.6%. The re-swept set costs 0.5 points of efficiency (90.4% against 90.9%) and
-# buys back the 1.37 m, which is the trade the shipped weights ask for: distance 10
-# against efficiency 5.
+# Re-swept twice. First when `pivot_height` rose to 2.5 m: the pulley machine's equations
+# of motion do not contain the pivot height, so the previous set still launched
+# identically - it just released 1.5 m higher and landed 31.37 m out. Then again when the
+# arm's aerodynamic drag torque was corrected (see physics.TrebuchetSimulator.__init__):
+# the old expression was short a factor of length and overstated the drag on a short arm
+# by 3.1x, so the search had been paying for air resistance this machine does not have.
+# The corrected sweep is 3% shorter in the arm and 5% smaller in the pulley, and reads
+# 93.2% efficiency against the previous set's 90.4%.
 DEFAULT_OPTIMIZABLE_PARAMS = {
-    "counter_weight_mass": 46.111,  # kg
-    "pulley_radius": 0.0197,        # m
-    "arm_length": 0.4322,           # m
-    "string_length": 0.2502,        # m
-    "release_angle": -4.3237,       # radians
+    "counter_weight_mass": 46.058118,  # kg
+    "pulley_radius": 0.018923,         # m
+    "arm_length": 0.418225,            # m
+    "string_length": 0.238384,         # m
+    "release_angle": -4.232393,        # radians
 }
 
 
@@ -65,14 +68,6 @@ class MachineType(str, Enum):
     TRADITIONAL = "traditional"
 
 
-# Canonical defaults for the traditional machine. The arm starts cocked at -135
-# degrees (long arm down and forward, counterweight raised behind the pivot) and the
-# counterweight rides the arm rather than a pulley - so `length_counterweight` replaces
-# `pulley_radius` as the linkage parameter. Geometry is chosen so the tip stands one sling
-# length above the ground, which is what lets the machine be loaded the way a real one is:
-# the projectile lies on the ground at the far end of a sling stretched back behind the
-# pivot (see physics.ground_start_state), rather than dangling from the tip - which on this
-# geometry put it 23 mm underground.
 # Cocked positions. The pulley machine starts with the arm raised at 45 degrees;
 # the traditional one starts at -135 degrees, long arm down and forward with the
 # counterweight raised behind the pivot, which is the mirror image about the
@@ -83,21 +78,38 @@ DEFAULT_INITIAL_ARM_ANGLE.update({
 })
 
 
+# Canonical defaults for the traditional machine, derived exactly the way the pulley
+# machine's are: optimizer output for the 30 m target on the shipped weights and seed,
+# with the fixed geometry below held. The arm starts cocked at -135 degrees (long arm down
+# and forward, counterweight raised behind the pivot) and the counterweight rides the arm
+# rather than a pulley - so `length_counterweight` replaces `pulley_radius` as the linkage
+# parameter.
+#
+# These replace a hand-chosen 50 kg / 0.35 m / 1.8 m beam whose release angle alone had
+# been swept for maximum range. That machine reached its 70.2 m only by driving the
+# counterweight rope into compression - down to -158 N, an impulse of 2.1 N*s - which is a
+# rope pushing, and no machine at all. Nothing measured it at the time: the compression
+# metrics were reported for the pulley machine only, on the reasoning that a pinned link
+# cannot go slack (see physics._cw_link_tension for why a pin does not save it). Holding
+# that beam and only pulling the release angle back to where the rope stays loaded costs
+# 16% of its range; re-deriving the machine instead reaches the 30 m target at 96.8%
+# efficiency on a third of the mass, with every rope loaded throughout.
+#
+# One documented property is gone with the old beam: its cocked tip stood one sling length
+# up, so the stone lay on the ground at the far end of a stretched sling, the way a real
+# machine is loaded. This one's tip stands well above its sling, so the stone hangs.
+# `physics.ground_start_state` still does that whenever the geometry allows it - see the
+# dedicated geometries in tests/test_ground.py.
 DEFAULT_TRADITIONAL_PARAMS = {
-    "counter_weight_mass": 50.0,     # kg
-    "length_counterweight": 0.35,    # m
-    "arm_length": 1.8,               # m
-    "string_length": 1.35,           # m
-    # Swept for maximum range on this geometry, which means the pose above: laid back
-    # along the ground rather than hanging. The two differ by 10.5 degrees of initial sling
-    # lean and the sweep by 4.4 degrees of arm - -4.94 was the answer for the hanging pose,
-    # and reads 63.9 m on the real one against this angle's 70.2 m.
-    "release_angle": -5.016,         # radians
+    "counter_weight_mass": 25.532580,   # kg
+    "length_counterweight": 0.126775,   # m
+    "arm_length": 0.673647,             # m
+    "string_length": 0.408670,          # m
+    "release_angle": -4.723133,         # radians
 }
 
-# Fixed (never-optimized) fields whose defaults also differ per machine. The pivot
-# is tall enough that the cocked arm tip sits one sling length above the ground, so
-# the projectile starts resting on it; the rope length is the pin-to-weight link.
+# Fixed (never-optimized) fields whose defaults also differ per machine: the pivot the
+# machine stands on, and the pin-to-weight link the counterweight hangs from.
 DEFAULT_TRADITIONAL_FIXED = {
     "pivot_height": 2.6,                 # m
     "counter_weight_rope_length": 0.5,   # m
