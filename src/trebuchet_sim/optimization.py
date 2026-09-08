@@ -12,7 +12,7 @@ import numpy as np
 from scipy.optimize import differential_evolution
 
 from trebuchet_sim.config import (
-    DEFAULT_INITIAL_ARM_ANGLE,
+    AUTO_INITIAL_ARM_ANGLE,
     LINKAGE_PARAM,
     MachineType,
     TrebuchetParams,
@@ -48,6 +48,10 @@ def param_names(machine: MachineType = MachineType.PULLEY) -> List[str]:
 _FASTSIM_FIXED_FIELDS = [
     "pivot_height", "pulley_density", "arm_density", "projectile_mass", "projectile_radius",
     "initial_arm_angle", "arm_drag_coefficient", "projectile_drag_coefficient", "joint_friction_coefficient",
+    # Dry friction at the main pivot: a torque that costs the same at every speed, so it
+    # is charged per radian the arm turns rather than per unit of anything the other loss
+    # terms measure. Both fields together give its magnitude.
+    "bearing_friction_coefficient", "pivot_shaft_radius",
     # Sets how fast a pinned counterweight swings, so it is part of the traditional
     # machine's equations of motion rather than just its rendering.
     "counter_weight_rope_length",
@@ -75,7 +79,14 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     # outright, so with the arm at 2.0 m nothing above 1.9 m can ever be scored, and a
     # bound of 2.5 m was search space that only ever produced invalid designs.
     "string_length": (0.1, 2.0),           # m
-    "release_angle": (np.radians(-290), np.radians(-180)),  # rad (-290 to -180 deg)
+    # The release pin's angle, measured from the arm to the sling (see
+    # config.TrebuchetParams.release_angle), not the arm's angle in the world - so the
+    # range is about where a pin can usefully sit rather than about how far the arm turns.
+    # The upper end is under the tightest cocked sling-to-arm angle either machine starts
+    # at, since a pin above where the sling already is cannot catch it on the way down
+    # without a whole extra turn; the lower end is past full extension, where a sling that
+    # has swung out in front of the arm is thrown flattest.
+    "release_angle": (np.radians(-90), np.radians(150)),  # rad
     # Traditional machine only, in the linkage slot where pulley_radius sits otherwise.
     # Capped well under the arm-length bound: a short arm approaching the long one is a
     # balanced beam that throws nothing.
@@ -92,7 +103,7 @@ PARAM_LIMITS: Dict[str, Tuple[float, float]] = {
     "pulley_radius": (0.001, 2.0),                  # m
     "arm_length": (0.05, 10.0),                     # m
     "string_length": (0.05, 10.0),                  # m
-    "release_angle": (np.radians(-360), np.radians(-1)),   # rad
+    "release_angle": (np.radians(-180), np.radians(180)),  # rad
     "length_counterweight": (0.01, 5.0),            # m
 }
 
@@ -120,20 +131,24 @@ class OptimizationConfig:
     efficiency_weight: float = 5.0
     distance_weight: float = 10.0
     mass_weight: float = 0.15
-    # Cost per N*s of counterweight-link "compression impulse". Whatever carries the
-    # weight - a rope over the axle, or the link a pinned weight hangs on - is still a
-    # rigid link in both engines, unlike the sling, which is a rope in both. So it can
-    # push where a real rope or chain would go slack, and a run where it does is
-    # unphysical from that moment on. Penalizing the impulse keeps the search out of
-    # there. It is a feasibility term, not a design preference: there is no version of
-    # the machine the answer describes.
+    # Cost per N*s of the counterweight rope's "compression impulse", on the pulley
+    # machine. That machine hangs its weight on a rope over the axle, which the model
+    # holds rigid; a rope pulls and never pushes, so a run where the model needs it to
+    # push is unphysical from that moment on, and penalizing the impulse keeps the search
+    # out of there. It is a feasibility term, not a design preference: there is no version
+    # of the machine the answer describes.
     #
-    # It is charged on both machines now. It used to be zero for a traditional one - not
-    # because that machine has nothing to charge, but because nothing measured its link
-    # (see physics._cw_link_tension) - and the search went straight for the gap: across a
-    # target sweep every traditional winner came back with the link in compression, down
-    # to -1212 N and 7.9 N*s, while the pulley machine's identical failure mode was
-    # penalized to zero. The same sweep now returns a worst case of -2 N and 0.0014 N*s.
+    # The traditional machine is charged nothing, because it has no rope. Its weight is
+    # pinned to the arm's short end through a rigid link, and a pinned two-force member is
+    # a strut - it carries compression as readily as tension, and does so on the stroke
+    # where the weight is swung rather than dropped. `cw_rope_compression_impulse` is
+    # therefore identically zero for it and this weight has nothing to multiply.
+    #
+    # This has moved twice. It was pulley-only, then charged on both, on the argument that
+    # a pin holds the link's *end* and the weight hangs a further
+    # `counter_weight_rope_length` below it - true of a rope hanger, but that machine is
+    # pinned right through. Charging it cost real designs: the traditional winners it
+    # forbade, down to -1212 N, are strut loads to size for rather than runs to discard.
     slack_penalty_weight: float = 200.0
     # Cost per unit of `sling_tension_deficit` - the share of the launch the sling spent
     # below config.SLING_TENSION_FLOOR projectile weights, weighted by how far below
@@ -206,7 +221,16 @@ class OptimizationConfig:
     # not searched at all, so a range given for one is simply unused.
     param_bounds: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     fixed_params: Dict[str, float] = field(default_factory=dict)
-    seed: int = 572956
+    # 33 rather than the old 572956 because the pulley machine's landscape has one narrow
+    # basin that is much better than the broad one around it, and most seeds miss it. Over
+    # 48 seeds at the 30 m target, 40 converge on a 1.0 m arm releasing at a -69 degree pin
+    # for 73.5% efficiency and score about -235; the 8 that find the narrow one get a
+    # 0.37 m arm at a -4.2 degree pin, 90.1% efficiency and about -282.7. This is not quite
+    # the best of those (-282.636 against -282.833) and is chosen because one seed has to
+    # serve both machines: the traditional search is nearly seed-independent, but not
+    # perfectly, and this seed is within 0.002 of its best where the pulley machine's own
+    # best seed is 0.36 adrift of it.
+    seed: int = 33
     max_iterations: int = 1000
     # scipy multiplies popsize by the number of free params, so 40 means a
     # population of ~200 individuals for the 5-parameter search space.
@@ -346,19 +370,38 @@ def _fastsim_fixed_scalar(config: "OptimizationConfig", name: str) -> float:
     """A fixed (non-optimizable) TrebuchetParams field as a plain float: the config
     override if present, otherwise the dataclass default (matches build_params).
 
-    Two fields have no usable dataclass default. `initial_arm_angle` resolves per machine
-    in __post_init__, so the machine's cocked angle stands in. `counter_weight_rope_length`
-    defaults to None, meaning "one wrap of the pulley"; numba has no None, so it is passed
-    as 0.0 and fastsim applies the same fallback.
+    Two fields have no usable dataclass default, and both mean "resolve it downstream"
+    rather than "use this number". `initial_arm_angle` resolves per machine in
+    __post_init__, and on the traditional machine it resolves from the *arm length* - which
+    differs per individual, so it cannot be a scalar here at all;
+    config.AUTO_INITIAL_ARM_ANGLE is the sentinel that tells fastsim to derive it the same
+    way. `counter_weight_rope_length` defaults to None,
+    meaning "one wrap of the pulley"; numba has no None either, so it is passed as 0.0 and
+    fastsim applies the same fallback.
+
+    An explicit None *in* fixed_params means what an absent key means - "resolve it
+    downstream" - so it falls through to the sentinel above rather than to a number. It
+    used to be coerced to 0.0, which is right for the rope, whose sentinel is 0.0 anyway,
+    and silently wrong for the angle: 0.0 is a perfectly good arm angle, so a machine
+    cocked flat along the ground went to the search with nothing to complain about. The
+    dashboard passes exactly that on the traditional machine, whose cocked angle has no
+    box because it follows the arm length, and the two halves of a run then disagreed
+    about which machine they were: the fast objective scored every candidate at 0 degrees
+    while build_params went on resolving the same design to -140.5, so the reported result
+    - and the design DE returned - came from a machine that was never scored. On the
+    shipped traditional defaults that is a cost of 1069 against the 7.2 the CLI's own dict
+    gets, which is not a tuning difference but a different machine.
     """
     default = getattr(TrebuchetParams, name)
     if default is None:
         if name == "initial_arm_angle":
-            default = DEFAULT_INITIAL_ARM_ANGLE[config.machine]
+            default = AUTO_INITIAL_ARM_ANGLE
         elif name == "counter_weight_rope_length":
             default = 0.0
     value = config.fixed_params.get(name, default)
-    return float(0.0 if value is None else value)
+    if value is None:
+        value = default
+    return float(value)
 
 
 def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.ndarray:
@@ -391,6 +434,7 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
         fixed["pivot_height"], fixed["pulley_density"], fixed["arm_density"],
         fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
+        fixed["bearing_friction_coefficient"], fixed["pivot_shaft_radius"],
         config.machine is MachineType.PULLEY,
         config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
         config.slack_penalty_weight, config.snap_penalty_weight, config.jerk_penalty_weight,

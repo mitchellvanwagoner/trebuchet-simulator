@@ -98,6 +98,9 @@ def _fixed_defaults(machine: MachineType) -> dict:
     box with no default renders blank, which the solver reads as "not ready". A
     saved user_defaults.json used to hide that, so it showed up first on a fresh
     install - an empty TREBUCHET_DATA_DIR, i.e. a newly created container volume.
+    Only the pulley machine has a box to fill: the traditional machine's cocked angle
+    follows its arm length and pivot height (config.resolve_initial_arm_angle) and is
+    reported rather than typed.
     """
     defaults = dict(_DATACLASS_FIXED_DEFAULTS)
     defaults["initial_arm_angle"] = float(DEFAULT_INITIAL_ARM_ANGLE[machine])
@@ -107,12 +110,11 @@ def _fixed_defaults(machine: MachineType) -> dict:
     return defaults
 
 
-# The cocked arm sits on opposite sides of vertical on the two machines - the pulley
-# arm starts raised behind the pivot, the traditional one nose-down in front of it - so
-# one signed range cannot serve both without also admitting the poses that don't throw.
+# Where the pulley machine's cocked arm may be set. Only that machine has the choice:
+# the traditional one is loaded by walking its long arm down to the ground, so its cocked
+# angle is geometry and is derived rather than entered (config.resolve_initial_arm_angle).
 INITIAL_ARM_ANGLE_BOUNDS = {
     MachineType.PULLEY: (math.radians(5.0), math.radians(175.0)),
-    MachineType.TRADITIONAL: (math.radians(-175.0), math.radians(-5.0)),
 }
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
@@ -774,14 +776,16 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             f"{result.metrics.get('projectile_ground_fraction', 0.0) * 100:.0f}% of the throw. "
             "Raise the pivot height or shorten the sling to swing it clear."
         )
-    # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope. Both
-    # machines have one - a rope over the axle, or the link a pinned weight hangs on - and
-    # both reach it their own way: the pulley machine by out-accelerating its falling
-    # weight, the traditional one by whipping the weight past its pin.
+    # 0.05 N*s is the integration-noise floor for the counterweight rope, and only the
+    # pulley machine has one - a rope over the axle, which it can drive into compression by
+    # out-accelerating its own falling weight. The traditional machine's weight is pinned
+    # to the arm on a rigid strut with no rope anywhere in the linkage, so compression
+    # there is a load rather than a fault, it reports exactly zero here, and this never
+    # fires for it (see physics._cw_link_tension).
     if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
         st.warning(
             f"Counterweight rope goes slack (min tension "
-            f"{result.metrics.get('min_cw_rope_tension', 0.0):.1f} N): the link would have to "
+            f"{result.metrics.get('min_cw_rope_tension', 0.0):.1f} N): the rope would have to "
             "push to hold the weight where the model puts it, so the results are not physical."
         )
 
@@ -810,7 +814,7 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
     _metric_grid(
         {
             "Release velocity": _fmt_speed(result.metrics["release_velocity"], imperial),
-            "Release angle": f"{result.metrics['release_angle_deg']:.1f} deg",
+            "Arm angle at release": f"{result.metrics['release_angle_deg']:.1f} deg",
             "Release height": _fmt_length(result.metrics["release_height"], imperial),
             "Time to release": f"{result.metrics['t_release']:.3f} s",
             "Flight time": f"{result.metrics.get('flight_time', 0.0):.2f} s",
@@ -837,7 +841,7 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             "Arm length": _fmt_length(params.arm_length, imperial),
             "String length": _fmt_length(params.string_length, imperial),
             "String/arm ratio": f"{params.string_arm_ratio:.3f}",
-            "Release angle": f"{math.degrees(params.release_angle):.1f} deg",
+            "Release pin angle": f"{math.degrees(params.release_angle):.1f} deg",
             "Pivot height": _fmt_length(params.pivot_height, imperial),
             "Initial arm angle": f"{math.degrees(params.initial_arm_angle):.1f} deg",
             "CW rope length": _fmt_length(params.initial_cw_rope_length, imperial),
@@ -876,13 +880,18 @@ with left:
         # machine we already had rather than leaving the page with no machine at all.
         or st.session_state.get("_machine_was", MachineType.PULLEY.value)
     )
-    angle_min, angle_max = INITIAL_ARM_ANGLE_BOUNDS[machine]
-
     grid3, grid4 = st.columns(2)
     pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, machine, imperial=imperial)
-    initial_arm_angle = _fixed_input(
-        grid4, "Initial arm angle", "initial_arm_angle", angle_min, angle_max, machine, kind="angle",
-    )
+    # Only the pulley machine gets a cocked-angle box. The traditional machine is loaded
+    # by walking its long arm down until the tip is a hair off the ground, so its angle
+    # follows the arm length and the pivot height rather than being chosen; None here
+    # means TrebuchetParams derives it, and the Specifications panel reports what it got.
+    initial_arm_angle = None
+    if machine is MachineType.PULLEY:
+        angle_min, angle_max = INITIAL_ARM_ANGLE_BOUNDS[machine]
+        initial_arm_angle = _fixed_input(
+            grid4, "Initial arm angle", "initial_arm_angle", angle_min, angle_max, machine, kind="angle",
+        )
     projectile_mass = _fixed_input(
         grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, machine, kind="mass", imperial=imperial
     )
@@ -890,7 +899,8 @@ with left:
         grid4, "Projectile radius", "projectile_radius", 0.001, 1.0, machine, imperial=imperial
     )
     counter_weight_rope_length = _fixed_input_optional(
-        grid3, "CW rope length", "counter_weight_rope_length", 0.001, 5.0, machine, imperial=imperial,
+        grid4 if machine is MachineType.TRADITIONAL else grid3,
+        "CW rope length", "counter_weight_rope_length", 0.001, 5.0, machine, imperial=imperial,
         help=(
             "Rope from the pivot axle to the counterweight at t=0. Leave blank to "
             "default to 2x the pulley radius (one wrap)."
@@ -906,7 +916,13 @@ with left:
         projectile_mass=projectile_mass,
         projectile_radius=projectile_radius,
     )
-    fixed_ready = all(v is not None for v in fixed_values.values())
+    # A blank box means "still typing" and blocks the solve - except on the traditional
+    # machine's cocked angle, which has no box at all and is meant to arrive as None.
+    fixed_ready = all(
+        value is not None
+        for name, value in fixed_values.items()
+        if not (name == "initial_arm_angle" and machine is MachineType.TRADITIONAL)
+    )
     if not fixed_ready:
         st.error("All fixed system parameters are required.")
 
@@ -932,7 +948,11 @@ with left:
         (grid2, linkage_label, linkage, "length", linkage_help),
         (grid1, "Arm length", "arm_length", "length", None),
         (grid2, "String length", "string_length", "length", None),
-        (grid1, "Release angle", "release_angle", "angle", None),
+        (grid1, "Release pin angle", "release_angle", "angle",
+         "Where the release pin sits, measured from the arm to the sling: 0 is a sling "
+         "lying straight out along the arm, positive is a sling trailing behind the tip. "
+         "The pin turns with the arm, so this - not the arm's angle in the world - is "
+         "what a real machine can actually be built to."),
     ]
     optimizable_values, optimizable_raw, optimizable_locked = {}, {}, {}
     for container, label, name, kind, help_text in rows:

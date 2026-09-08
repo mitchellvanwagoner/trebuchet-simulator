@@ -51,7 +51,8 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
         print(f"  CW arm length: {params.length_counterweight:.3f} m")
     print(f"  Arm length: {params.arm_length:.3f} m")
     print(f"  String length: {params.string_length:.3f} m")
-    print(f"  Release angle: {math.degrees(params.release_angle):.1f} deg")
+    print(f"  Release pin angle: {math.degrees(params.release_angle):.1f} deg (sling, from the arm)")
+    print(f"  Cocked arm angle: {math.degrees(params.initial_arm_angle):.1f} deg")
     print(f"  String/Arm ratio: {params.string_arm_ratio:.3f}")
     print(f"  Total mass: {params.total_mass:.1f} kg")
 
@@ -119,9 +120,11 @@ def print_simulation_results(params: TrebuchetParams, result: SimulationResult) 
                 f"along it for {result.metrics.get('projectile_ground_fraction', 0.0) * 100:.0f}% "
                 "of the throw. Raise --pivot-height or shorten the sling."
             )
-        # 0.05 N*s is the integration-noise floor for the rigid-link counterweight rope.
-        # Reported on both machines: a pinned weight still hangs on a link this model holds
-        # rigid, and it pushes wherever the weight whips past its pin.
+        # 0.05 N*s is the integration-noise floor for the counterweight rope. The pulley
+        # machine is the only one with a rope to go slack; the traditional machine's weight
+        # is pinned to the arm on a rigid strut, which carries compression by design, so
+        # that machine reports exactly zero here and never trips this (see
+        # physics._cw_link_tension).
         if result.metrics.get("cw_rope_compression_impulse", 0.0) > 0.05:
             print(
                 f"  [WARNING] Counterweight rope goes slack (min tension "
@@ -154,7 +157,7 @@ def _parse_range(spec: str) -> tuple:
     """Parse NAME=MIN:MAX. As with _parse_lock, the name is checked in cmd_optimize.
 
     Colon-separated rather than a second '=' so a negative bound reads naturally:
-    release_angle=-5.06:-3.14.
+    release_angle=-1.0:2.6.
     """
     name, _, span = spec.partition("=")
     low, sep, high = span.partition(":")
@@ -178,7 +181,13 @@ def _machine_defaults(machine: MachineType) -> dict:
     values = dict(DEFAULT_MACHINE_PARAMS[machine])
     values["pivot_height"] = fixed.get("pivot_height", TrebuchetParams.pivot_height)
     values["counter_weight_rope_length"] = fixed.get("counter_weight_rope_length")
-    values["initial_arm_angle"] = DEFAULT_INITIAL_ARM_ANGLE[machine]
+    # None on the traditional machine, whose cocked angle is not a choice at all: it is
+    # whatever walks the long arm down to the ground, so it follows the arm length and the
+    # pivot height and TrebuchetParams derives it (config.resolve_initial_arm_angle).
+    # _default_note prints such an entry as "auto".
+    values["initial_arm_angle"] = (
+        DEFAULT_INITIAL_ARM_ANGLE[machine] if machine is MachineType.PULLEY else None
+    )
     return values
 
 
@@ -306,10 +315,12 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     # The machine's own fixed geometry, so `optimize --machine traditional` starts from a
     # buildable machine instead of the pulley machine's 1 m pivot.
     defaults = _machine_defaults(machine)
-    fixed = {
-        "pivot_height": defaults["pivot_height"],
-        "initial_arm_angle": defaults["initial_arm_angle"],
-    }
+    fixed = {"pivot_height": defaults["pivot_height"]}
+    # Pinned only where it is a real choice. On the traditional machine the cocked angle
+    # follows the arm length, which is exactly what the search is varying, so pinning it
+    # would freeze the pose at one candidate's geometry and apply it to all of them.
+    if defaults["initial_arm_angle"] is not None:
+        fixed["initial_arm_angle"] = defaults["initial_arm_angle"]
     if defaults["counter_weight_rope_length"] is not None:
         fixed["counter_weight_rope_length"] = defaults["counter_weight_rope_length"]
 
@@ -379,7 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sim_parser.add_argument("--arm-length", type=float, help=_default_note("arm_length", "m"))
     sim_parser.add_argument("--string-length", type=float, help=_default_note("string_length", "m"))
-    sim_parser.add_argument("--release-angle", type=float, help=_default_note("release_angle", "radians"))
+    sim_parser.add_argument(
+        "--release-angle", type=float,
+        help=_default_note("release_angle", "radians, sling-to-arm angle the pin releases at"),
+    )
     sim_parser.add_argument("--pivot-height", type=float, help=_default_note("pivot_height", "m"))
     sim_parser.add_argument(
         "--initial-arm-angle", type=float, help=_default_note("initial_arm_angle", "radians"),
@@ -449,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=MIN:MAX",
         help="Narrow (or widen) the search range for a parameter, instead of the default "
              "bounds. Repeatable, same parameter names as --lock. Angles in radians, e.g. "
-             "--range arm_length=0.3:0.8 --range release_angle=-5.0:-4.0",
+             "--range arm_length=0.3:0.8 --range release_angle=0.2:1.2",
     )
     _add_output_args(opt_parser)
     opt_parser.set_defaults(func=cmd_optimize)

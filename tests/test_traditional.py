@@ -8,6 +8,7 @@ the pulley machine.
 import numpy as np
 import pytest
 
+from trebuchet_sim import config
 from trebuchet_sim.config import (
     G,
     DEFAULT_INITIAL_ARM_ANGLE,
@@ -36,11 +37,37 @@ def test_machine_type_round_trips_through_a_plain_string():
 
 
 def test_initial_arm_angle_resolves_per_machine():
-    """None is not a usable start angle - __post_init__ fills in the machine's own."""
+    """None is not a usable start angle - __post_init__ resolves the machine's own.
+
+    The pulley machine's is a constant. The traditional machine's is geometry: whatever
+    puts the long arm's tip TRADITIONAL_START_CLEARANCE off the ground, on the branch that
+    has it down and behind the pivot. So it moves with the arm length and the pivot height
+    rather than being a number to keep in step with them by hand.
+    """
     assert TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS).initial_arm_angle == (
         DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY]
     )
-    assert traditional_params().initial_arm_angle == DEFAULT_INITIAL_ARM_ANGLE[MachineType.TRADITIONAL]
+
+    params = traditional_params()
+    tip_height = (
+        params.arm_length * np.sin(params.initial_arm_angle) + params.pivot_height
+    )
+    assert tip_height == pytest.approx(config.TRADITIONAL_START_CLEARANCE)
+    assert -np.pi < params.initial_arm_angle < -np.pi / 2  # down, and behind the pivot
+
+    # Lengthen the arm and the same rule lays it down further round.
+    longer = traditional_params(arm_length=params.arm_length * 1.5)
+    assert longer.initial_arm_angle < params.initial_arm_angle
+    assert longer.arm_length * np.sin(longer.initial_arm_angle) + longer.pivot_height == (
+        pytest.approx(config.TRADITIONAL_START_CLEARANCE)
+    )
+
+    # An arm too short to reach the ground is cocked as low as it goes, which is straight
+    # down - and there every gravity torque carries a cos(theta) and vanishes, so the
+    # machine sits on its own balance point and does not launch. That is the geometry
+    # reporting a pivot too tall for the arm, not a defect.
+    unreachable = traditional_params(arm_length=0.3, string_length=0.2)
+    assert unreachable.initial_arm_angle == pytest.approx(-np.pi / 2)
 
 
 def test_traditional_machine_releases_and_throws():
@@ -64,13 +91,22 @@ def test_traditional_launch_conserves_energy_with_dissipation_switched_off():
     enough to look suspicious.
     """
     params = traditional_params(
-        arm_drag_coefficient=0.0, projectile_drag_coefficient=0.0, joint_friction_coefficient=0.0
+        arm_drag_coefficient=0.0, projectile_drag_coefficient=0.0, joint_friction_coefficient=0.0,
+        bearing_friction_coefficient=0.0,
     )
     result = simulate_trebuchet(params, track_energy=True)
 
-    assert result.metrics["string_slack_fraction"] == 0.0  # no snap losses either
+    # This machine is loaded on the ground, so its launch does contain one discontinuity -
+    # the sling coming taut over the stone and picking it up - and that is a real loss
+    # rather than drift. Everything either side of it has to be flat, so the drift is
+    # measured against the total the launch is *allowed* to lose, which the launch reports
+    # for itself.
+    allowed = result.metrics["sling_snap_energy"] + result.metrics["projectile_ground_energy"]
+    assert allowed > 0.0
     totals = np.array([entry["total"] for entry in result.energy_history])
-    assert np.max(np.abs(totals - totals[0])) < 1e-6 * abs(totals[0])
+    drop = totals[0] - totals
+    assert drop.min() > -1e-6 * abs(totals[0])            # never gains
+    assert drop.max() == pytest.approx(allowed, rel=1e-3)  # loses exactly what it recorded
 
 
 def test_counterweight_swing_is_inert_on_the_pulley_machine():
@@ -131,24 +167,31 @@ def test_pinned_counterweight_hangs_from_the_arm_not_the_axle():
     assert pin_y > params.pivot_height
 
 
-def test_the_pinned_counterweight_link_is_graded_like_the_pulley_machine_s_rope():
-    """A pin holds the link's end, not its length.
+def test_the_pinned_counterweight_link_reports_its_load_but_is_never_charged():
+    """This machine has no rope in its counterweight linkage, so it has none to go slack.
 
-    These metrics were reported for the pulley machine alone, on the reading that a pinned
-    counterweight has no rope to go slack. It has: the weight hangs a further
-    `counter_weight_rope_length` below that pin, on a link this model holds rigid exactly
-    as it holds the pulley machine's rope rigid, and a rigid link pushes where a rope would
-    let go. Nothing measured that, so the optimizer designed straight into it - every
-    traditional winner across a target sweep came back with the link in compression, down
-    to -1212 N, while the pulley machine's equivalent was penalized to zero.
+    The weight is pinned to the arm's short end, and a pinned two-force member is a strut:
+    it carries compression as readily as tension. So `cw_rope_compression_impulse` - a
+    rope-feasibility measure - is identically zero here whatever the link does, while
+    `min_cw_rope_tension` still reports the load, because the peak compressive force is
+    something a builder has to size the member for.
 
-    The shipped defaults keep it loaded the whole way, which is the point of measuring it.
+    The reading has moved twice. The metrics were pulley-only, then charged on both
+    machines on the argument that a pin holds the link's *end* rather than its length and
+    the weight hangs a further `counter_weight_rope_length` below it. That is right for a
+    rope hanger and wrong here: this linkage is pinned right through.
+
+    The shipped defaults happen to keep the link in tension throughout, so this asserts
+    both that the load is reported and that the fault metric is dead.
     """
     result = simulate_trebuchet(traditional_params())
 
     assert result.metrics["min_cw_rope_tension"] > 0.0
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
-    assert result.metrics["min_string_tension"] > 0.0
+    # The sling reads exactly zero while the machine is taking up the slack it was loaded
+    # with, and never less: a rope carries nothing or it pulls.
+    assert result.metrics["min_string_tension"] == 0.0
+    assert result.metrics["string_compression_impulse"] < 1e-9
 
 
 def test_traditional_aftermath_runs_as_one_regime_and_stops_at_the_ground():
@@ -305,7 +348,8 @@ def test_both_engines_agree_on_the_fallback_link_length():
         params.pivot_height, params.pulley_density, params.arm_density,
         params.projectile_mass, params.projectile_radius, params.initial_arm_angle,
         params.arm_drag_coefficient, params.projectile_drag_coefficient,
-        params.joint_friction_coefficient, False,
+        params.joint_friction_coefficient, params.bearing_friction_coefficient,
+        params.pivot_shaft_radius, False,
     )
 
     assert fast[0] is reference.metrics["release_occurred"]
@@ -344,10 +388,20 @@ def test_the_counterweight_link_tension_matches_the_measured_acceleration():
     # solver's rtol. One difference of a velocity the model states in closed form leaves
     # the interpolant as the only error left, which is what the 0.2% bound is - the
     # formula itself is pinned exactly by the at-rest anchor above.
+    # Sampled inside the taut segments only, and never across a segment boundary: the
+    # machine's angular acceleration steps at every regime change, so a central difference
+    # spanning one measures the discontinuity rather than the motion. This machine is
+    # loaded on the ground, so its launch has at least one.
+    def taut_window(t):
+        seg = sol._segment_at(t)
+        return seg.regime == "taut" and seg.t0 + 4 * h < t < seg.t1 - 4 * h
+
     h = 1e-5
     checked = 0
-    for t in np.linspace(4 * h, sol.t_end - 4 * h, 40):
+    for t in np.linspace(4 * h, sol.t_end - 4 * h, 200):
         t = float(t)
+        if not taut_window(t):
+            continue
         y = sol._y_at(t)[1]
         theta, theta_dot, psi, psi_dot = y[0], y[1], y[4], y[5]
         closed_form = simulator._cw_link_tension(
@@ -360,30 +414,44 @@ def test_the_counterweight_link_tension_matches_the_measured_acceleration():
         assert closed_form == pytest.approx(measured, rel=2e-3, abs=1e-2)
         checked += 1
 
-    assert checked == 40
+    assert checked > 20
     assert l_w > 0  # there is a link to have a tension at all
 
 
-def test_a_whipping_counterweight_pushes_its_link_and_is_reported_for_it():
-    """The failure mode the pulley machine has always been graded on, on this linkage.
+def test_a_whipping_counterweight_pushes_its_pinned_link_and_is_not_charged_for_it():
+    """A pinned link is a strut, so pushing is a load to size for, not a fault.
 
     A short lever swinging a weight on a long link whips it past the pin, and the link has
-    to push to keep up - which a rope cannot do. It is the region the optimizer used to
-    walk straight into, so the metrics have to see it.
+    to push to keep up. On the pulley machine the same sign would be a rope pushing, which
+    is no machine at all and is charged as a compression impulse. Here there is no rope
+    anywhere in the linkage - the weight is pinned to the arm's short end - and a pinned
+    two-force member carries compression as readily as tension.
+
+    So both halves matter: the tension diagnostic still has to *see* the compression,
+    because -900 N is a real member load somebody has to build for, and the feasibility
+    impulse has to stay at exactly zero, because there is nothing infeasible about it.
+    This design used to be scored out of contention for it.
     """
     params = traditional_params(
-        counter_weight_mass=50.0, length_counterweight=0.35, arm_length=1.8,
-        string_length=1.35, release_angle=-5.016,
+        counter_weight_mass=54.584208, length_counterweight=0.320627, arm_length=1.234251,
+        string_length=0.530571, release_angle=1.031954, pivot_height=0.914917,
+        counter_weight_rope_length=0.584211,
     )
     result = simulate_trebuchet(params)
 
     assert result.metrics["release_occurred"] is True
-    assert result.metrics["min_cw_rope_tension"] < -100.0
-    assert result.metrics["cw_rope_compression_impulse"] > 1.0
-    # And nothing else about the launch complains: the sling is loaded the whole way and
-    # the stone never touches the ground, so this is the only term that can catch it.
-    assert result.metrics["sling_tension_deficit"] == 0.0
+    assert result.distance > 20.0  # and it is not a wreck: it throws as far as the default
+    # The load is real and is reported.
+    assert result.metrics["min_cw_rope_tension"] < -900.0
+    # And it is not a fault: no rope, nothing to go slack, nothing to charge.
+    assert result.metrics["cw_rope_compression_impulse"] == 0.0
+    # Nothing else singles this design out either. Its slack share is the loading stroke
+    # every machine of this kind makes, its snap is that stroke ending, and the stone
+    # never touches the ground after it - so with the link no longer charged, the design
+    # stands or falls on range and efficiency like any other.
     assert result.metrics["projectile_ground_contacts"] == 0
+    assert result.metrics["sling_snap_count"] == 1
+    assert result.solution.segments[0].regime == "slack_ground"
 
 
 def test_the_aftermath_carries_the_counterweight_swing_across_release():

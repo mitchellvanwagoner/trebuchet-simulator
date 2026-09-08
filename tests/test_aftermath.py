@@ -121,7 +121,8 @@ def test_sample_full_timeline_ends_at_projectile_impact():
     positions = sample_full_timeline(params, result, [t_end])
 
     assert positions["projectile"][0][0] == pytest.approx(result.distance, rel=1e-6)
-    assert positions["projectile"][0][1] == pytest.approx(0.0, abs=1e-6)
+    # Resting on the ground means the stone's centre at its own radius, not in the dirt.
+    assert positions["projectile"][0][1] == pytest.approx(params.projectile_radius, abs=1e-6)
 
 
 def test_sample_full_timeline_clamps_grounded_counterweight_bottom_face_to_ground():

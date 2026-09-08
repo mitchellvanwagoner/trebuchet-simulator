@@ -2,12 +2,20 @@ import pytest
 
 import numpy as np
 
-from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, MachineType, TrebuchetParams
+from trebuchet_sim.config import (
+    AUTO_INITIAL_ARM_ANGLE,
+    DEFAULT_MACHINE_FIXED,
+    DEFAULT_MACHINE_PARAMS,
+    DEFAULT_OPTIMIZABLE_PARAMS,
+    MachineType,
+    TrebuchetParams,
+)
 from trebuchet_sim.optimization import (
     PARAM_BOUNDS,
     PARAM_LIMITS,
     PARAM_NAMES,
     OptimizationConfig,
+    _fastsim_fixed_scalar,
     _objective,
     _objective_vectorized,
     optimize_trebuchet,
@@ -57,18 +65,28 @@ def test_objective_penalizes_slack_sling_solutions():
     # A jerky parameter set (the pre-slack-penalty optimizer defaults) holds the sling
     # in compression, so the slack penalty must raise its cost by weight * impulse.
     jerky = {
-        "counter_weight_mass": 16.865,
-        "pulley_radius": 0.121,
-        "arm_length": 0.813,
-        "string_length": 0.669,
-        "release_angle": -4.877,
+        "counter_weight_mass": 41.795496,
+        "pulley_radius": 0.554577,
+        "arm_length": 1.637497,
+        "string_length": 1.493071,
+        "release_angle": 2.253022,
     }
+    fixed = {"pivot_height": 1.764323}
     free_values = [jerky[name] for name in PARAM_NAMES]
 
-    base = _objective(free_values, OptimizationConfig(slack_penalty_weight=0.0))
-    penalized = _objective(free_values, OptimizationConfig(slack_penalty_weight=200.0))
+    base = _objective(free_values, OptimizationConfig(slack_penalty_weight=0.0, fixed_params=dict(fixed)))
+    penalized = _objective(
+        free_values, OptimizationConfig(slack_penalty_weight=200.0, fixed_params=dict(fixed))
+    )
 
-    assert penalized > base + 100.0  # this set has ~1.2 N*s of compression impulse
+    # It scores at all, so the gap between the two is the penalty and nothing else - and
+    # the gap is exactly weight * impulse, which is the whole claim.
+    assert base < 1e6
+    impulse = simulate_trebuchet(
+        TrebuchetParams(**jerky, **fixed), rtol=1e-6, dense_output=False
+    ).metrics["cw_rope_compression_impulse"]
+    assert impulse > 1.0
+    assert penalized - base == pytest.approx(200.0 * impulse, rel=1e-6)
 
 
 # Copied from tests/test_physics.py: a sling that never detaches but runs on almost no
@@ -76,12 +94,12 @@ def test_objective_penalizes_slack_sling_solutions():
 # snap energy, both compression impulses - reads exactly zero for it. The raised pivot
 # is part of the fixture; see the copy in test_physics.py for why.
 MARGINAL_SLING_PARAMS = {
-    "counter_weight_mass": 21.396,
-    "pulley_radius": 0.0229,
-    "arm_length": 0.9,
-    "string_length": 0.416,
-    "release_angle": -4.064,
-    "pivot_height": 1.5,
+    "counter_weight_mass": 59.251943,
+    "pulley_radius": 0.053070,
+    "arm_length": 0.639161,
+    "string_length": 0.560699,
+    "release_angle": -0.101006,
+    "pivot_height": 2.5,
 }
 
 # The five design variables and the geometry they were measured on, in the two shapes
@@ -287,3 +305,45 @@ def test_both_engines_charge_the_same_jerk_cost():
         assert _objective_vectorized(values, config)[0] == pytest.approx(
             _objective([JERK_PARAMS[name] for name in config.free_params], config), rel=1e-3
         )
+
+
+def test_a_none_fixed_param_means_the_same_as_leaving_it_out():
+    """`fixed_params={"initial_arm_angle": None}` must not become a real arm angle.
+
+    The dashboard has no cocked-angle box on the traditional machine - that angle follows
+    the arm length, which is what the search varies - so it passes None, meaning what an
+    absent key means: resolve it per individual. It used to be coerced to 0.0, which is
+    harmless for the counterweight rope, whose "unset" sentinel is 0.0 anyway, and silent
+    for the angle, because 0.0 radians is a perfectly good arm cocked flat along the
+    ground. The two halves of a run then described different machines: the fast objective
+    scored every candidate at 0 degrees while build_params resolved the same design to
+    -140.5, so the design DE returned and the result reported beside it came from a
+    machine nothing had scored. On these defaults that is a cost of about 1069 against
+    about 7.2.
+    """
+    machine = MachineType.TRADITIONAL
+    fixed = dict(DEFAULT_MACHINE_FIXED[machine])
+    absent = OptimizationConfig(machine=machine, fixed_params=dict(fixed))
+    explicit = OptimizationConfig(
+        machine=machine, fixed_params=dict(fixed, initial_arm_angle=None)
+    )
+
+    assert _fastsim_fixed_scalar(explicit, "initial_arm_angle") == AUTO_INITIAL_ARM_ANGLE
+    assert _fastsim_fixed_scalar(explicit, "initial_arm_angle") == _fastsim_fixed_scalar(
+        absent, "initial_arm_angle"
+    )
+    # And the sentinel has to survive all the way to a score, not just to the scalar: the
+    # angle it stands for is the one the reference resolves geometrically, so the two
+    # configs must price the same design identically.
+    values = np.array(
+        [[DEFAULT_MACHINE_PARAMS[machine][name]] for name in absent.free_params],
+        dtype=np.float64,
+    )
+    assert _objective_vectorized(values, explicit)[0] == pytest.approx(
+        _objective_vectorized(values, absent)[0], rel=1e-9
+    )
+    # The angle both of them mean, for good measure: walked down to the ground, not flat.
+    assert explicit.build_params(values[:, 0]).initial_arm_angle == pytest.approx(
+        absent.build_params(values[:, 0]).initial_arm_angle
+    )
+    assert explicit.build_params(values[:, 0]).initial_arm_angle < -np.pi / 2

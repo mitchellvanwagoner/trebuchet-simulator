@@ -7,7 +7,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from trebuchet_sim.config import ARM_CROSS_SECTION_WIDTH, G, RHO_AIR, SLING_TENSION_FLOOR, TrebuchetParams
+from trebuchet_sim.config import (
+    ARM_CROSS_SECTION_WIDTH,
+    G,
+    PIVOT_FRICTION_SMOOTHING,
+    RHO_AIR,
+    SLING_TENSION_FLOOR,
+    TrebuchetParams,
+)
 from trebuchet_sim.trajectory import BallisticTrajectory, integrate_ballistic_trajectory
 
 # Launch state, taut sling: theta (arm), alpha (sling), psi (counterweight swing).
@@ -36,6 +43,37 @@ GROUNDED_REGIMES = (TAUT_GROUND, SLACK_GROUND)
 # destroys energy, so the switching always dies out; the cap only guards against
 # numerical chatter right at a regime boundary.
 MAX_LAUNCH_SEGMENTS = 200
+
+# Three running integrals ride along at the end of every state vector, whatever the
+# regime: the sling's compression impulse, the counterweight link's, and the sling's
+# tension deficit (see _tension_metrics for what each one means).
+#
+# They are states rather than a quadrature summed afterwards because the objective reads
+# two of them, and the integrator is the only thing that knows where its own steps should
+# fall. Summed over accepted steps with a trapezoid, they were second-order quadratures on
+# a grid the integrator had sized for the fifth-order dynamics - and worse, their
+# integrands have kinks (at zero tension, and at the deficit floor) that the dynamics do
+# not, so the step grid was blind to exactly the features carrying the value. Between rtol
+# 1e-6 and 1e-10 that moved the deficit by up to 0.021 and the counterweight impulse by
+# 6.9%, which at the shipped penalty weights is 21 and 100 cost units - a 2% and a 10%
+# miss on the target distance, out of integration noise alone. As states they are advanced
+# by the same fifth-order weights as everything else, and their error is measured.
+N_QUADRATURE = 3
+# Absolute tolerance for those three, in place of the 1e-6 the physical states get. It is
+# theirs rather than shared because they are the awkward integrands: they start at exactly
+# zero and the counterweight's is a narrow spike over a launch that is otherwise flat, so
+# they need the error demand set against what they are worth rather than against the
+# dynamics carrying them.
+#
+# 1e-7 is measured. Comparing the shipped pulley machine's metrics at rtol 1e-6 against
+# rtol 1e-10 - which is what "converged" means for a quantity like this - the counterweight
+# impulse settles from 8.7e-4 N*s apart at 1e-4 to 2e-5 at 1e-7, and the deficit from
+# 2.3e-3 to 3e-6. At the shipped penalty weights that is the difference between about 2.5
+# cost units of integration noise and 0.007, against a distance term worth 10 per 1% of
+# target. It costs 60% more accepted steps (21 to 34 on that launch), which is the price of
+# resolving a spike the dynamics alone never asked the stepper to look at.
+QUADRATURE_ATOL = 1e-7
+STATE_ATOL = 1e-6  # scipy's own default, spelled out so the vector above can be built
 
 
 @dataclass
@@ -324,6 +362,11 @@ class TrebuchetSimulator:
         self._l_a, self._l_s = l_a, l_s
         self._m_p = m_p
         self._h_T = p.pivot_height
+        # A resting sphere sits on the ground at its own radius, not with its centre in
+        # the dirt. Every ground test the launch makes - the two landing events, the
+        # re-tension over a grounded projectile, the loading pose, and the geometry the
+        # grounded regimes solve - is against this line rather than y = 0.
+        self._ground_y = p.projectile_radius
         # The counterweight's contribution is the only thing that differs between
         # the two machines (see config.MachineType), and it enters in exactly two
         # places: an inertia about the pivot, and a gravity torque.
@@ -386,6 +429,33 @@ class TrebuchetSimulator:
         self._proj_gravity_theta_k = m_p * G * l_a
         self._proj_gravity_alpha_k = m_p * l_s * G
         self._joint_friction = p.joint_friction_coefficient
+        # Dry friction at the main bearing: a constant-magnitude torque opposing rotation,
+        # regularized by _friction_eps so it is smooth through theta_dot = 0 instead of a
+        # sign function the integrator has to chase. Unlike drag (theta_dot^2) and the
+        # viscous term (theta_dot), this one costs the same at every speed, so what it
+        # charges for is how far the arm turns - see TrebuchetParams.pivot_friction_torque.
+        self._pivot_friction = p.pivot_friction_torque
+        self._friction_eps = PIVOT_FRICTION_SMOOTHING
+        # Once the counterweight is lying on the ground it is not bearing on the pivot any
+        # more, so the friction it was causing goes with it. Only the post-release slack
+        # regime reaches this - during the launch the weight is always hanging - and
+        # without it the bare arm, which has a hundredth of the machine's inertia, is left
+        # fighting the whole machine's friction and stops dead in a few hundredths of a
+        # second.
+        self._pivot_friction_unloaded = (
+            p.bearing_friction_coefficient * p.pivot_shaft_radius
+            * (p.total_mass - p.counter_weight_mass) * G
+        )
+        # Only a rope can be faulted for pushing, and only the pulley machine hangs its
+        # weight on one (see _quadrature_rates and _cw_link_tension).
+        self._grades_cw_link = p.has_pulley
+        # The deficit's own floor, in newtons, so the running integral means the same
+        # thing on a 0.15 kg stone as on a 20 kg one (see _tension_metrics).
+        self._tension_floor = SLING_TENSION_FLOOR * m_p * G
+        # Per-component tolerances: the physical states at scipy's default, the three
+        # trailing integrals looser (see QUADRATURE_ATOL).
+        self._atol_taut = np.array([STATE_ATOL] * 6 + [QUADRATURE_ATOL] * N_QUADRATURE)
+        self._atol_eight = np.array([STATE_ATOL] * 8 + [QUADRATURE_ATOL] * N_QUADRATURE)
 
         # Post-release aftermath: sling and projectile are gone, so the machine collapses
         # to a single DOF (theta). "Taut" reuses the launch-phase counterweight/pulley/arm
@@ -588,14 +658,20 @@ class TrebuchetSimulator:
         }
 
     def trebuchet_dynamics(self, t: float, y: State) -> List[float]:
-        """Euler-Lagrange equations of motion: state = [theta, theta_dot, alpha, alpha_dot].
+        """Euler-Lagrange equations of motion, plus the three running integrals.
+
+        State is [theta, theta_dot, alpha, alpha_dot, psi, psi_dot] followed by the
+        N_QUADRATURE integrals every regime carries.
 
         This is the ODE hot path (a few hundred calls per simulation, hundreds of
         thousands per optimizer run), so it uses `math` scalar functions and the
         machine constants folded in __init__ rather than numpy scalars and the
-        dataclass properties.
+        dataclass properties. The constraint tensions are worked out here rather than
+        being asked of constraint_tensions: the integrals need them at every stage, and
+        they cost only the trig this already has in hand.
         """
-        theta, theta_dot, alpha, alpha_dot, psi, psi_dot = y
+        theta, theta_dot, alpha, alpha_dot = y[0], y[1], y[2], y[3]
+        psi, psi_dot = y[4], y[5]
         l_a, l_s = self._l_a, self._l_s
 
         sin_t, cos_t = math.sin(theta), math.cos(theta)
@@ -621,6 +697,10 @@ class TrebuchetSimulator:
 
         # Arm aero drag torque always opposes the arm's angular velocity, whichever way it spins
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
+        # Dry bearing friction, same sense, constant magnitude (see __init__).
+        bearing_torque = -self._pivot_friction * theta_dot / math.sqrt(
+            theta_dot * theta_dot + self._friction_eps * self._friction_eps
+        )
 
         # Projectile drag force vector (opposes its velocity). The projectile position depends
         # on both coordinates, so the drag contributes a generalized force on each:
@@ -640,7 +720,8 @@ class TrebuchetSimulator:
             - self._proj_gravity_theta_k * cos_t                         # projectile gravity (via arm)
             + arm_drag_torque                                            # arm drag
             + Q_theta_drag                                               # projectile drag (via arm)
-            - self._joint_friction * theta_dot                           # joint friction
+            - self._joint_friction * theta_dot                           # viscous joint friction
+            + bearing_torque                                             # dry bearing friction
         )
 
         # Generalized forces on alpha (string angle)
@@ -671,13 +752,56 @@ class TrebuchetSimulator:
         A, B, C, D, E = self._M11, M12, M13, self._M22, self._M33
         det = A * D * E - B * B * E - C * C * D
         if abs(det) < 1e-12:
-            return [theta_dot, 0.0, alpha_dot, 0.0, psi_dot, 0.0]
+            return [theta_dot, 0.0, alpha_dot, 0.0, psi_dot, 0.0, 0.0, 0.0, 0.0]
 
         theta_ddot = (D * E * Q_theta - B * E * Q_alpha - C * D * Q_psi) / det
         alpha_ddot = (-B * E * Q_theta + (A * E - C * C) * Q_alpha + B * C * Q_psi) / det
         psi_ddot = (-C * D * Q_theta + B * C * Q_alpha + (A * D - B * B) * Q_psi) / det
 
-        return [theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot]
+        # Newton for the projectile along the string, reusing the trig above; the same
+        # expression constraint_tensions spells out, from the same theta_ddot.
+        radial_acc = (
+            l_a * theta_ddot * sin_at - l_a * theta_dot * theta_dot * cos_at - l_s * alpha_dot**2
+        )
+        string_T = (
+            -self._m_p * G * sin_a
+            - drag_scale * (p_vx * cos_a + p_vy * sin_a)
+            - self._m_p * radial_acc
+        )
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
+        q_string, q_cw, q_def = self._quadrature_rates(string_T, cw_T)
+
+        return [theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot,
+                q_string, q_cw, q_def]
+
+    def _quadrature_rates(self, string_T: float, cw_T: float) -> Tuple[float, float, float]:
+        """Derivatives of the three running integrals, from the two constraint tensions.
+
+        The first two are compression impulses: how hard, and for how long, something that
+        can only pull was pushing instead. The third grades how far *under* a working load
+        the sling ran, which is the continuous signal the optimizer steers by - clamped
+        below at zero as well as above at the floor, so a rope that has already let go is
+        exactly as limp at -400 N as at 0 and the metric stays the [0, 1] share of the
+        launch it claims to be.
+
+        The counterweight's is charged on the pulley machine alone (`_grades_cw_link`),
+        because that is the only machine where a rope carries the weight - over the axle,
+        where it can only pull. The traditional machine's weight is pinned to the arm's
+        short end on a rigid link, and a pinned two-force member carries compression as
+        happily as tension: it is a strut, and pushing is simply what a strut does on the
+        stroke where the weight is being swung rather than falling. There is nothing there
+        for a feasibility term to forbid, so it is not integrated at all.
+        """
+        floor = self._tension_floor
+        loaded = string_T if string_T > 0.0 else 0.0
+        cw_rate = 0.0
+        if self._grades_cw_link and cw_T < 0.0:
+            cw_rate = -cw_T
+        return (
+            -string_T if string_T < 0.0 else 0.0,
+            cw_rate,
+            floor - (floor if loaded > floor else loaded),
+        )
 
     def _first_arm_ground_angle(self) -> float:
         """The largest arm angle below the cocked one at which the beam touches the ground.
@@ -710,15 +834,29 @@ class TrebuchetSimulator:
                          psi: float, psi_dot: float) -> float:
         """Tension in whatever carries the counterweight, in newtons.
 
-        Both machines hang the weight on a link the model holds rigid, and a rigid link
-        can push where a real rope or chain would just go slack - so on both machines a
-        negative value marks the run unphysical from that moment on, and the optimizer
-        charges for the impulse (see _tension_metrics and
-        optimization.slack_penalty_weight). It used to be reported for the pulley machine
-        alone, on the grounds that a pinned link cannot go slack; a pin holds the link's
-        *end*, not its length, and the traditional machine's weight hangs a further
-        `counter_weight_rope_length` below that pin on exactly the same rigid-link
-        idealization the pulley machine's rope gets.
+        Both machines hang the weight on a link the model holds rigid, but only one of
+        them is holding a *rope* rigid, and that is the whole difference in how a negative
+        value reads.
+
+        On the pulley machine the weight hangs on a rope over the axle. A rope pulls and
+        never pushes, so a negative tension there is the model doing something the machine
+        cannot, and the run is unphysical from that moment on - it is charged as an
+        impulse (see _tension_metrics and optimization.slack_penalty_weight).
+
+        On the traditional machine the weight is pinned to the arm's short end, and there
+        is no rope anywhere in that linkage. A pinned two-force member is a strut: it
+        carries compression exactly as well as tension, and going into compression is
+        simply what it does on the stroke where the weight is being swung rather than
+        falling. So a negative value there is a load to size the member for, not a fault,
+        and nothing is charged for it. It is still reported, as `min_cw_rope_tension`,
+        because the peak compressive load is worth knowing before building the thing.
+
+        This is the second time these metrics have changed hands and the reasoning is
+        worth keeping. They were pulley-only, then briefly graded on both machines on the
+        argument that a pin holds the link's *end* rather than its length and the weight
+        hangs a further `counter_weight_rope_length` below it - which would be right if
+        that hanger were a rope. It is not: the traditional machine is pinned through,
+        so the argument does not reach it.
 
         Pulley: the weight travels straight down at r_pul metres per radian, so its
         vertical equation is m*a_y = T - m*g with a_y = r_pul * theta_ddot.
@@ -786,7 +924,7 @@ class TrebuchetSimulator:
         return string_tension, self._cw_link_tension(theta, theta_dot, theta_ddot, y[4], y[5])
 
     def _tension_metrics(self, launch: LaunchSolution) -> Dict:
-        """Rope diagnostics sampled at the solver's accepted steps of each segment.
+        """Rope diagnostics: the three carried integrals, and the two running minima.
 
         The sling is handled physically (slack regime + snap losses), so its metrics
         report what actually happened: `sling_snap_energy` is the kinetic energy
@@ -799,25 +937,45 @@ class TrebuchetSimulator:
         the floor or fully slack). It is what makes a jerky design cost more than a
         smooth one *before* it snaps - see optimization.snap_penalty_weight.
 
-        The counterweight's own link is still a rigid one on both machines, so it keeps
-        the feasibility-style `cw_rope_compression_impulse` (integral of max(0, -T) dt,
-        N*s): nonzero means the link was pushing where a real rope or chain would have
-        gone slack, and that part of the solution isn't physical. The pulley machine gets
-        there by out-accelerating its falling counterweight; the traditional one by
-        whipping the weight past its pin (see _cw_link_tension).
+        The counterweight keeps the feasibility-style `cw_rope_compression_impulse`
+        (integral of max(0, -T) dt, N*s) on the pulley machine, which is the only one that
+        hangs its weight on a rope: nonzero means the rope was pushing, which it cannot,
+        and that part of the solution isn't physical - the machine gets there by
+        out-accelerating its falling counterweight. On the traditional machine the weight
+        is pinned to the arm through a rigid link, a strut that carries compression by
+        design, so there is nothing to fault and this reads exactly zero; the load itself
+        is still reported as `min_cw_rope_tension`, where a negative value is a member to
+        size rather than a run to discard (see _cw_link_tension).
+        `string_compression_impulse`
+        is the same integral for the sling, and is a self-check rather than a penalty
+        input: the sling is a rope in this model, so a taut segment ends at the tension
+        zero crossing and this should come back at the event solver's own error.
+
+        All three are read off the end of each segment's state vector rather than summed
+        here - they were integrated along with the dynamics (see N_QUADRATURE). Each
+        segment restarts them at zero, so the launch's total is the sum over segments and
+        no interval ever spans a snap. The two *minima* below are still sampled at the
+        accepted steps, which is all a diagnostic needs.
         """
         string_T_min = math.inf
         cw_T_min = math.inf
+        string_impulse = 0.0
         cw_impulse = 0.0
-        # Absolute floor in newtons; the deficit integral below is normalized by it, so
-        # the metric means the same thing on a 0.15 kg stone as on a 20 kg one.
-        tension_floor = SLING_TENSION_FLOOR * self._m_p * G
+        tension_floor = self._tension_floor
         sling_deficit = 0.0
 
         for seg in launch.segments:
+            # Clamped at zero per segment. All three integrands are non-negative by
+            # construction, but a fifth-order combination of one that is zero over most of
+            # a step and kinked inside it can undershoot - two of the Dormand-Prince
+            # weights are negative - and an impulse the objective is charged for must
+            # never come out able to pay the design back.
+            final = seg.sol.y[:, -1]
+            string_impulse += max(0.0, float(final[-3]))
+            cw_impulse += max(0.0, float(final[-2]))
+            sling_deficit += max(0.0, float(final[-1]))
+
             ts = seg.sol.t
-            prev_cw_deficit = None
-            prev_sling_deficit = None
             for i in range(len(ts)):
                 t_i, y_i = float(ts[i]), seg.sol.y[:, i]
                 # A sling under load reports its tension whether or not the projectile
@@ -841,24 +999,7 @@ class TrebuchetSimulator:
                         float(y_i[0]), float(y_i[1]), theta_ddot, float(y_i[6]), float(y_i[7])
                     )
                 string_T_min = min(string_T_min, string_T)
-
-                # Trapezoid over the same accepted steps as the cw impulse below; a
-                # segment's first step sits exactly on the previous segment's last, so
-                # restarting the rule per segment skips no time. Clamped below at zero
-                # as well as above at the floor: a taut segment's tension only goes
-                # negative by the event solver's own error, and fastsim, which runs
-                # the same taut/slack alternation, has to come out with the same [0, 1]
-                # share of the launch.
-                deficit = tension_floor - min(tension_floor, max(0.0, string_T))
-                if prev_sling_deficit is not None:
-                    sling_deficit += 0.5 * (prev_sling_deficit + deficit) * (t_i - float(ts[i - 1]))
-                prev_sling_deficit = deficit
-
                 cw_T_min = min(cw_T_min, cw_T)
-                deficit = max(0.0, -cw_T)
-                if prev_cw_deficit is not None:
-                    cw_impulse += 0.5 * (prev_cw_deficit + deficit) * (t_i - float(ts[i - 1]))
-                prev_cw_deficit = deficit
 
         duration = launch.t_end
         metrics = {
@@ -889,6 +1030,7 @@ class TrebuchetSimulator:
         }
         metrics["min_cw_rope_tension"] = float(cw_T_min)
         metrics["cw_rope_compression_impulse"] = float(cw_impulse)
+        metrics["string_compression_impulse"] = float(string_impulse)
         return metrics
 
     def _machine_only_forces(self, theta, theta_dot, psi, psi_dot):
@@ -906,12 +1048,16 @@ class TrebuchetSimulator:
         cos_pt = cos_p * cos_t + sin_p * sin_t
 
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
+        bearing_torque = -self._pivot_friction * theta_dot / math.sqrt(
+            theta_dot * theta_dot + self._friction_eps * self._friction_eps
+        )
         Q_theta = (
             -self._cw_swing_coupling * sin_pt * psi_dot**2
             + self._cw_torque_const + self._cw_torque_cos * cos_t
             - self._arm_gravity_k * cos_t
             + arm_drag_torque
             - self._joint_friction * theta_dot
+            + bearing_torque
         )
         Q_psi = self._cw_swing_coupling * sin_pt * theta_dot**2 - self._cw_swing_gravity_k * cos_p
         return Q_theta, Q_psi, -self._cw_swing_coupling * cos_pt
@@ -928,7 +1074,7 @@ class TrebuchetSimulator:
         l_a = self._l_a
         sin_t, cos_t = math.sin(theta), math.cos(theta)
         tip_x, tip_y = l_a * cos_t, l_a * sin_t + self._h_T
-        dx, dy = px - tip_x, -tip_y
+        dx, dy = px - tip_x, self._ground_y - tip_y
         dist = math.hypot(dx, dy)
         if dist < 1e-12:
             dist = 1e-12
@@ -945,7 +1091,8 @@ class TrebuchetSimulator:
         negative, and the projectile lifts off when the normal force would. Solved
         together with the accelerations - see _grounded_taut_dynamics for the algebra.
         """
-        theta, theta_dot, px, _py, pvx, _pvy, psi, psi_dot = y
+        theta, theta_dot, px, pvx = y[0], y[1], y[2], y[4]
+        psi, psi_dot = y[6], y[7]
         m_p = self._m_p
         ex, ey, a, b, dist = self._grounded_geometry(theta, px)
 
@@ -987,7 +1134,8 @@ class TrebuchetSimulator:
         The projectile slides without friction, so the only horizontal force on it
         besides the sling is aerodynamic drag.
         """
-        theta, theta_dot, px, _py, pvx, _pvy, psi, psi_dot = y
+        theta, theta_dot, px, pvx = y[0], y[1], y[2], y[4]
+        psi, psi_dot = y[6], y[7]
         m_p = self._m_p
         ex, ey, a, b, dist = self._grounded_geometry(theta, px)
 
@@ -1003,13 +1151,17 @@ class TrebuchetSimulator:
         R = drag_x * ex / m_p - theta_dot * theta_dot * b + w / dist
         det = M_eff * (ex * ex / m_p) + a * a
         if abs(det) < 1e-15:
-            return [theta_dot, 0.0, pvx, 0.0, 0.0, 0.0, psi_dot, 0.0]
+            return [theta_dot, 0.0, pvx, 0.0, 0.0, 0.0, psi_dot, 0.0, 0.0, 0.0, 0.0]
 
         theta_ddot = (Q_eff * (ex * ex / m_p) + a * R) / det
         tension = (M_eff * R - a * Q_eff) / det
         psi_ddot = (Q_psi - M13 * theta_ddot) / self._M33
         ax = (-tension * ex + drag_x) / m_p
-        return [theta_dot, theta_ddot, pvx, 0.0, ax, 0.0, psi_dot, psi_ddot]
+        # A sling under load reports its tension whether or not the stone it is pulling
+        # happens to be resting on the ground.
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
+        return [theta_dot, theta_ddot, pvx, 0.0, ax, 0.0, psi_dot, psi_ddot,
+                *self._quadrature_rates(tension, cw_T)]
 
     def _grounded_slack_dynamics(self, t: float, y) -> List[float]:
         """Sling slack and the projectile lying on the ground: the two are uncoupled.
@@ -1018,10 +1170,16 @@ class TrebuchetSimulator:
         had along the ground, shedding it only to air drag - the ground is frictionless
         by choice, so nothing else slows it.
         """
-        theta, theta_dot, _px, _py, pvx, _pvy, psi, psi_dot = y
+        theta, theta_dot, pvx = y[0], y[1], y[4]
+        psi, psi_dot = y[6], y[7]
         theta_ddot, psi_ddot = self._machine_only_accelerations(theta, theta_dot, psi, psi_dot)
         drag_x = -self._proj_drag_k * abs(pvx) * pvx
-        return [theta_dot, theta_ddot, pvx, 0.0, drag_x / self._m_p, 0.0, psi_dot, psi_ddot]
+        # A slack sling carries nothing, which is a full floor's worth of deficit and no
+        # compression impulse of its own; the counterweight link is read from whatever
+        # angular acceleration this regime produced.
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
+        return [theta_dot, theta_ddot, pvx, 0.0, drag_x / self._m_p, 0.0, psi_dot, psi_ddot,
+                *self._quadrature_rates(0.0, cw_T)]
 
     def _machine_only_accelerations(self, theta, theta_dot, psi, psi_dot):
         """(theta_ddot, psi_ddot) for the machine carrying no projectile.
@@ -1050,14 +1208,17 @@ class TrebuchetSimulator:
         the same body as the taut aftermath (projectile terms gone); the projectile
         is in free flight with quadratic drag (same force law as trajectory.py).
         """
-        theta, theta_dot, _px, _py, pvx, pvy, psi, psi_dot = y
+        theta, theta_dot, pvx, pvy = y[0], y[1], y[4], y[5]
+        psi, psi_dot = y[6], y[7]
         theta_ddot, psi_ddot = self._machine_only_accelerations(theta, theta_dot, psi, psi_dot)
         speed = math.hypot(pvx, pvy)
         drag_accel = -self._proj_drag_k * speed / self._m_p if speed > 1e-12 else 0.0
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
         return [
             theta_dot, theta_ddot, pvx, pvy,
             drag_accel * pvx, -G + drag_accel * pvy,
             psi_dot, psi_ddot,
+            *self._quadrature_rates(0.0, cw_T),
         ]
 
     def _slack_state_from_taut(self, y_taut) -> List[float]:
@@ -1067,6 +1228,7 @@ class TrebuchetSimulator:
             float(y_taut[0]), float(y_taut[1]),
             float(pos[0]), float(pos[1]), float(vel[0]), float(vel[1]),
             float(y_taut[4]), float(y_taut[5]),
+            *(0.0,) * N_QUADRATURE,
         ]
 
     def _apply_snap(self, y_slack) -> Tuple[List[float], List[float], float]:
@@ -1079,7 +1241,9 @@ class TrebuchetSimulator:
         a regime by checking the post-snap string tension. The energy lost is
         0.5 * P * g_dot, always >= 0: the snap can only ever dissipate.
         """
-        theta, theta_dot, px, py, pvx, pvy, psi, psi_dot = (float(v) for v in y_slack)
+        theta, theta_dot = float(y_slack[0]), float(y_slack[1])
+        px, py, pvx, pvy = (float(y_slack[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y_slack[6]), float(y_slack[7])
         l_a, l_s, m_p = self._l_a, self._l_s, self._m_p
 
         sin_t, cos_t = math.sin(theta), math.cos(theta)
@@ -1115,11 +1279,12 @@ class TrebuchetSimulator:
         v_tip_x, v_tip_y = theta_dot * tvx, theta_dot * tvy
         alpha_dot = ((pvx - v_tip_x) * -math.sin(alpha) + (pvy - v_tip_y) * math.cos(alpha)) / l_s
 
-        taut_state = [theta, theta_dot, alpha, alpha_dot, psi, psi_dot]
+        taut_state = [theta, theta_dot, alpha, alpha_dot, psi, psi_dot, *(0.0,) * N_QUADRATURE]
         # Snap the projectile exactly onto the string circle so a continued slack
         # segment starts with separation == l_s rather than integration-error above it.
         slack_state = [
             theta, theta_dot, tip_x + l_s * ex, tip_y + l_s * ey, pvx, pvy, psi, psi_dot,
+            *(0.0,) * N_QUADRATURE,
         ]
         return taut_state, slack_state, energy_lost
 
@@ -1150,7 +1315,9 @@ class TrebuchetSimulator:
         Returns the grounded state and the kinetic energy destroyed, which is always
         >= 0 - both impulses are dissipative.
         """
-        theta, theta_dot, px, py, pvx, pvy, psi, psi_dot = (float(v) for v in y)
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
         m_p = self._m_p
         ex, ey, a, _b, _dist = self._grounded_geometry(theta, px)
         M13, M_eff = self._sling_impulse_terms(theta, psi)
@@ -1178,7 +1345,8 @@ class TrebuchetSimulator:
         pvy = 0.0
 
         after = self._launch_kinetic_energy(theta_dot, pvx, pvy, psi, psi_dot, theta)
-        return ([theta, theta_dot, px, 0.0, pvx, 0.0, psi, psi_dot],
+        return ([theta, theta_dot, px, self._ground_y, pvx, 0.0, psi, psi_dot,
+                 *(0.0,) * N_QUADRATURE],
                 max(0.0, before - after))
 
     def _launch_kinetic_energy(self, theta_dot, pvx, pvy, psi, psi_dot, theta) -> float:
@@ -1195,7 +1363,8 @@ class TrebuchetSimulator:
         """A taut-sling projectile reaching the ground: land it, keeping the sling taut."""
         pos, vel = self.projectile_position_velocity(y_taut)
         state = [float(y_taut[0]), float(y_taut[1]), float(pos[0]), float(pos[1]),
-                 float(vel[0]), float(vel[1]), float(y_taut[4]), float(y_taut[5])]
+                 float(vel[0]), float(vel[1]), float(y_taut[4]), float(y_taut[5]),
+                 *(0.0,) * N_QUADRATURE]
         return self._apply_ground_impulse(state, radial_target=0.0)
 
     def _integrate_launch(self, t_max: float, rtol: float, dense_output: bool) -> LaunchSolution:
@@ -1217,18 +1386,22 @@ class TrebuchetSimulator:
         Every crossing into the ground costs energy - the ground takes the projectile's
         downward momentum - which is recorded the same way a snap's loss is.
         """
-        release_angle = self.params.release_angle
         launch = LaunchSolution(self)
-        l_a, l_s, h_T = self._l_a, self._l_s, self._h_T
+        l_a, l_s, h_T, ground_y = self._l_a, self._l_s, self._h_T, self._ground_y
+
+        # The pin's angle, re-anchored at the start of every taut segment (see
+        # _release_target). A one-element list because the event closure has to see the
+        # value the loop below writes.
+        release_target = [0.0]
 
         def release_event(t, y):
-            return y[0] - release_angle
+            return (y[2] - y[0]) - release_target[0]
 
         def slack_event(t, y):
             return self.constraint_tensions(t, y)[0]
 
         def taut_landing_event(t, y):
-            return l_a * math.sin(y[0]) + l_s * math.sin(y[2]) + h_T
+            return l_a * math.sin(y[0]) + l_s * math.sin(y[2]) + h_T - ground_y
 
         def retension_event(t, y):
             tip_x = l_a * math.cos(y[0])
@@ -1236,7 +1409,7 @@ class TrebuchetSimulator:
             return math.hypot(y[2] - tip_x, y[3] - tip_y) - l_s
 
         def slack_landing_event(t, y):
-            return y[3]
+            return y[3] - ground_y
 
         def liftoff_event(t, y):
             return self.grounded_forces(y)[1]
@@ -1247,7 +1420,7 @@ class TrebuchetSimulator:
         def ground_retension_event(t, y):
             tip_x = l_a * math.cos(y[0])
             tip_y = l_a * math.sin(y[0]) + h_T
-            return math.hypot(y[2] - tip_x, tip_y) - l_s
+            return math.hypot(y[2] - tip_x, ground_y - tip_y) - l_s
 
         theta_arm_ground = self._theta_arm_ground
 
@@ -1255,14 +1428,15 @@ class TrebuchetSimulator:
             return y[0] - theta_arm_ground
 
         for event in (release_event, slack_event, taut_landing_event, slack_landing_event,
-                      liftoff_event, ground_slack_event, arm_ground_event):
+                      liftoff_event, ground_slack_event, arm_ground_event):  # noqa: E501
             event.terminal = True
             event.direction = -1
         for event in (retension_event, ground_retension_event):
             event.terminal = True
             event.direction = 1
 
-        # (dynamics, transition events after the shared release event) per regime. The
+        # (dynamics, that regime's own transition events) per regime. The release event
+        # goes in front of them, but only in TAUT - see the loop below - and the
         # arm-ground event is appended last, and only while the beam is still clear.
         regimes = {
             TAUT: (self.trebuchet_dynamics, [slack_event, taut_landing_event]),
@@ -1279,16 +1453,29 @@ class TrebuchetSimulator:
                 break
 
             dynamics, transitions = regimes[regime]
-            events = [release_event] + transitions
+            # The pin can only let go of a sling it is holding under load and swinging
+            # free, so the release is armed in TAUT alone. A sling that has gone slack is
+            # not pulling on the ring at all, and one dragging a stone along the ground is
+            # not going to throw it whatever the pin does - both of those run on until the
+            # sling picks the stone up again, which is the TAUT segment that then throws.
+            events = list(transitions)
+            release_index = -1
+            if regime == TAUT:
+                release_target[0] = self._release_target(float(y[2]) - float(y[0]))
+                events.insert(0, release_event)
+                release_index = 0
             # Unarmed when the beam can never reach the ground, and when it is already
             # at or past that angle - scipy would otherwise fire at t0 and return a
             # zero-length segment forever.
             ground_armed = math.isfinite(theta_arm_ground) and y[0] > theta_arm_ground
+            ground_index = -1
             if ground_armed:
+                ground_index = len(events)
                 events = events + [arm_ground_event]
 
+            atol = self._atol_taut if regime == TAUT else self._atol_eight
             sol = solve_ivp(dynamics, (t, t_max), y, events=events,
-                            dense_output=dense_output, rtol=rtol)
+                            dense_output=dense_output, rtol=rtol, atol=atol)
             launch.segments.append(
                 LaunchSegment(sol=sol, t0=t, t1=float(sol.t[-1]), regime=regime)
             )
@@ -1300,14 +1487,16 @@ class TrebuchetSimulator:
             t, index = min(fired)
             y_event = sol.y_events[index][0]
 
-            if index == 0:  # release
+            if index == release_index:
                 self._record_release(launch, t, y_event, regime)
                 break
-            if ground_armed and index == len(events) - 1:  # beam hit the ground
+            if index == ground_index:  # beam hit the ground
                 launch.arm_ground_contact = True
                 break
 
-            y, regime = self._launch_transition(launch, t, y_event, regime, index)
+            y, regime = self._launch_transition(
+                launch, t, y_event, regime, index - (1 if release_index == 0 else 0)
+            )
 
         return launch
 
@@ -1340,7 +1529,8 @@ class TrebuchetSimulator:
         pos = (float(y8[2]), float(y8[3]))
         vel = (float(y8[4]), float(y8[5]))
         alpha, alpha_dot = self._effective_string_state(theta, theta_dot, pos, vel)
-        return [theta, theta_dot, alpha, alpha_dot, float(y8[6]), float(y8[7])]
+        return [theta, theta_dot, alpha, alpha_dot, float(y8[6]), float(y8[7]),
+                *(0.0,) * N_QUADRATURE]
 
     def _grounded_state_from_slack(self, y8) -> Tuple[List[float], float]:
         """Land a free-flying projectile with a slack sling: the ground takes its fall.
@@ -1350,8 +1540,10 @@ class TrebuchetSimulator:
         """
         state = [float(v) for v in y8]
         energy = 0.5 * self._m_p * state[5] ** 2
-        state[3] = 0.0
+        state[3] = self._ground_y
         state[5] = 0.0
+        for i in range(N_QUADRATURE):
+            state[-1 - i] = 0.0
         return state, energy
 
     def _record_release(self, launch: "LaunchSolution", t: float, y_event, regime: str) -> None:
@@ -1369,11 +1561,38 @@ class TrebuchetSimulator:
                 (float(y_event[4]), float(y_event[5])),
             )
 
+    def _release_target(self, beta_now: float) -> float:
+        """The release pin's angle, put on the branch just below the sling's current one.
+
+        `release_angle` is the sling-to-arm angle beta = alpha - theta the pin lets go at,
+        and the pin is a physical object that has no idea how many turns anything has
+        made: beta and beta + 2*pi are the same pin. But alpha is rebuilt from an arctangent
+        every time the launch re-enters the taut regime, so the branch it lands on is an
+        accident of the geometry at that instant, and comparing a wound-up beta against a
+        fixed number would compare two different branches.
+
+        So the target is re-anchored per taut segment, to the copy of the pin angle that
+        sits just below where the sling actually is - which is the copy the sling will
+        reach next, turning the way it turns. Strictly below, never equal, so a segment
+        never opens with its own release event already sitting on zero.
+
+        This is the same trick _first_arm_ground_angle plays on the beam's ground angle,
+        and for the same reason: an event on an angle has to be an event on a *number*
+        before a solver can bracket it.
+        """
+        span = 2 * math.pi
+        turns = math.ceil((beta_now - self.params.release_angle) / span) - 1
+        return self.params.release_angle + span * turns
+
     def _launch_transition(self, launch: "LaunchSolution", t: float, y_event, regime: str,
                            index: int) -> Tuple[List[float], str]:
-        """Cross from one launch regime into the next at a fired transition event."""
+        """Cross from one launch regime into the next at a fired transition event.
+
+        `index` counts the regime's own transitions, in the order `regimes` lists them -
+        the release and beam-ground events are handled by the caller and are not in it.
+        """
         if regime == TAUT:
-            if index == 1:  # tension crossed zero: the rope lets go
+            if index == 0:  # tension crossed zero: the rope lets go
                 return self._slack_state_from_taut(y_event), SLACK
             # The projectile reached the ground while still on a loaded sling.
             state, energy = self._ground_contact_state(y_event)
@@ -1382,7 +1601,7 @@ class TrebuchetSimulator:
             return self._settle_grounded(state)
 
         if regime == SLACK:
-            if index == 1:  # separation grew back to the sling length
+            if index == 0:  # separation grew back to the sling length
                 taut_state, slack_state, energy = self._apply_snap(y_event)
                 launch.snap_times.append(float(t))
                 launch.snap_energy_losses.append(energy)
@@ -1397,14 +1616,48 @@ class TrebuchetSimulator:
             return state, SLACK_GROUND
 
         if regime == TAUT_GROUND:
-            if index == 1:  # normal force crossed zero: the sling has picked it up
+            if index == 0:  # normal force crossed zero: the sling has picked it up
                 return self._taut_state_from_grounded(y_event), TAUT
-            return [float(v) for v in y_event], SLACK_GROUND
+            # The sling let go over a projectile already on the ground. This is the one
+            # crossing where the physical state carries over untouched - nothing is
+            # impulsed, the projectile simply stops being pulled - so the running integrals
+            # have to be restarted by hand, the way every other state map restarts them.
+            # Carrying them meant the next segment opened with this one's total already in
+            # it, and _tension_metrics then counted it twice: it drove one traditional
+            # draw's deficit to 1.156, on a metric whose whole meaning is a share of the
+            # launch and which therefore cannot exceed 1.
+            state = [float(v) for v in y_event]
+            for i in range(N_QUADRATURE):
+                state[-1 - i] = 0.0
+            return state, SLACK_GROUND
 
         # SLACK_GROUND: the sling came taut over a projectile already on the ground.
-        state, energy = self._apply_ground_impulse(y_event, radial_target=0.0)
+        #
+        # Two impulses could act here - the sling's, along its own line, and the ground's,
+        # straight up - and the ground's is one-sided: it can push, never pull. Solving
+        # both together under "the projectile stays on the ground" is only the right
+        # answer when the ground impulse that comes out is positive, and here it never is.
+        # The arm tip is always above a stone lying on the ground, so the sling's pull has
+        # an upward component, and the combined solve answers with the ground holding the
+        # stone down while the sling hauls on it - which over-charged the jerk by 14% on
+        # the four-regime fixture and by 103% on a machine loaded the ordinary way.
+        #
+        # So take the free snap first, and use it whenever it leaves the stone rising:
+        # that is the sling picking the stone up, which is the loading stroke of every
+        # machine that starts with its stone in the dirt.
+        taut_state, slack_state, energy = self._apply_snap(y_event)
         launch.snap_times.append(float(t))
         launch.snap_energy_losses.append(energy)
+        if slack_state[5] >= 0.0:
+            if self.constraint_tensions(t, taut_state)[0] > 1e-9:
+                return taut_state, TAUT
+            return slack_state, SLACK
+        # The other branch, kept because it is the one the one-sidedness actually
+        # decides: a sling pulling downward - a nearly horizontal one under a tip almost
+        # on the ground - does drive the stone into the ground, and there the ground's
+        # impulse is real and the two are solved together after all.
+        state, energy = self._apply_ground_impulse(y_event, radial_target=0.0)
+        launch.snap_energy_losses[-1] = energy
         return self._settle_grounded(state)
 
     def _settle_grounded(self, state) -> Tuple[List[float], str]:
@@ -1435,7 +1688,14 @@ class TrebuchetSimulator:
         theta, theta_dot = y[0], y[1]
         cos_t = math.cos(theta)
         arm_drag_torque = -math.copysign(self._arm_drag_k * theta_dot * theta_dot, theta_dot)
-        Q_theta = -self._arm_gravity_k * cos_t + arm_drag_torque - self._joint_friction * theta_dot
+        # The unloaded friction: the counterweight is on the ground in this regime.
+        bearing_torque = -self._pivot_friction_unloaded * theta_dot / math.sqrt(
+            theta_dot * theta_dot + self._friction_eps * self._friction_eps
+        )
+        Q_theta = (
+            -self._arm_gravity_k * cos_t + arm_drag_torque
+            - self._joint_friction * theta_dot + bearing_torque
+        )
         return [theta_dot, Q_theta / self._M_slack, 0.0, 0.0]
 
     def _simulate_aftermath_pinned(
@@ -1595,8 +1855,8 @@ class TrebuchetSimulator:
         theta_i = float(p.initial_arm_angle)
         if p.has_pulley:
             alpha_i = theta_i + np.pi - np.arcsin(p.projectile_radius / p.string_length)
-            return [theta_i, 0.0, float(alpha_i), 0.0, 0.0, 0.0]
-        return [theta_i, 0.0, self._psi_rest, 0.0, self._psi_rest, 0.0]
+            return [theta_i, 0.0, float(alpha_i), 0.0, 0.0, 0.0, *(0.0,) * N_QUADRATURE]
+        return [theta_i, 0.0, self._psi_rest, 0.0, self._psi_rest, 0.0, *(0.0,) * N_QUADRATURE]
 
     def ground_start_state(self) -> "Optional[List[float]]":
         """The cocked pose with the projectile lying on the ground, or None.
@@ -1615,14 +1875,17 @@ class TrebuchetSimulator:
         theta_i = float(self.params.initial_arm_angle)
         tip_x = self._l_a * math.cos(theta_i)
         tip_y = self._l_a * math.sin(theta_i) + self._h_T
-        if tip_y < 0.0 or tip_y > self._l_s:
+        # Measured to the resting stone's centre, which sits one radius up.
+        drop = tip_y - self._ground_y
+        if drop < 0.0 or drop > self._l_s:
             return None
-        reach = math.sqrt(max(0.0, self._l_s * self._l_s - tip_y * tip_y))
+        reach = math.sqrt(max(0.0, self._l_s * self._l_s - drop * drop))
         # Behind the machine: the tip leans to one side of the pivot at rest and the
         # sling is laid out further that way, so the throw sweeps the projectile up and
         # across rather than dragging it backwards through the frame.
         px = tip_x + math.copysign(reach, tip_x) if tip_x != 0.0 else tip_x - reach
-        return [theta_i, 0.0, px, 0.0, 0.0, 0.0, self._psi_rest, 0.0]
+        return [theta_i, 0.0, px, self._ground_y, 0.0, 0.0, self._psi_rest, 0.0,
+                *(0.0,) * N_QUADRATURE]
 
     def simulate(
         self, t_max: float = 10.0, rtol: float = 1e-8, dense_output: bool = True, simulate_aftermath: bool = False,
@@ -1767,6 +2030,7 @@ class TrebuchetSimulator:
                 self.params.projectile_drag_coefficient,
                 self.params.projectile_area,
                 dense_output=dense_output,
+                ground_level=self._ground_y,
             )
             distance = trajectory.impact_x
             flight_time = trajectory.flight_time
@@ -1812,11 +2076,20 @@ class TrebuchetSimulator:
         total_PE_spent = counterweight_PE_spent + arm_PE_spent + projectile_PE_spent
         efficiency = proj_KE_before / total_PE_spent if total_PE_spent > 0 else 0.0
 
+        # What the pin was actually holding when it let go: the sling-to-arm angle, which
+        # is what `release_angle` names. Reported alongside the arm's own angle because
+        # the two are easy to confuse and only one of them is a setting.
+        tip_x = self._l_a * math.cos(theta_release)
+        tip_y = self._l_a * math.sin(theta_release) + self._h_T
+        beta_release = math.atan2(release_pos[1] - tip_y, release_pos[0] - tip_x) - theta_release
+        beta_release = (beta_release + np.pi) % (2 * np.pi) - np.pi
+
         metrics = {
             "release_velocity": release_velocity,
             "release_velocity_components": (vx0, vy0),
             "release_height": y0_height,
             "release_angle_deg": theta_release * 180 / np.pi,
+            "release_pin_angle_deg": beta_release * 180 / np.pi,
             "pe_spent": counterweight_PE_spent,
             "ke_projectile": proj_KE_before,
             "total_pe_spent": total_PE_spent,

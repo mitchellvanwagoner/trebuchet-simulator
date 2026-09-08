@@ -5,7 +5,7 @@ numba = pytest.importorskip("numba")
 
 from trebuchet_sim import fastsim
 from trebuchet_sim.config import (
-    DEFAULT_INITIAL_ARM_ANGLE,
+    AUTO_INITIAL_ARM_ANGLE,
     G,
     DEFAULT_MACHINE_FIXED,
     DEFAULT_MACHINE_PARAMS,
@@ -33,12 +33,15 @@ def _fixed_for(machine: MachineType) -> dict:
         "arm_density": TrebuchetParams.arm_density,
         "projectile_mass": TrebuchetParams.projectile_mass,
         "projectile_radius": TrebuchetParams.projectile_radius,
-        # Read from the machine's start-angle table rather than the dataclass default,
-        # which is None until __post_init__ resolves it per machine.
-        "initial_arm_angle": float(DEFAULT_INITIAL_ARM_ANGLE[machine]),
+        # The "derive it from the geometry" sentinel, which is what TrebuchetParams' own
+        # None means (config.resolve_initial_arm_angle) - a constant on the pulley machine,
+        # and on the traditional one whatever walks the long arm down to the ground.
+        "initial_arm_angle": AUTO_INITIAL_ARM_ANGLE,
         "arm_drag_coefficient": TrebuchetParams.arm_drag_coefficient,
         "projectile_drag_coefficient": TrebuchetParams.projectile_drag_coefficient,
         "joint_friction_coefficient": TrebuchetParams.joint_friction_coefficient,
+        "bearing_friction_coefficient": TrebuchetParams.bearing_friction_coefficient,
+        "pivot_shaft_radius": TrebuchetParams.pivot_shaft_radius,
         "counter_weight_rope_length": _ROPE_UNSET,
     }
     fixed.update(DEFAULT_MACHINE_FIXED[machine])
@@ -61,6 +64,7 @@ def _simulate_fast(values, machine=MachineType.PULLEY, **overrides):
         f["pivot_height"], f["pulley_density"], f["arm_density"],
         f["projectile_mass"], f["projectile_radius"], f["initial_arm_angle"],
         f["arm_drag_coefficient"], f["projectile_drag_coefficient"], f["joint_friction_coefficient"],
+        f["bearing_friction_coefficient"], f["pivot_shaft_radius"],
         machine is MachineType.PULLEY,
     )
 
@@ -70,9 +74,11 @@ def _reference_params(values, machine=MachineType.PULLEY, **overrides) -> Trebuc
     f = dict(_fixed_for(machine))
     f.update(overrides)
     rope = f.pop("counter_weight_rope_length")
+    angle = f.pop("initial_arm_angle")
     return TrebuchetParams(
         machine=machine,
         counter_weight_rope_length=None if rope == _ROPE_UNSET else rope,
+        initial_arm_angle=None if angle >= AUTO_INITIAL_ARM_ANGLE else angle,
         **values,
         **f,
     )
@@ -101,6 +107,17 @@ def _reference_params(values, machine=MachineType.PULLEY, **overrides) -> Trebuc
 # of a percentage point on a quiet launch and a tenth on an eventful one clear the worst
 # these grids produce (6.8e-5 and 2.4e-4) by 1.5x and 4x, and for any efficiency worth
 # building they are tighter than the relative bounds above, not looser.
+#
+# What these bounds are not is a guarantee about every design in the bounds, and the
+# distinction is worth keeping straight: they are what the two engines meet on *this*
+# grid, and this grid is one seed. Re-drawn on seeds 43 through 47 - same construction,
+# same exemptions - 7 of 1087 usable draws exceed the eventful bound, about one in 155,
+# every one of them eventful, at 1.1% / 1.6% / 5.7% / 5.7% / 7.4% / 21% on distance. They
+# are the same kind of draw the exemptions above describe without quite catching: a launch
+# whose regime sequence is decided by where one event solver lands relative to the other,
+# where the reference happens to agree with itself closely enough to stay in the
+# comparison. So a pass here means the engines agree across a representative sweep, not
+# that no design exists where they part company - if a specific design matters, ask both.
 _QUIET_TOLERANCE = dict(rel=1e-3, abs=1e-3, eff=1e-4)
 _EVENTFUL_TOLERANCE = dict(rel=1e-2, abs=1e-1, eff=1e-3)
 
@@ -153,25 +170,43 @@ def _exhausted(result) -> bool:
 _GRAZE_TENSION = 0.02 * TrebuchetParams.projectile_mass * G
 
 
-def _contacts_undecided(params, ref) -> bool:
-    """Does the reference change its mind about how often the stone lands, if asked harder?
+def _regimes_undecided(params, ref) -> bool:
+    """Does the reference change its mind about the launch's *shape*, if asked harder?
 
-    The sibling of _undecided, on the ground constraint rather than the sling. A projectile
-    skimming the line can touch down a number of times that the tolerance decides rather
-    than the design: one traditional draw in this sweep reads 3 contacts and 1.061 J at the
-    rtol=1e-6 the optimizer runs at, and 5 contacts and 0.967 J at 1e-8 and at 1e-10. The
-    fast engine reads 0.968 J, which is the converged answer - so holding it to the
-    reference's 1e-6 reading would be demanding it reproduce an under-resolved one.
+    The sibling of _undecided, generalized from the ground constraint to every
+    discontinuity. A launch that snaps or lands repeatedly is chaotic in the ordinary
+    sense: each discontinuity re-aims what follows it, so an event placed a rounding
+    earlier or later changes the sequence of regimes rather than perturbing a number, and
+    two engines have nothing left to agree about. The test for that is not "are these
+    engines far apart" but "does the reference agree with *itself* at a tighter
+    tolerance", which is a question about the draw and not about the port.
 
-    Only asked of draws that actually landed, so it costs one extra reference run each on
-    the handful that did.
+    Two draws in these sweeps are like that. A pulley one reads 15 segments and a 133 m
+    throw at rtol 1e-6, 13 segments and no release at 1e-8, and 12 segments at 1e-10; the
+    fast engine reads no release, which is the converged branch. A traditional one reads 14
+    snaps and 45.8 J at 1e-6, 13 and 44.6 at 1e-8, 14 and 53.5 at 1e-10 - a quantity with
+    no settled value to hold anything to.
+
+    What counts as "changing its mind" is the same set of answers this file holds the two
+    engines to - the shape of the launch, whether it threw, and what its discontinuities
+    cost - because those are exactly the answers a draw has to have a settled value of
+    before two engines can be asked to agree on it.
+
+    Only asked of launches that had a discontinuity at all, so the quiet majority costs
+    nothing.
     """
-    if not ref.metrics.get("projectile_ground_contacts"):
+    if len(ref.solution.segments) <= 1 and not ref.metrics.get("projectile_ground_contacts"):
         return False
     tighter = simulate_trebuchet(params, rtol=1e-8, dense_output=False)
-    return (
-        tighter.metrics["projectile_ground_contacts"]
-        != ref.metrics["projectile_ground_contacts"]
+    here, there = ref.metrics, tighter.metrics
+    if len(tighter.solution.segments) != len(ref.solution.segments):
+        return True
+    if here["projectile_ground_contacts"] != there["projectile_ground_contacts"]:
+        return True
+    if bool(here.get("release_occurred")) != bool(there.get("release_occurred")):
+        return True
+    return here["sling_snap_energy"] != pytest.approx(
+        there["sling_snap_energy"], rel=5e-2, abs=_SNAP_ENERGY_NOISE_FLOOR
     )
 
 
@@ -194,10 +229,19 @@ def _undecided(metrics) -> bool:
         and metrics["min_string_tension"] < _GRAZE_TENSION
     )
 
-# A rope carries no compression, so neither engine should be reporting any on the sling.
-# This is a self-check on the port rather than a tolerance: it measures 0 exactly on most
-# draws and never worse than machine epsilon on the rest.
-_STRING_COMPRESSION_EPS = 1e-12
+# A rope carries no compression, so neither engine should be reporting any real amount on
+# the sling. This is a self-check on the port rather than a penalty input - nothing is
+# charged for it - and it is no longer exactly zero, for a reason worth writing down.
+#
+# The three integrals became ODE states (see physics.N_QUADRATURE), which means they are
+# advanced by the same fifth-order weights as everything else and interpolated to the event
+# time by the same cubic Hermite. A taut segment ends at the tension's zero crossing, but
+# the *step* containing that crossing runs past it, and its later stages sample the
+# negative tension beyond. The interpolant carries a little of that back to the event time.
+# It is bounded by the step error, an order below the counterweight impulse's own atol, and
+# worth about 0.2 of a cost unit at the shipped penalty weight if it were charged at all.
+# Over these sweeps it peaks at 8.5e-4 N*s.
+_STRING_COMPRESSION_EPS = 5e-3
 
 # Below this a snap is not evidence that a launch went slack, only that its sling grazed
 # zero tension somewhere. Whether a graze counts as a detachment is decided by two event
@@ -218,7 +262,8 @@ _SNAP_ENERGY_NOISE_FLOOR = 0.01
 # second); the counts below are what these seeds actually produce.
 _GRID_DRAWS = {MachineType.PULLEY: 150, MachineType.TRADITIONAL: 300}
 
-# The pivot is swept too, between just clearing the beam and a metre and a half above it.
+# The pivot is swept too. On the pulley machine that means between just clearing the beam
+# and a metre and a half above it.
 # It has to clear the beam at all: a machine whose arm reaches the ground stops there
 # (see test_both_engines_stop_the_launch_where_the_beam_reaches_the_ground), which is a
 # real answer but a useless one to compare engines on, since a launch that ends in the
@@ -237,6 +282,19 @@ _GRID_DRAWS = {MachineType.PULLEY: 150, MachineType.TRADITIONAL: 300}
 # recognize, since nobody stands a trebuchet on a tower twice its arm.
 _PIVOT_CLEARANCE = 0.25
 _PIVOT_SPREAD = 0.75
+
+# The traditional machine is stood the other way up, and has to be. Its cocked angle is not
+# a number anyone picks any more - it is whatever walks the long arm down to the ground
+# (config.resolve_initial_arm_angle) - so an arm shorter than the pivot is tall cannot get
+# there, and the clamp leaves it hanging straight down on its own balance point, where
+# every gravity torque carries a cos(theta) and is identically zero. Such a machine does
+# not move at all: standing this sweep on a pivot above the beam, the way the pulley
+# machine is stood, produced 180 draws and not one release.
+#
+# So the pivot is drawn as a fraction of the arm instead. The top of the band is what the
+# clamp allows; the bottom is low enough to sweep the cocked angle across most of its own
+# range (0.4 of the arm cocks it at about -156 degrees, 0.9 at about -122).
+_TRADITIONAL_PIVOT_FRACTION = (0.4, 0.9)
 
 
 def _parameter_grid(machine=MachineType.PULLEY, seed: int = 42, draws: int = None):
@@ -263,8 +321,11 @@ def _parameter_grid(machine=MachineType.PULLEY, seed: int = 42, draws: int = Non
     rng = np.random.default_rng(seed)
     for _ in range(draws):
         values = {name: rng.uniform(*PARAM_BOUNDS[name]) for name in param_names(machine)}
-        reach = max(values["arm_length"], values.get("length_counterweight", 0.0))
-        pivot = reach + _PIVOT_CLEARANCE + rng.uniform(0.0, _PIVOT_SPREAD)
+        if machine is MachineType.PULLEY:
+            reach = max(values["arm_length"], values.get("length_counterweight", 0.0))
+            pivot = reach + _PIVOT_CLEARANCE + rng.uniform(0.0, _PIVOT_SPREAD)
+        else:
+            pivot = values["arm_length"] * rng.uniform(*_TRADITIONAL_PIVOT_FRACTION)
         params = _reference_params(values, machine, pivot_height=pivot)
         if params.string_length > 0.95 * params.arm_length:
             continue
@@ -287,13 +348,13 @@ def test_fast_engine_matches_scipy_engine_for_default_params():
     assert string_impulse <= _STRING_COMPRESSION_EPS
     assert snap_energy == 0.0
     assert ref.metrics["sling_snap_energy"] == 0.0
-    # The defaults keep real tension margin, so they owe nothing on the snap penalty
-    # either - and both engines have to agree on that, not just on the distance.
-    assert sling_deficit == 0.0
-    assert ref.metrics["sling_tension_deficit"] == 0.0
-    # The cw impulse comes from trapezoid sums over each engine's own accepted steps,
-    # so it agrees only to the ~0.05 N*s noise floor (see the parameter-grid test).
-    assert cw_impulse == pytest.approx(ref.metrics["cw_rope_compression_impulse"], rel=3e-1, abs=5e-2)
+    # It does run under a working load for part of the throw, though - the sling is barely
+    # loaded while the arm is still taking up speed - so the deficit is not zero, and what
+    # matters is that both engines read the same number rather than that it is small. They
+    # are integrating it now rather than summing a trapezoid over their own step grids, so
+    # they agree far more closely than they used to.
+    assert sling_deficit == pytest.approx(ref.metrics["sling_tension_deficit"], rel=1e-3)
+    assert cw_impulse == pytest.approx(ref.metrics["cw_rope_compression_impulse"], rel=1e-2, abs=1e-3)
 
 
 def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
@@ -301,7 +362,11 @@ def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
     machine = MachineType.TRADITIONAL
     values = DEFAULT_MACHINE_PARAMS[machine]
     ref = simulate_trebuchet(_reference_params(values, machine), rtol=1e-6, dense_output=False)
-    assert ref.metrics["string_slack_fraction"] == 0.0
+    # This machine is loaded on the ground with its sling laid out behind it, so it opens
+    # with the sling carrying nothing and spends the first third of the launch taking up
+    # that slack. Both are real, and both engines have to see the same amount of it.
+    assert ref.solution.segments[0].regime == "slack_ground"
+    assert 0.0 < ref.metrics["string_slack_fraction"] < 1.0
 
     (released, distance, efficiency, string_impulse, cw_impulse,
      sling_deficit, snap_energy, ground_energy) = _simulate_fast(values, machine)
@@ -310,9 +375,23 @@ def test_fast_engine_matches_scipy_engine_for_the_traditional_default_machine():
     assert distance == pytest.approx(ref.distance, rel=1e-3)
     assert efficiency == pytest.approx(ref.efficiency, rel=1e-3)
     assert string_impulse <= _STRING_COMPRESSION_EPS
-    assert snap_energy == 0.0
-    assert sling_deficit == 0.0
-    assert ref.metrics["sling_tension_deficit"] == 0.0
+    # The sling coming taut over a stone lying on the ground is a snap like any other, and
+    # it is the one this machine's loading stroke always makes.
+    assert snap_energy > 0.0
+    assert snap_energy == pytest.approx(ref.metrics["sling_snap_energy"], rel=1e-2)
+    # Looser than the 1e-3 the pulley machine's twin gets, and measured rather than
+    # chosen. Almost all of this machine's deficit is the slack it opens with, which the
+    # two engines put at 0.4524043 and 0.4524049 - agreement to 1.4e-6. The rest is a bump
+    # in the taut stretch, where the tension sags to 2.358 N against a 2.4525 N floor for
+    # about 30 ms; the integrand is the *clamped* margin, so it is nonzero only inside that
+    # dip and zero either side of it. At rtol 1e-6 scipy's steps happen to straddle the
+    # bump and this engine's do not, and it collects 3.5% of it - 3.1e-5 against 8.96e-4.
+    # Neither is wrong and they converge on each other: this engine reads 0.3405494 /
+    # 0.3411957 / 0.3411990 / 0.3412054 at rtol 1e-6 / 1e-8 / 1e-10 / 1e-12, against a
+    # reference that is already settled at 0.3412010 by 1e-6. The gap is 0.19% of the
+    # metric and 0.65 cost units at the shipped snap penalty, against a distance term
+    # worth 10 per 1% of target, so it moves no design's standing.
+    assert sling_deficit == pytest.approx(ref.metrics["sling_tension_deficit"], rel=3e-3)
     # The pin-to-weight link is a rigid link in both engines, exactly as the pulley
     # machine's rope is, so both report a compression impulse for it - and on these
     # defaults both report none, because the link stays loaded the whole way.
@@ -351,15 +430,18 @@ def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
         (released, distance, efficiency, string_impulse, cw_impulse,
          sling_deficit, snap_energy, ground_energy) = fast
 
-        assert released == ref_released, design
-        # A rope cannot push in either engine now.
+        # A rope cannot push in either engine now. Asserted before anything is exempted,
+        # because it is a statement about the model rather than about this draw.
         assert string_impulse <= _STRING_COMPRESSION_EPS, design
 
-        if _undecided(ref.metrics) or _contacts_undecided(params, ref):
+        if _undecided(ref.metrics) or _regimes_undecided(params, ref):
             # Nothing below is a shared answer for this draw - see _undecided and
-            # _contacts_undecided. Whether it threw at all still is, and is asserted above.
+            # _regimes_undecided - including whether it threw at all, which on a launch
+            # whose regime sequence is settled by rounding is the branch and not the
+            # physics.
             undecided_cases += 1
             continue
+        assert released == ref_released, design
         # Whether the sling let go at all is itself a shared answer: this engine used to
         # be the one that could not tell, and a launch it thought was fine is exactly
         # where it used to invent a throw. Only a graze is exempt, and only up to the
@@ -381,15 +463,14 @@ def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
             # The snap penalty's input is a shared quantity, not a fast-engine invention:
             # in the regime where the two engines model the same physics they must also
             # agree about how close to slack the sling ran, or the search would be steered
-            # by a number the reference engine would score differently. Same trapezoid
-            # caveat as the counterweight impulse below - the integrand kinks where the
-            # tension crosses the floor, so two adaptive step grids sum it slightly
-            # differently. Most designs sit at exactly zero on both engines, which is the
-            # agreement the penalty most needs; the 1e-2 absolute floor covers the
-            # boundary band where one engine reads a sliver of slack before a release the
-            # other takes straight out of the taut regime.
+            # by a number the reference engine would score differently. The old band here
+            # was 30% and a 1e-2 floor, because both engines summed a trapezoid over their
+            # own accepted steps and the integrand kinks where the tension crosses the
+            # floor. Both integrate it as an ODE state now (physics.N_QUADRATURE), so the
+            # step grid no longer decides the answer and the two agree to a few parts in a
+            # thousand.
             assert sling_deficit == pytest.approx(
-                ref.metrics["sling_tension_deficit"], rel=3e-1, abs=1e-2
+                ref.metrics["sling_tension_deficit"], rel=1e-2, abs=1e-3
             ), design
 
         if ref_released:
@@ -431,14 +512,23 @@ def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
                 ref.metrics["cw_rope_compression_impulse"], rel=3e-2, abs=1e-3
             ), design
 
-    # Sanity-check the grid actually exercised every arm of the launch.
-    assert quiet_cases > 5
+    # Sanity-check the grid actually exercised every arm of the launch. A quiet launch is
+    # one the pulley machine can have and the traditional machine cannot: this machine is
+    # loaded with its stone on the ground, so every one of its launches spends part of
+    # itself in a grounded regime by construction, and asking for a quiet draw from it
+    # would be asking for a machine loaded some other way.
+    if machine is MachineType.PULLEY:
+        assert quiet_cases > 5
+    else:
+        assert quiet_cases == 0
     assert eventful_cases > 20
     assert grounded_cases > 10
-    # And that the escape hatch stayed an escape hatch: two draws in 196 over both
-    # machines, one per constraint - a sling grazing zero tension on the pulley machine and
-    # a stone skimming the ground on the traditional one.
-    assert undecided_cases <= 2
+    # And that the escape hatch stayed an escape hatch: 8 draws in 196 over both machines,
+    # against 196 - 8 held to the full comparison. It grew from 2 when it grew from "the
+    # reference disagrees with itself about how often the stone landed" to "...about the
+    # shape of the launch or what its discontinuities cost", which is the right question
+    # and catches more draws asking it (see _regimes_undecided).
+    assert undecided_cases <= 8
 
 
 @pytest.mark.parametrize("machine", list(MachineType))
@@ -453,8 +543,10 @@ def test_fast_engine_reproduces_the_energy_a_snap_destroys(machine):
     """
     snapping_cases = 0
 
-    for design, _params, ref, fast in _parameter_grid(machine):
-        if _exhausted(ref):
+    for design, params, ref, fast in _parameter_grid(machine):
+        if _exhausted(ref) or _regimes_undecided(params, ref):
+            # A launch whose regime sequence is itself settled by rounding has no snap
+            # energy to compare - see _regimes_undecided.
             continue
         ref_energy = ref.metrics["sling_snap_energy"]
         if ref_energy < _SNAP_ENERGY_NOISE_FLOOR:
@@ -490,9 +582,20 @@ def test_both_engines_stop_the_launch_where_the_beam_reaches_the_ground(machine)
     arm = values["arm_length"]
     linkage = values.get("length_counterweight", 0.0)
 
-    # Tall enough to swing, then short enough that it cannot.
-    clears = _reference_params(values, machine, pivot_height=arm + linkage + 0.5)
-    digs = _reference_params(values, machine, pivot_height=arm / 2.0)
+    # Which end of the beam can reach the ground differs by machine, because the two are
+    # cocked on opposite sides of vertical. The pulley machine starts with its arm raised
+    # and cos(theta) > 0, so the tip descends as the arm turns and digs in whenever the arm
+    # is longer than the pivot is tall. The traditional machine is cocked nose-down with
+    # cos(theta) < 0, so its tip *rises* through the first half turn - its short end is what
+    # comes down, and that reaches the ground when the counterweight arm is longer than the
+    # pivot is tall. Both are branches of physics._first_arm_ground_angle; one test geometry
+    # cannot exercise both.
+    if machine is MachineType.PULLEY:
+        clear_pivot, dig_pivot = arm + 0.5, arm / 2.0
+    else:
+        clear_pivot, dig_pivot = arm * 0.7, linkage / 2.0
+    clears = _reference_params(values, machine, pivot_height=clear_pivot)
+    digs = _reference_params(values, machine, pivot_height=dig_pivot)
 
     ref_clears = simulate_trebuchet(clears, rtol=1e-6, dense_output=False)
     ref_digs = simulate_trebuchet(digs, rtol=1e-6, dense_output=False)
@@ -501,8 +604,8 @@ def test_both_engines_stop_the_launch_where_the_beam_reaches_the_ground(machine)
     assert ref_digs.metrics["release_occurred"] is False
     assert ref_digs.distance == 0.0
 
-    fast_clears = _simulate_fast(values, machine, pivot_height=arm + linkage + 0.5)
-    fast_digs = _simulate_fast(values, machine, pivot_height=arm / 2.0)
+    fast_clears = _simulate_fast(values, machine, pivot_height=clear_pivot)
+    fast_digs = _simulate_fast(values, machine, pivot_height=dig_pivot)
     assert fast_clears[0] == ref_clears.metrics["release_occurred"]
     assert fast_digs[0] is False
     assert fast_digs[1] == 0.0
@@ -562,7 +665,8 @@ def test_evaluate_population_matches_per_individual_score(machine):
         fixed["pivot_height"], fixed["pulley_density"], fixed["arm_density"],
         fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
-        fixed["joint_friction_coefficient"], has_pulley,
+        fixed["joint_friction_coefficient"], fixed["bearing_friction_coefficient"],
+        fixed["pivot_shaft_radius"], has_pulley,
         30.0, 5.0, 1.0, 0.15, 200.0, 300.0, 20.0,
     )
 
@@ -574,7 +678,49 @@ def test_evaluate_population_matches_per_individual_score(machine):
             fixed["pivot_height"], fixed["pulley_density"], fixed["arm_density"],
             fixed["projectile_mass"], fixed["projectile_radius"], fixed["initial_arm_angle"],
             fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
-            fixed["joint_friction_coefficient"], has_pulley,
+            fixed["joint_friction_coefficient"], fixed["bearing_friction_coefficient"],
+            fixed["pivot_shaft_radius"], has_pulley,
             30.0, 5.0, 1.0, 0.15, 200.0, 300.0, 20.0,
         )
         assert costs[i] == pytest.approx(expected)
+
+
+def test_the_sling_lifting_a_grounded_stone_leaves_the_grounded_regime():
+    """A re-tension that snaps a stone off the ground puts it in the air, in both engines.
+
+    The sling coming taut over a projectile lying in the dirt is resolved by taking the
+    free snap first and using it whenever it leaves the stone rising: that is the sling
+    picking the stone up, and the stone is then airborne with the sling still carrying
+    nothing - SLACK, not SLACK_GROUND.
+
+    This engine used to copy the snapped state and leave the regime alone, so a launch
+    that reached the snap from SLACK_GROUND stayed grounded. The grounded dynamics pin
+    dy/dt at zero, so the stone kept the upward velocity the snap had just given it and
+    never moved, while the reference flew it. It is not a corner the search can avoid:
+    the reference takes that branch 245 times in 500 random draws over these bounds.
+
+    The design below walks all four regimes and makes exactly that crossing, and unlike
+    most launches carrying this many discontinuities it has a settled answer to hold the
+    two engines to - the same seven regimes and 2.47727-2.47728 m at rtol 1e-6 through
+    1e-10. Before the fix the reference threw it 2.477 m and this engine threw nothing.
+    """
+    values = {
+        "counter_weight_mass": 32.467516,
+        "pulley_radius": 0.142788,
+        "arm_length": 1.072829,
+        "string_length": 1.738,
+        "release_angle": -0.853532,
+    }
+    pivot = 1.3314
+    ref = simulate_trebuchet(
+        _reference_params(values, pivot_height=pivot), rtol=1e-6, dense_output=False
+    )
+    regimes = [seg.regime for seg in ref.solution.segments]
+    # The crossing under test: the grounded slack regime handing straight back to the
+    # airborne one, with nothing landing in between.
+    assert "slack_ground" in regimes
+    assert regimes[regimes.index("slack_ground") + 1] == "slack"
+
+    released, distance = _simulate_fast(values, pivot_height=pivot)[:2]
+    assert released is True
+    assert distance == pytest.approx(ref.distance, rel=1e-3)
