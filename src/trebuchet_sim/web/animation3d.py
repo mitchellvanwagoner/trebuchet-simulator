@@ -245,41 +245,74 @@ _HTML_TEMPLATE = r"""
   let [vw, vh] = viewportSize();
 
   // The camera sits behind the trebuchet (negative x, like an operator's view)
-  // but aims downrange toward the target, pulled back just far enough that the
-  // machine AND the entire flight path sit inside the view frustum.
+  // and frames THE MACHINE, not the whole flight.
+  //
+  // It used to frame both, anchoring the trebuchet in one corner and the impact
+  // point in the other. That is the right shot for "where did it land", and the
+  // wrong one for watching the machine work: a 30 m throw is two orders of
+  // magnitude longer than a 0.4 m arm, so fitting the arc renders the whole
+  // trebuchet about fifteen pixels wide and a 40 mm stone smaller than a pixel.
+  // Everything worth looking at up close - the sling going slack, the stone
+  // resting on the ground, the beam sweeping past it - was invisible at that
+  // scale, which is exactly the question the animation is there to answer.
+  //
+  // So the subject is the launch: the machine's own reach plus wherever the
+  // stone actually goes while it is still attached. The ballistic arc leaves the
+  // frame, deliberately; the faint reference path is still drawn all the way to
+  // the impact point, so where the stone exits is visible, and the 2D view keeps
+  // its pan/zoom for following it out.
   const machineReach = geo.arm_length + geo.string_length;
+  // Kept at full flight extent: the ground plane, the fog and the reference path
+  // still have to cover where the stone lands, even though the shot does not.
   let trajMaxX = Math.max(DATA.final_distance || 0, 5);
   let trajMaxY = geo.pivot_height + machineReach;
-  const framePoints = [
-    new THREE.Vector3(-machineReach, 0, 0),
-    new THREE.Vector3(0, trajMaxY, 0),
-    new THREE.Vector3(trajMaxX, 0, 0),
-  ];
-  launchFrames.concat(releaseFrames).forEach((f) => {
+  releaseFrames.forEach((f) => {
     trajMaxX = Math.max(trajMaxX, f.projectile[0]);
     trajMaxY = Math.max(trajMaxY, f.projectile[1]);
-    framePoints.push(new THREE.Vector3(f.projectile[0], f.projectile[1], 0));
   });
 
-  // Shot composition: the trebuchet in the bottom-left of the frame, the
-  // impact point in the top-right, and the whole trajectory contained.
-  // Solved numerically at load: coordinate descent over the aim point, camera
-  // elevation, and distance, scoring the two anchor projections plus an
-  // out-of-frame penalty for every trajectory sample.
-  const machineRef = new THREE.Vector3(0, geo.pivot_height * 0.5, 0);
-  const impactRef = new THREE.Vector3(trajMaxX, 0, 0);
-  const MACHINE_NDC = { x: -0.78, y: -0.7 };
-  const IMPACT_NDC = { x: 0.8, y: 0.6 };
+  // The framed subject: everything the machine occupies during the launch. The
+  // beam's back end counts too - on the traditional machine it carries the
+  // counterweight and swings the other way.
+  const backReach = Math.max(geo.arm_back_length || 0, geo.pulley_radius || 0);
+  let subMinX = -Math.max(machineReach, backReach), subMaxX = machineReach;
+  let subMinY = 0, subMaxY = geo.pivot_height + machineReach;
+  const framePoints = [];
+  launchFrames.forEach((f) => {
+    ["projectile", "arm_tip", "counterweight", "cw_pin"].forEach((key) => {
+      const p = f[key];
+      if (!p) return;
+      subMinX = Math.min(subMinX, p[0]); subMaxX = Math.max(subMaxX, p[0]);
+      subMinY = Math.min(subMinY, p[1]); subMaxY = Math.max(subMaxY, p[1]);
+    });
+  });
+  [[subMinX, subMinY], [subMaxX, subMinY], [subMinX, subMaxY], [subMaxX, subMaxY]].forEach(
+    ([x, y]) => framePoints.push(new THREE.Vector3(x, y, 0))
+  );
+
+  // Shot composition: the subject box's two opposite corners pinned near
+  // opposite corners of the frame, so the machine fills the shot. Solved
+  // numerically at load by coordinate descent over the aim point, camera
+  // elevation and distance, scoring the two anchor projections plus an
+  // out-of-frame penalty on the box.
+  const machineRef = new THREE.Vector3(subMinX, subMinY, 0);
+  const impactRef = new THREE.Vector3(subMaxX, subMaxY, 0);
+  const MACHINE_NDC = { x: -0.72, y: -0.72 };
+  const IMPACT_NDC = { x: 0.72, y: 0.72 };
 
   const lookTarget = new THREE.Vector3();
   const camera = new THREE.PerspectiveCamera(38, vw / vh, 0.05, 2000);
+  const subW = Math.max(subMaxX - subMinX, 1e-3);
+  const subH = Math.max(subMaxY - subMinY, 1e-3);
   const fit = {
-    lookX: trajMaxX * 0.5,
-    lookY: trajMaxY * 0.35,
+    lookX: (subMinX + subMaxX) / 2,
+    lookY: (subMinY + subMaxY) / 2,
     dirY: 0.42,
-    // Start well behind the machine so every point is in front of the camera;
-    // starting too close traps the descent in a degenerate local minimum.
-    dist: Math.max(machineReach * 3, trajMaxX * 1.1, 6),
+    // Start well back so every corner is in front of the camera; starting too
+    // close traps the descent in a degenerate local minimum. Scaled to the
+    // subject now rather than to the throw - on a 30 m shot the old seed opened
+    // 33 m away from a 1 m machine and the descent never pulled all the way in.
+    dist: Math.max(subW, subH) * 2.2 + 2,
   };
 
   function placeCamera() {
@@ -321,8 +354,10 @@ _HTML_TEMPLATE = r"""
   }
   while (!allInView() && fit.dist < 2000) fit.dist *= 1.08;
 
-  const steps = { lookX: trajMaxX * 0.25, lookY: Math.max(trajMaxY * 0.25, 1), dirY: 0.15, dist: fit.dist * 0.25 };
-  const clamps = { dirY: [0.02, 1.2], dist: [machineReach * 1.5, 2000] };
+  const steps = { lookX: subW * 0.25, lookY: Math.max(subH * 0.25, 0.25), dirY: 0.15, dist: fit.dist * 0.25 };
+  // The lower distance clamp has to let the camera come in close enough to fill
+  // the frame with a small machine, which machineReach * 1.5 did not.
+  const clamps = { dirY: [0.02, 1.2], dist: [Math.max(subW, subH) * 0.6, 2000] };
   let bestScore = composeScore();
   for (let iter = 0; iter < 40; iter++) {
     for (const k in steps) {
@@ -369,7 +404,14 @@ _HTML_TEMPLATE = r"""
   // default framing on every run. Since srcdoc iframes share the parent's origin,
   // localStorage survives the reload, so we save the user's pan/zoom/rotate and
   // restore it instead of the computed auto-fit once they've touched the camera.
-  const CAMERA_STORAGE_KEY = "trebuchet3d.cameraState";
+  // Versioned, and the version is part of the contract: a saved view is only
+  // meaningful against the auto-fit it was a deviation from. When the default
+  // framing changes - as it did when the shot stopped fitting the whole flight
+  // and started filling the frame with the machine - every stored view is a
+  // camera parked for the old composition, and restoring it silently hides the
+  // new one from exactly the people who have used the thing most. Bump this
+  // whenever the framing changes; the old key is simply abandoned.
+  const CAMERA_STORAGE_KEY = "trebuchet3d.cameraState.v2";
   let saveTimer = null;
 
   function saveCameraState() {
@@ -539,14 +581,12 @@ _HTML_TEMPLATE = r"""
   );
   scene.add(refLine);
 
-  // Frame the 2D side view around everything that moves: the full projectile
-  // path plus the trebuchet itself (arm + string reach around the pivot).
-  const reach = geo.arm_length + geo.string_length;
-  let bMinX = -reach, bMaxX = Math.max(5, reach), bMinY = 0, bMaxY = geo.pivot_height + reach;
-  fullPathPoints.forEach((p) => {
-    bMinX = Math.min(bMinX, p.x); bMaxX = Math.max(bMaxX, p.x);
-    bMaxY = Math.max(bMaxY, p.y);
-  });
+  // Frame the 2D side view on the same subject the 3D shot uses - the machine
+  // and the launch - rather than on the full projectile path. Same reasoning:
+  // fitting a 30 m arc leaves the trebuchet a few pixels across. This view keeps
+  // its pan/zoom (controls2D), so following the stone out to the impact point is
+  // a scroll away, and the faint reference path shows where it went.
+  let bMinX = subMinX, bMaxX = subMaxX, bMinY = subMinY, bMaxY = subMaxY;
 
   function fit2D() {
     const pad = 1.08;

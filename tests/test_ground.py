@@ -305,7 +305,11 @@ def test_the_animations_draw_the_projectile_on_the_ground_rather_than_under_it(m
     result = simulate_trebuchet(params, simulate_aftermath=True)
     frames = _build_timeline(params, result)["launch_frames"]
 
-    assert min(frame["projectile"][1] for frame in frames) >= -1e-6
+    # Against the projectile's own resting line - its centre one radius up - not
+    # against y = 0. The looser bound passed for a stone drawn with its centre in
+    # the dirt, i.e. buried to its equator, which is the whole error this file is
+    # about and is a full radius of slack on a 40 mm ball.
+    assert min(frame["projectile"][1] for frame in frames) >= params.projectile_radius - 1e-6
     assert frames[0]["projectile"] == list(result.solution.projectile_state(0.0)[0])
 
 
