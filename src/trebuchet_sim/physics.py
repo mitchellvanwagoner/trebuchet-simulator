@@ -1397,6 +1397,102 @@ class TrebuchetSimulator:
         return [theta_dot, theta_ddot, pvx, pvy, ax, ay, psi_dot, psi_ddot,
                 *self._quadrature_rates(0.0, cw_T)]
 
+    def _sling_geometry(self, theta, px, py):
+        """`_grounded_geometry` for a projectile that is not on the ground.
+
+        Same five numbers - the unit vector from the arm tip to the stone, the tip's
+        first and second derivatives with respect to theta projected onto it, and the
+        actual separation - but measured to wherever the stone is rather than to the
+        resting line. The grounded version is this with py pinned, and stays separate
+        because it can skip carrying a y it already knows.
+        """
+        l_a = self._l_a
+        sin_t, cos_t = math.sin(theta), math.cos(theta)
+        tip_x, tip_y = l_a * cos_t, l_a * sin_t + self._h_T
+        dx, dy = px - tip_x, py - tip_y
+        dist = math.hypot(dx, dy)
+        if dist < 1e-12:
+            dist = 1e-12
+        ex, ey = dx / dist, dy / dist
+        return ex, ey, -l_a * sin_t * ex + l_a * cos_t * ey, -l_a * cos_t * ex - l_a * sin_t * ey, dist
+
+    def beam_taut_forces(self, y) -> Tuple[float, float]:
+        """(sling tension, beam normal force) for a stone both slung and touching the arm.
+
+        Two one-sided constraints at once, which is the same shape as TAUT_GROUND and for
+        the same reason: with the sling holding its length and the beam holding the stone
+        off its surface, the stone has no freedom left relative to the machine, and both
+        forces are determined. The regime ends when either reaches zero - the sling lets
+        go, or the stone leaves the arm - so both are events.
+
+        They have to be solved together rather than in sequence, because each enters the
+        other's equation twice over: through the stone's acceleration, and through
+        theta_ddot, which both of them torque. Writing the sling constraint and the
+        contact constraint with theta_ddot eliminated leaves
+
+            [ K1  -K2 ] [T]   [R1]
+            [ K2  -K3 ] [u] = [R2]
+
+        whose off-diagonals are equal, as they must be - K2 is the coupling between the
+        two constraint directions and does not care which order they are written in, and
+        an implementation error that broke that symmetry would quietly inject energy.
+        """
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
+        return self._beam_taut_solve(theta, theta_dot, px, py, pvx, pvy, psi, psi_dot)[:2]
+
+    def _beam_taut_solve(self, theta, theta_dot, px, py, pvx, pvy, psi, psi_dot):
+        """(T, N, u, theta_ddot, psi_ddot, ax, ay) with both constraints live."""
+        m_p = self._m_p
+        sx, sy, A, b, dist = self._sling_geometry(theta, px, py)
+        _ex, _ey, nx, ny, s, d, v_e, _v_n, sigma, _d_dot = self._beam_contact_terms(
+            theta, theta_dot, px, py, pvx, pvy
+        )
+        Q_theta, Q_psi, M13 = self._machine_only_forces(theta, theta_dot, psi, psi_dot)
+        M_eff = self._M_taut - M13 * M13 / self._M33
+        Q_eff = Q_theta - M13 * Q_psi / self._M33
+
+        f_x, f_y = self._projectile_external_force(pvx, pvy)
+        c = sx * nx + sy * ny                    # sling direction against the contact normal
+
+        # Relative speed of stone and tip, squared: what the rigid sling needs to keep
+        # its length, exactly as grounded_forces uses it.
+        rel_x = pvx + theta_dot * self._l_a * math.sin(theta)
+        rel_y = pvy - theta_dot * self._l_a * math.cos(theta)
+        w = rel_x * rel_x + rel_y * rel_y
+
+        K1 = 1.0 / m_p + A * A / M_eff
+        K2 = c / m_p + A * s / M_eff
+        K3 = 1.0 / m_p + s * s / M_eff
+        R1 = (f_x * sx + f_y * sy) / m_p - A * Q_eff / M_eff - b * theta_dot * theta_dot + w / dist
+        R2 = (f_x * nx + f_y * ny) / m_p - 2.0 * theta_dot * v_e - s * Q_eff / M_eff \
+            - theta_dot * theta_dot * d
+
+        det = K2 * K2 - K1 * K3
+        if abs(det) < 1e-15:
+            return 0.0, 0.0, 0.0, Q_eff / M_eff, (Q_psi - M13 * Q_eff / M_eff) / self._M33, 0.0, 0.0
+        T = (K2 * R2 - R1 * K3) / det
+        u = (K1 * R2 - K2 * R1) / det
+
+        theta_ddot = (Q_eff + T * A - u * s) / M_eff
+        psi_ddot = (Q_psi - M13 * theta_ddot) / self._M33
+        ax = (f_x - T * sx + u * nx) / m_p
+        ay = (f_y - T * sy + u * ny) / m_p
+        return T, u * sigma, u, theta_ddot, psi_ddot, ax, ay
+
+    def _beam_taut_dynamics(self, t: float, y) -> List[float]:
+        """Sling taut and the stone against the beam: both constraint forces carry."""
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
+        T, _N, _u, theta_ddot, psi_ddot, ax, ay = self._beam_taut_solve(
+            theta, theta_dot, px, py, pvx, pvy, psi, psi_dot
+        )
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
+        return [theta_dot, theta_ddot, pvx, pvy, ax, ay, psi_dot, psi_ddot,
+                *self._quadrature_rates(T, cw_T)]
+
     def _apply_beam_impulse(self, y) -> Tuple[List[float], float]:
         """Land the stone on the beam: an inelastic impulse along the contact normal.
 

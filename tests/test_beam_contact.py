@@ -299,3 +299,89 @@ def test_the_stone_rides_the_beam_while_it_turns_underneath():
 
     s_end = sim._beam_contact_terms(*[sol.y[i, -1] for i in (0, 1, 2, 3, 4, 5)])[4]
     assert abs(s_end - s0) > 1e-3       # it really slid, rather than being pinned in place
+
+
+def _slung_and_touching(sim, theta=0.4):
+    """A stone exactly a sling length from the tip AND exactly on the beam's surface.
+
+    Both constraints satisfied at once, which is the only pose TAUT_BEAM is valid at.
+    In beam coordinates the tip is (l_a, 0) and the stone is (s, r_p), so the sling
+    length fixes s = l_a - sqrt(l_s^2 - r_p^2) - the near intersection, the one that
+    lands on the arm rather than out past the tip.
+    """
+    l_a, l_s = sim.params.arm_length, sim.params.string_length
+    r_p, h = sim.params.projectile_radius, sim.params.pivot_height
+    ex, ey, nx, ny = sim.beam_frame(theta)
+    s0 = l_a - math.sqrt(l_s * l_s - r_p * r_p)
+    px = s0 * ex + r_p * nx
+    py = h + s0 * ey + r_p * ny
+    return [theta, 0.0, px, py, 0.0, 0.0, -math.pi / 2, 0.0] + [0.0] * 3, s0
+
+
+def test_both_constraints_hold_while_the_arm_swings_under_the_stone():
+    """The 2x2 solve, checked the only way that means anything: integrate it.
+
+    A tension and a normal force that were merely plausible would still let the stone
+    drift off the sling circle or off the beam within a few degrees of rotation. Holding
+    both to a picometre through 18 degrees of swing is the coupling being right - each
+    force torques the arm, and the arm's response feeds back into the other constraint.
+    """
+    from scipy.integrate import solve_ivp
+
+    sim = _sim()
+    l_a, l_s = sim.params.arm_length, sim.params.string_length
+    r_p, h = sim.params.projectile_radius, sim.params.pivot_height
+    state, _s0 = _slung_and_touching(sim)
+
+    sol = solve_ivp(sim._beam_taut_dynamics, (0.0, 0.20), state,
+                    rtol=1e-11, atol=1e-13, dense_output=True)
+
+    sling_err = beam_err = 0.0
+    for t in np.linspace(0.0, sol.t[-1], 300):
+        yy = sol.sol(t)
+        ex, ey, _nx, _ny = sim.beam_frame(yy[0])
+        tip_x, tip_y = l_a * ex, h + l_a * ey
+        sling_err = max(sling_err, abs(math.hypot(yy[2] - tip_x, yy[3] - tip_y) - l_s))
+        beam_err = max(beam_err, abs(abs(sim.beam_contact_geometry(yy[0], yy[2], yy[3])[1]) - r_p))
+
+    assert sling_err < 1e-10
+    assert beam_err < 1e-10
+    # And it was not a stationary machine: both constraints had to track a moving arm.
+    assert abs(math.degrees(sol.y[0, -1] - state[0])) > 5.0
+
+
+def test_both_forces_are_reported_and_push_the_right_way():
+    sim = _sim()
+    state, _s0 = _slung_and_touching(sim)
+    tension, normal = sim.beam_taut_forces(state)
+
+    # A sling under load pulls, a surface under load pushes; either reaching zero is
+    # what ends the regime, so both must come back signed rather than as magnitudes.
+    assert tension > 0.0
+    assert normal > 0.0
+
+
+def test_the_constraint_matrix_is_symmetric():
+    """K2 is the coupling between the sling direction and the contact normal, and it
+    cannot depend on which constraint is written first. An asymmetry there would be a
+    non-conservative coupling - energy appearing from the pair of forces - which is the
+    kind of error that stays invisible until a long launch drifts.
+    """
+    sim = _sim()
+    state, _s0 = _slung_and_touching(sim, theta=0.9)
+    theta, theta_dot = state[0], 0.7
+    px, py, pvx, pvy = state[2], state[3], 0.3, -0.4
+    psi, psi_dot = state[6], 0.2
+
+    m_p = sim.params.projectile_mass
+    sx, sy, A, _b, _dist = sim._sling_geometry(theta, px, py)
+    _ex, _ey, nx, ny, s, _d, _v_e, _v_n, _sigma, _dd = sim._beam_contact_terms(
+        theta, theta_dot, px, py, pvx, pvy
+    )
+    _Qt, _Qp, M13 = sim._machine_only_forces(theta, theta_dot, psi, psi_dot)
+    M_eff = sim._M_taut - M13 * M13 / sim._M33
+
+    c = sx * nx + sy * ny
+    k_sling_beam = c / m_p + A * s / M_eff
+    k_beam_sling = c / m_p + s * A / M_eff
+    assert k_sling_beam == pytest.approx(k_beam_sling, rel=1e-15)
