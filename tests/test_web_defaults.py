@@ -42,6 +42,19 @@ def _run(app=None):
     return app
 
 
+def _metric(app):
+    """Put the page in metric units, whatever the dashboard's own default is.
+
+    These tests are about saved defaults being per-machine, and they address the boxes by
+    label and compare canonical SI values. The unit toggle decides both - "Target (m)"
+    against "Target (ft)", 30.0 against 98.43 - so pinning it here keeps them testing the
+    thing they are about rather than re-failing whenever the default unit changes (it did,
+    when imperial became the default).
+    """
+    toggle = [t for t in app.toggle if t.label == "Imperial units"][0]
+    return _run(toggle.set_value(False)) if toggle.value else app
+
+
 def _box(app, label):
     matches = [n for n in app.number_input if n.label == label]
     assert matches, f"no {label!r} box on the page"
@@ -57,7 +70,7 @@ def _save(app):
 
 
 def test_each_machine_keeps_its_own_target_and_weights(data_dir):
-    app = _run()
+    app = _metric(_run())
 
     # Pulley: a target and a weight nothing else would produce.
     app = _run(_box(app, "Target (m)").set_value(47.0))
@@ -85,7 +98,7 @@ def test_each_machine_keeps_its_own_target_and_weights(data_dir):
     assert saved["machines"]["pulley"]["optimizable"]
 
     # And each machine gets its own back on a fresh session.
-    app = _run()
+    app = _metric(_run())
     assert _box(app, "Target (m)").value == 88.0  # traditional was saved last, so it opens
     app = _set_machine(app, "pulley")
     assert _box(app, "Target (m)").value == 47.0
@@ -108,7 +121,7 @@ def test_a_one_machine_defaults_file_still_loads_and_survives_the_next_save(data
     }
     (data_dir / "user_defaults.json").write_text(json.dumps(legacy))
 
-    app = _run()
+    app = _metric(_run())
     # It opens on the machine it was written for, carrying that machine's values...
     assert app.segmented_control[0].value == "traditional"
     assert _box(app, "Target (m)").value == 61.0

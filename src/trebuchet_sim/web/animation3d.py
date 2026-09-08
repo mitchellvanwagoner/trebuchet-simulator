@@ -196,7 +196,7 @@ _HTML_TEMPLATE = r"""
   <canvas id="treb-canvas"></canvas>
   <div id="treb-controls">
     <button id="treb-playpause">Pause</button>
-    <button id="treb-view" title="Toggle between the 3D isometric view and a flat 2D side view">2D view</button>
+    <button id="treb-view">2D view</button>
     <input id="treb-scrub" type="range" min="0" max="1000" value="0" />
     <span id="treb-time">0.00 / 0.00 s</span>
     <select id="treb-speed">

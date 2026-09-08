@@ -308,6 +308,19 @@ class TrebuchetParams:
     counter_weight_density: float = 7850               # kg/m^3, steel - sizes the counterweight's cube for ground collision
     projectile_mass: float = 0.25                     # kg (apple)
     projectile_radius: float = 0.04                   # m
+    # The arm's angle in the world, radians, measured the ordinary way: zero points from
+    # the pivot straight out along +x - horizontal, level with the pivot, and in the
+    # direction the machine throws - and positive turns counter-clockwise, raising the
+    # tip. Both machines use it, and both throw toward +x, so zero means the same thing on
+    # each: the long arm held out level, aimed downrange. The tip is at
+    # (l_a*cos(theta), l_a*sin(theta) + pivot_height), which is where that convention
+    # comes from and the only place it is expressed.
+    #
+    # Not to be confused with `release_angle`, which since it became the pin angle is
+    # measured from the *arm* to the sling rather than in the world at all.
+    #
+    # None means "resolve it per machine" - a constant for the pulley machine, geometry
+    # for the traditional one (see resolve_initial_arm_angle).
     initial_arm_angle: Optional[float] = None          # radians; None -> the machine's default
                                                        # (see DEFAULT_INITIAL_ARM_ANGLE)
     arm_drag_coefficient: float = 1.05

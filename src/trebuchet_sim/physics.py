@@ -830,6 +830,33 @@ class TrebuchetSimulator:
                 candidates.append(root - 2 * math.pi * turns)
         return max(candidates) if candidates else -math.inf
 
+    def _cocked_beam_clearance(self) -> float:
+        """How far the lowest end of the beam clears the ground at the cocked pose, in m.
+
+        Negative means the machine is standing in a hole: part of the beam is below the
+        ground before the launch has begun. Nothing downstream represents that, and the
+        beam's own ground event cannot catch it - `_first_arm_ground_angle` looks for the
+        first crossing *below* the cocked angle, which for a pose that starts underground
+        is the angle where the beam comes back up. So a launch cocked at -90 degrees on an
+        arm longer than its pivot is tall ran happily with its tip half a metre under, and
+        the stone hanging from it a sling length further down, until the beam surfaced.
+
+        This could not happen while the traditional machine's cocked angle was derived by
+        walking the arm down to the ground, which lands on the surface by construction. It
+        became reachable when that angle was made settable again, so it is checked rather
+        than assumed. The pulley machine has always been able to reach it too, by pairing
+        a low pivot with a long arm and a cocked angle below the horizontal.
+
+        Measured to y = 0, the line the beam touches, not to the projectile's own resting
+        height - a beam is not a sphere and does not rest on its radius.
+        """
+        sin_t = math.sin(float(self.params.initial_arm_angle))
+        # The two ends the beam can put in the ground; the pivot itself is at h_T, which
+        # is above ground for any machine that stands up at all.
+        tip_y = self._h_T + self._l_a * sin_t
+        back_y = self._h_T - self._arm_back_length * sin_t
+        return min(tip_y, back_y)
+
     def _cw_link_tension(self, theta: float, theta_dot: float, theta_ddot: float,
                          psi: float, psi_dot: float) -> float:
         """Tension in whatever carries the counterweight, in newtons.
@@ -1903,6 +1930,30 @@ class TrebuchetSimulator:
         release. It's opt-in: the optimizer objective and default callers never pay for it.
         """
         self.energy_history = []
+
+        # Refuse a machine that is already standing in the ground (see
+        # _cocked_beam_clearance). Checked before integrating rather than left to the
+        # beam's ground event, which by construction only looks for crossings below the
+        # cocked angle and so would let this run on underground until the beam surfaced.
+        clearance = self._cocked_beam_clearance()
+        if clearance < 0.0:
+            needed = self.params.pivot_height - clearance
+            # The two lengths ride alongside the message in SI so a caller that shows
+            # lengths in some other unit can say the same thing in that unit rather than
+            # quoting metres into a ft/in dashboard (web/app.py does exactly that). The
+            # message itself stays, because the CLI and any bare `metrics["error"]` reader
+            # want one sentence they can print without knowing the convention.
+            return SimulationResult(0.0, 0.0, {
+                "error": (
+                    f"The beam is {abs(clearance):.2f} m underground at the cocked angle of "
+                    f"{math.degrees(self.params.initial_arm_angle):.1f} deg, so there is no "
+                    f"machine to launch. Raise the pivot height to at least {needed:.2f} m, "
+                    "shorten the arm, or cock it closer to horizontal."
+                ),
+                "cocked_beam_depth": float(-clearance),
+                "required_pivot_height": float(needed),
+                "cocked_arm_angle_deg": float(math.degrees(self.params.initial_arm_angle)),
+            }, None)
 
         launch = self._integrate_launch(t_max, rtol=rtol, dense_output=dense_output or self.track_energy)
 

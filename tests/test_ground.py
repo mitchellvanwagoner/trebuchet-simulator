@@ -307,3 +307,53 @@ def test_the_animations_draw_the_projectile_on_the_ground_rather_than_under_it(m
 
     assert min(frame["projectile"][1] for frame in frames) >= -1e-6
     assert frames[0]["projectile"] == list(result.solution.projectile_state(0.0)[0])
+
+
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_a_machine_cocked_into_the_ground_is_refused_rather_than_simulated(machine):
+    """A cocked pose can put the beam underground, and the beam's own ground event cannot
+    catch it: `_first_arm_ground_angle` looks for the first crossing *below* the cocked
+    angle, which for a pose that starts under is the angle where the beam comes back up.
+    So the launch used to run happily with its tip buried and the stone hanging a sling
+    length below that, until the beam surfaced - the projectile "resting on the ground"
+    half a metre under it, and no ground contact recorded, because nothing had gone down
+    through the surface.
+
+    Reachable on both machines by cocking an arm longer than its pivot straight down; on
+    the traditional machine it became reachable the moment that angle went back to being
+    settable rather than derived by walking the arm down to the ground.
+    """
+    # A pivot half the arm's length, so straight down buries the tip by the other half -
+    # taken from the arm rather than fixed, because the two machines' arms differ by 4x
+    # and a single number would leave the pulley machine's unable to reach the ground.
+    arm_length = DEFAULT_MACHINE_PARAMS[machine]["arm_length"]
+    params = TrebuchetParams(
+        machine=machine,
+        **DEFAULT_MACHINE_PARAMS[machine],
+        **{**DEFAULT_MACHINE_FIXED[machine], "pivot_height": arm_length / 2},
+        initial_arm_angle=-np.pi / 2,
+    )
+    # The pose really is underground, so this is testing the guard and not the geometry.
+    assert params.arm_length > params.pivot_height
+    result = simulate_trebuchet(params)
+
+    assert "error" in result.metrics
+    assert result.distance == 0.0
+    depth = result.metrics["cocked_beam_depth"]
+    assert depth == pytest.approx(params.arm_length - params.pivot_height)
+    # The advice has to clear the beam, and is carried in SI beside the message so a
+    # caller showing ft/in can give it in ft/in (see web/app.py's error branch).
+    assert result.metrics["required_pivot_height"] == pytest.approx(params.arm_length)
+
+
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_a_machine_cocked_just_clear_of_the_ground_still_launches(machine):
+    """The other side of the guard above: it must refuse only the poses that are actually
+    buried, not every pose that comes near the ground. The derived traditional angle sits
+    50 mm off it by construction, so a guard that was even slightly over-eager would
+    reject that machine's own shipped defaults.
+    """
+    result = simulate_trebuchet(default_params(machine))
+
+    assert "error" not in result.metrics
+    assert result.distance > 0.0

@@ -59,8 +59,11 @@ title_col.markdown(
     "</div></div>",
     unsafe_allow_html=True,
 )
+# Imperial by default. `value` only seeds the first render - once the key exists in
+# session state Streamlit keeps whatever the user last set, so toggling to metric sticks
+# for the rest of the session.
 imperial = unit_col.toggle(
-    "Imperial units", key="imperial_units", help="Show lengths in ft/in, masses in lb, speeds in ft/s."
+    "Imperial units", key="imperial_units", value=True,
 )
 
 ANIMATION_HEIGHT = 440
@@ -98,9 +101,10 @@ def _fixed_defaults(machine: MachineType) -> dict:
     box with no default renders blank, which the solver reads as "not ready". A
     saved user_defaults.json used to hide that, so it showed up first on a fresh
     install - an empty TREBUCHET_DATA_DIR, i.e. a newly created container volume.
-    Only the pulley machine has a box to fill: the traditional machine's cocked angle
-    follows its arm length and pivot height (config.resolve_initial_arm_angle) and is
-    reported rather than typed.
+    This is the value the pulley machine's required box seeds from. The traditional
+    machine's box is optional and seeds from DEFAULT_MACHINE_FIXED instead, which carries
+    no angle for it - so that box opens blank, meaning "derive it from the geometry"
+    (config.resolve_initial_arm_angle).
     """
     defaults = dict(_DATACLASS_FIXED_DEFAULTS)
     defaults["initial_arm_angle"] = float(DEFAULT_INITIAL_ARM_ANGLE[machine])
@@ -110,11 +114,20 @@ def _fixed_defaults(machine: MachineType) -> dict:
     return defaults
 
 
-# Where the pulley machine's cocked arm may be set. Only that machine has the choice:
-# the traditional one is loaded by walking its long arm down to the ground, so its cocked
-# angle is geometry and is derived rather than entered (config.resolve_initial_arm_angle).
+# Where each machine's cocked arm may be set. The two sit on opposite sides of vertical -
+# the pulley arm starts raised behind the pivot, the traditional one nose-down in front of
+# it - so one signed range cannot serve both without also admitting the poses that don't
+# throw.
+#
+# The traditional machine's box is optional (see the input below): left blank, the angle is
+# derived from the geometry by walking the long arm down to the ground
+# (config.resolve_initial_arm_angle), which is how that machine is actually loaded and what
+# the optimizer needs, since the angle follows the arm length it is searching. A value
+# typed here pins it instead, which is a real thing to want - a machine that is cocked
+# somewhere other than all the way down - and is what this range is for.
 INITIAL_ARM_ANGLE_BOUNDS = {
     MachineType.PULLEY: (math.radians(5.0), math.radians(175.0)),
+    MachineType.TRADITIONAL: (math.radians(-175.0), math.radians(-5.0)),
 }
 
 # User-saved input defaults (💾 button), stored in canonical units (m, kg,
@@ -338,7 +351,7 @@ def _store_result(params: TrebuchetParams, result) -> None:
 
 def _length_pair_input(
     container, label: str, key_prefix: str, default_m: "float | None",
-    min_value: float, max_value: "float | None" = None, help: str = None,
+    min_value: float, max_value: "float | None" = None,
 ) -> "float | None":
     """Feet+inches sub-widget pair for a length field in Imperial mode.
 
@@ -377,7 +390,7 @@ def _length_pair_input(
     sub_feet, sub_inches = container.container(key=f"pair_{key_prefix}").columns(2)
     feet_val = sub_feet.number_input(
         f"{label} (ft)", min_value=0, max_value=feet_max, value=None,
-        key=ft_key, step=1, help=help,
+        key=ft_key, step=1,
     )
     inches_val = sub_inches.number_input(
         "(in)", min_value=0.0, max_value=11.99, value=None,
@@ -451,7 +464,7 @@ def _range_unit(kind: str, imperial: bool) -> _DisplayUnit:
 def _si_input(
     container, label: str, key: str, unit: _DisplayUnit,
     si_default: "float | None", si_min: float, si_max: float,
-    clearable: bool, help: str = None,
+    clearable: bool,
 ) -> "float | None":
     """One parameter box (or ft/in pair), in canonical SI and out again.
 
@@ -465,7 +478,7 @@ def _si_input(
     Returns None only when the box is blank.
     """
     if unit.is_pair:
-        return _length_pair_input(container, label, key, si_default, si_min, si_max, help=help)
+        return _length_pair_input(container, label, key, si_default, si_min, si_max)
 
     lo, hi = unit.to_display(si_min), unit.to_display(si_max)
     default = None if si_default is None else min(max(unit.to_display(si_default), lo), hi)
@@ -477,14 +490,14 @@ def _si_input(
 
     shown = container.number_input(
         f"{label} ({unit.suffix})", min_value=lo, max_value=hi, value=default,
-        key=key, format=f"%.{INPUT_DECIMALS}f", help=help,
+        key=key, format=f"%.{INPUT_DECIMALS}f",
     )
     return None if shown is None else unit.to_si(shown)
 
 
 def _optimizable_input(
     container, label: str, name: str, machine: MachineType,
-    kind: str = "length", imperial: bool = False, help: str = None,
+    kind: str = "length", imperial: bool = False,
 ) -> "tuple[float | None, float, bool]":
     """Number input for an optimizable parameter, paired with a lock toggle.
 
@@ -528,12 +541,11 @@ def _optimizable_input(
     lock_col.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
     locked = lock_col.toggle(
         f"Lock {label}", key=_widget_key("lock", name, machine), value=saved_locked, label_visibility="collapsed",
-        help="On: lock this parameter to the value in the box. Off: leave it free for the optimizer to search.",
     )
 
     value_si = _si_input(
         box_col, label, _widget_key("opt", name, machine), unit, fallback_si, si_min, si_max,
-        clearable=True, help=help
+        clearable=True,
     )
     raw = fallback_si if value_si is None else value_si
     effective = value_si if locked else None
@@ -609,7 +621,7 @@ def _fixed_input(
 
 def _fixed_input_optional(
     container, label: str, name: str, si_min: float, si_max: float, machine: MachineType,
-    kind: str = "length", imperial: bool = False, help: str = None,
+    kind: str = "length", imperial: bool = False,
 ) -> "float | None":
     """Number input for a fixed system parameter that may be left blank.
 
@@ -624,7 +636,7 @@ def _fixed_input_optional(
     unit = _display_unit(kind, imperial)
     return _si_input(
         container, label, _widget_key("fixed", name, machine), unit, saved, si_min, si_max,
-        clearable=True, help=help
+        clearable=True,
     )
 
 
@@ -669,14 +681,9 @@ def _fmt_speed(value_mps: float, imperial: bool) -> str:
     return f"{units.mps_to_fps(value_mps):.2f} ft/s" if imperial else f"{value_mps:.2f} m/s"
 
 
-def _section(title: str, hint: str = "") -> None:
-    """Small uppercase rule-header used to separate panel sections.
-
-    `hint` becomes a native title tooltip rather than a Streamlit help icon:
-    the dashboard is height-constrained, and a tooltip costs no vertical space.
-    """
-    attr = f' title="{html.escape(hint, quote=True)}"' if hint else ""
-    st.markdown(f'<div class="tb-section"{attr}>{html.escape(title)}</div>', unsafe_allow_html=True)
+def _section(title: str) -> None:
+    """Small uppercase rule-header used to separate panel sections."""
+    st.markdown(f'<div class="tb-section">{html.escape(title)}</div>', unsafe_allow_html=True)
 
 
 def _empty_state(mark: str, title: str, hint: str) -> str:
@@ -715,7 +722,21 @@ def _spec_list(specs: dict) -> None:
 
 def _show_results(params: TrebuchetParams, result, imperial: bool, target_distance: float) -> None:
     if "error" in result.metrics:
-        st.error(result.metrics["error"])
+        # A cocked pose standing in the ground carries its two lengths in SI beside the
+        # message, so the advice can be given in whatever unit the rest of the page is
+        # using - telling someone with a ft/in pivot box to raise it to "1.49 m" makes
+        # them do the conversion themselves.
+        depth = result.metrics.get("cocked_beam_depth")
+        if depth is not None:
+            st.error(
+                f"The beam is {_fmt_length(depth, imperial)} underground at the cocked angle "
+                f"of {result.metrics['cocked_arm_angle_deg']:.1f} deg, so there is no machine "
+                f"to launch. Raise the pivot height to at least "
+                f"{_fmt_length(result.metrics['required_pivot_height'], imperial)}, shorten "
+                "the arm, or cock it closer to horizontal."
+            )
+        else:
+            st.error(result.metrics["error"])
         return
 
     if not result.metrics.get("release_occurred", True):
@@ -811,7 +832,40 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
         unsafe_allow_html=True,
     )
 
+    # The machine's resolved geometry gets the cards, and the launch metrics the dense
+    # list below. That is the reverse of how these two started out, and deliberately: the
+    # geometry is the answer you would take away and build - especially the entries the
+    # optimizer chose, and the cocked angle, which on the traditional machine is derived
+    # rather than typed - while release velocity and flight time describe how that machine
+    # then behaved, which is a level down from what it *is*.
+    _section("Machine")
+    # Only the linkage this machine actually has: the other's parameter is carried on
+    # TrebuchetParams but unused, so listing it would be reporting a number that had no
+    # effect on the run above.
+    linkage_spec = (
+        {"CW arm length": _fmt_length(params.length_counterweight, imperial)}
+        if not params.has_pulley
+        else {"Pulley radius": _fmt_length(params.pulley_radius, imperial)}
+    )
     _metric_grid(
+        {
+            "Machine": "Pulley" if params.has_pulley else "Traditional",
+            "Counterweight mass": _fmt_mass(params.counter_weight_mass, imperial),
+            **linkage_spec,
+            "Arm length": _fmt_length(params.arm_length, imperial),
+            "String length": _fmt_length(params.string_length, imperial),
+            "String/arm ratio": f"{params.string_arm_ratio:.3f}",
+            "Release pin angle": f"{math.degrees(params.release_angle):.1f} deg",
+            "Initial arm angle": f"{math.degrees(params.initial_arm_angle):.1f} deg",
+            "Pivot height": _fmt_length(params.pivot_height, imperial),
+            "CW rope length": _fmt_length(params.initial_cw_rope_length, imperial),
+            "Projectile mass": _fmt_mass(params.projectile_mass, imperial),
+            "Total mass": _fmt_mass(params.total_mass, imperial),
+        }
+    )
+
+    _section("Launch")
+    _spec_list(
         {
             "Release velocity": _fmt_speed(result.metrics["release_velocity"], imperial),
             "Arm angle at release": f"{result.metrics['release_angle_deg']:.1f} deg",
@@ -821,33 +875,7 @@ def _show_results(params: TrebuchetParams, result, imperial: bool, target_distan
             "Projectile KE": f"{result.metrics['ke_projectile']:.1f} J",
             "Total PE spent": f"{result.metrics['total_pe_spent']:.1f} J",
             "Min sling tension": f"{result.metrics.get('min_string_tension', float('nan')):.1f} N",
-        }
-    )
-
-    _section("Machine")
-    # Only the linkage this machine actually has: the other's parameter is carried on
-    # TrebuchetParams but unused, so listing it would be reporting a number that had no
-    # effect on the run above.
-    linkage_spec = (
-        {"Pulley radius": _fmt_length(params.pulley_radius, imperial)}
-        if params.has_pulley
-        else {"CW arm length": _fmt_length(params.length_counterweight, imperial)}
-    )
-    _spec_list(
-        {
-            "Machine": "Pulley" if params.has_pulley else "Traditional",
-            "Counterweight mass": _fmt_mass(params.counter_weight_mass, imperial),
-            **linkage_spec,
-            "Arm length": _fmt_length(params.arm_length, imperial),
-            "String length": _fmt_length(params.string_length, imperial),
-            "String/arm ratio": f"{params.string_arm_ratio:.3f}",
-            "Release pin angle": f"{math.degrees(params.release_angle):.1f} deg",
-            "Pivot height": _fmt_length(params.pivot_height, imperial),
-            "Initial arm angle": f"{math.degrees(params.initial_arm_angle):.1f} deg",
-            "CW rope length": _fmt_length(params.initial_cw_rope_length, imperial),
-            "Projectile mass": _fmt_mass(params.projectile_mass, imperial),
             "Projectile radius": _fmt_length(params.projectile_radius, imperial),
-            "Total mass": _fmt_mass(params.total_mass, imperial),
         }
     )
 
@@ -861,7 +889,7 @@ with left:
     # Every input in this column stays visible with no scrolling; the optimizer
     # log at the bottom is the only element that flexes, absorbing whatever
     # vertical space the inputs leave over (see the opt_log_panel CSS).
-    _section("Machine", "Pick the counterweight linkage, then the fixed geometry it hangs on.")
+    _section("Machine")
     # Rendered before every other input, because it decides their defaults, bounds and
     # widget keys (see _widget_key).
     machine = MachineType(
@@ -872,9 +900,6 @@ with left:
             default=_saved_machine().value,
             key="machine_type",
             label_visibility="collapsed",
-            help="Pulley: the counterweight hangs from a rope over the pivot axle and drops "
-            "straight down. Traditional: it is bolted to the arm's short end and swings with "
-            "it. Switching reloads that machine's default geometry.",
         )
         # segmented_control returns None if the active pill is clicked again; keep the
         # machine we already had rather than leaving the page with no machine at all.
@@ -882,15 +907,21 @@ with left:
     )
     grid3, grid4 = st.columns(2)
     pivot_height = _fixed_input(grid3, "Pivot height", "pivot_height", 0.1, 5.0, machine, imperial=imperial)
-    # Only the pulley machine gets a cocked-angle box. The traditional machine is loaded
-    # by walking its long arm down until the tip is a hair off the ground, so its angle
-    # follows the arm length and the pivot height rather than being chosen; None here
-    # means TrebuchetParams derives it, and the Specifications panel reports what it got.
-    initial_arm_angle = None
+    # Both machines take a cocked angle here; they differ in whether it is required.
+    # The pulley machine's is a free choice with no natural default but the one in its
+    # box. The traditional machine's has a natural default - walking the long arm down to
+    # the ground is how the machine is loaded, and the angle that puts it there follows
+    # the arm length and pivot height - so its box is optional, and blank means "derive
+    # it" rather than "still typing". Typing a value pins the pose instead.
+    angle_min, angle_max = INITIAL_ARM_ANGLE_BOUNDS[machine]
     if machine is MachineType.PULLEY:
-        angle_min, angle_max = INITIAL_ARM_ANGLE_BOUNDS[machine]
         initial_arm_angle = _fixed_input(
             grid4, "Initial arm angle", "initial_arm_angle", angle_min, angle_max, machine, kind="angle",
+        )
+    else:
+        initial_arm_angle = _fixed_input_optional(
+            grid4, "Initial arm angle", "initial_arm_angle", angle_min, angle_max, machine,
+            kind="angle",
         )
     projectile_mass = _fixed_input(
         grid3, "Projectile mass", "projectile_mass", 0.001, 50.0, machine, kind="mass", imperial=imperial
@@ -899,15 +930,7 @@ with left:
         grid4, "Projectile radius", "projectile_radius", 0.001, 1.0, machine, imperial=imperial
     )
     counter_weight_rope_length = _fixed_input_optional(
-        grid4 if machine is MachineType.TRADITIONAL else grid3,
-        "CW rope length", "counter_weight_rope_length", 0.001, 5.0, machine, imperial=imperial,
-        help=(
-            "Rope from the pivot axle to the counterweight at t=0. Leave blank to "
-            "default to 2x the pulley radius (one wrap)."
-            if machine is MachineType.PULLEY
-            else "Link from the pin on the arm's short end to the counterweight. The weight "
-            "swings on it, so a longer link swings more slowly."
-        ),
+        grid3, "CW rope length", "counter_weight_rope_length", 0.001, 5.0, machine, imperial=imperial,
     )
 
     fixed_values = dict(
@@ -917,7 +940,8 @@ with left:
         projectile_radius=projectile_radius,
     )
     # A blank box means "still typing" and blocks the solve - except on the traditional
-    # machine's cocked angle, which has no box at all and is meant to arrive as None.
+    # machine's cocked angle, whose box is optional: blank there means "derive it from the
+    # geometry", which is a legal value and the one that machine defaults to.
     fixed_ready = all(
         value is not None
         for name, value in fixed_values.items()
@@ -930,34 +954,30 @@ with left:
     # it's kept out of the fixed_ready/required check above but still passed through.
     fixed_params_all = dict(fixed_values, counter_weight_rope_length=counter_weight_rope_length)
 
-    _section("Design variables", "Lock a parameter to pin it to the value in its box; unlocked leaves it free for the optimizer to search.")
+    _section("Design variables")
     grid1, grid2 = st.columns(2)
     # The linkage row is the one design variable that differs between the machines
     # (config.LINKAGE_PARAM): a pulley radius on one, the short arm's length on the
     # other. Both have their own widget keys, so each machine keeps its own box value
     # across a switch.
     linkage = LINKAGE_PARAM[machine]
-    linkage_label, linkage_help = {
-        "pulley_radius": ("Pulley radius", "How far the counterweight falls per radian of arm rotation."),
-        "length_counterweight": ("CW arm length", "How far the counterweight sits behind the pivot."),
+    linkage_label = {
+        "pulley_radius": "Pulley radius",
+        "length_counterweight": "CW arm length",
     }[linkage]
 
     # (container, label, name, kind) per row, laid out down the two columns.
     rows = [
-        (grid1, "Counterweight", "counter_weight_mass", "mass", None),
-        (grid2, linkage_label, linkage, "length", linkage_help),
-        (grid1, "Arm length", "arm_length", "length", None),
-        (grid2, "String length", "string_length", "length", None),
-        (grid1, "Release pin angle", "release_angle", "angle",
-         "Where the release pin sits, measured from the arm to the sling: 0 is a sling "
-         "lying straight out along the arm, positive is a sling trailing behind the tip. "
-         "The pin turns with the arm, so this - not the arm's angle in the world - is "
-         "what a real machine can actually be built to."),
+        (grid1, "Counterweight", "counter_weight_mass", "mass"),
+        (grid2, linkage_label, linkage, "length"),
+        (grid1, "Arm length", "arm_length", "length"),
+        (grid2, "String length", "string_length", "length"),
+        (grid1, "Release pin angle", "release_angle", "angle"),
     ]
     optimizable_values, optimizable_raw, optimizable_locked = {}, {}, {}
-    for container, label, name, kind, help_text in rows:
+    for container, label, name, kind in rows:
         value, raw, is_locked = _optimizable_input(
-            container, label, name, machine, kind=kind, imperial=imperial, help=help_text
+            container, label, name, machine, kind=kind, imperial=imperial
         )
         # value is None when the parameter is free; raw is always concrete, and both it
         # and the lock state are saved by the 💾 button so unlocking doesn't lose the
@@ -974,10 +994,9 @@ with left:
     custom_ranges = []
     with st.popover(
         "Search ranges", use_container_width=True,
-        help="Bounds the optimizer searches between. Locked parameters ignore theirs.",
     ):
         st.caption("Where the optimizer may look. Locked parameters are pinned, so their range is unused.")
-        for _container, label, name, _kind, _help_text in rows:
+        for _container, label, name, _kind in rows:
             bounds, is_custom = _range_input(st, label, name, machine, imperial)
             param_ranges[name] = bounds
             if is_custom:
@@ -985,7 +1004,7 @@ with left:
     if custom_ranges:
         st.caption(f"{len(custom_ranges)} custom range{'s' if len(custom_ranges) > 1 else ''}")
 
-    _section("Optimizer target", "Search for parameters that maximize launch efficiency at a target distance.")
+    _section("Optimizer target")
     # Target is the knob that changes per run, so it stays on the surface. The
     # four search-tuning values are set-once settings and live in a popover:
     # inline they cost a second input row, and that row is the difference
@@ -1012,33 +1031,26 @@ with left:
             # units toggle instead of showing feet under a metres label - the same split
             # the length inputs make (see _unit_dependent_inputs).
             key=_widget_key("target", "distance_ft", machine),
-            help="Target distance (ft)",
         )
         target_distance = target_distance_ft * units.METERS_PER_FOOT
     else:
         target_distance = target_col.number_input(
             "Target (m)", min_value=target_min_m, value=target_default_m,
             key=_widget_key("target", "distance_m", machine),
-            help="Target distance (m)",
         )
 
     tuning_col.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
-    with tuning_col.popover("Tuning", use_container_width=True, help="Search weights and convergence settings"):
+    with tuning_col.popover("Tuning", use_container_width=True):
         weight_col, dist_col = st.columns(2)
         efficiency_weight = weight_col.number_input(
             "Eff. weight", min_value=0.0,
             value=max(float(saved_target.get("efficiency_weight", OptimizationConfig.efficiency_weight)), 0.0),
             key=_widget_key("tune", "efficiency_weight", machine),
-            help="How strongly the objective rewards launch efficiency.",
         )
         distance_weight = dist_col.number_input(
             "Dist. weight", min_value=0.0,
             value=max(float(saved_target.get("distance_weight", OptimizationConfig.distance_weight)), 0.0),
             key=_widget_key("tune", "distance_weight", machine),
-            help="How strongly the objective penalizes missing the target. Against the "
-            "efficiency weight this is the exchange rate: efficiency points the search will "
-            "give up per 1% of target distance. Lower it to be shown the most efficient "
-            "machine near the target rather than one that hits it.",
         )
         population_size = weight_col.number_input(
             "Population",
@@ -1046,8 +1058,6 @@ with left:
             value=max(int(saved_target.get("population_size", OptimizationConfig.population_size)), 5),
             step=5,
             key=_widget_key("tune", "population_size", machine),
-            help="Differential-evolution population per free parameter. No upper cap - larger "
-            "searches more thoroughly, but runtime grows proportionally.",
         )
         absolute_tolerance = dist_col.number_input(
             "Tolerance",
@@ -1056,9 +1066,6 @@ with left:
             step=0.00001,
             format="%.8f",
             key=_widget_key("tune", "absolute_tolerance", machine),
-            help="Convergence tolerance on the final solution: the search stops once the "
-            "population's objective spread falls below this. Smaller = more precise but slower; "
-            "0 runs until the population fully converges or another stop condition is hit.",
         )
         # Full width rather than a third box in either column: its label doesn't fit the
         # half-width columns above, and the popover floats over the page, so an extra row
@@ -1072,8 +1079,6 @@ with left:
             ),
             step=50.0,
             key=_widget_key("tune", "snap_penalty_weight", machine),
-            help="How strongly the objective avoids designs whose sling runs close to slack. "
-            "Raise it if the winner still jerks; 0 optimizes on range and efficiency alone.",
         )
         jerk_penalty_weight = penalty_jerk.number_input(
             "Impact penalty",
@@ -1083,9 +1088,6 @@ with left:
             ),
             step=5.0,
             key=_widget_key("tune", "jerk_penalty_weight", machine),
-            help="Cost per joule the launch destroys in a sling snap or a ground impact. "
-            "A design that does neither pays nothing, so this only moves machines that "
-            "already jerk - typically ones on a pivot too low to swing the stone clear.",
         )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
@@ -1093,9 +1095,6 @@ with left:
     optimize_clicked = btn_opt.button("Optimize", disabled=not fixed_ready, use_container_width=True)
     if btn_save.button(
         "💾",
-        help="Save the current fixed, optimizable, and optimization-target parameters as "
-        "this machine's defaults. Each machine keeps its own set; saving one leaves the "
-        "other's alone",
         disabled=not fixed_ready,
         use_container_width=True,
     ):
