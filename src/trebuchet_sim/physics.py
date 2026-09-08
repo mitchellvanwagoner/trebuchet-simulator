@@ -367,6 +367,9 @@ class TrebuchetSimulator:
         # re-tension over a grounded projectile, the loading pose, and the geometry the
         # grounded regimes solve - is against this line rather than y = 0.
         self._ground_y = p.projectile_radius
+        # The same number, under the name the beam-contact geometry uses it by: there it
+        # is the sphere's radius about its own centre, not a height above the ground.
+        self._r_p = p.projectile_radius
         # The counterweight's contribution is the only thing that differs between
         # the two machines (see config.MachineType), and it enters in exactly two
         # places: an inertia about the pivot, and a gravity torque.
@@ -986,6 +989,7 @@ class TrebuchetSimulator:
         """
         string_T_min = math.inf
         cw_T_min = math.inf
+        beam_gap_min = math.inf
         string_impulse = 0.0
         cw_impulse = 0.0
         tension_floor = self._tension_floor
@@ -1027,6 +1031,10 @@ class TrebuchetSimulator:
                     )
                 string_T_min = min(string_T_min, string_T)
                 cw_T_min = min(cw_T_min, cw_T)
+                # How close the stone came to the beam it is being thrown by. Nothing
+                # stops the two interpenetrating yet, so this is the measurement that
+                # says whether a given design needs them to.
+                beam_gap_min = min(beam_gap_min, self.beam_clearance(y_i, seg.regime))
 
         duration = launch.t_end
         metrics = {
@@ -1055,6 +1063,14 @@ class TrebuchetSimulator:
             # than one that merely throws badly.
             "arm_ground_contact": launch.arm_ground_contact,
         }
+        # Surface clearance between the projectile and the beam, in metres, at its
+        # tightest over the launch. Negative means the stone passed through the arm -
+        # which the model permits, because the beam is not yet a contact surface, and
+        # which most of the search space does: measured over random draws inside
+        # PARAM_BOUNDS, 61% of pulley launches and 32% of traditional ones put the stone
+        # inside the beam, a median 25-33 mm into a 40 mm ball. Reported so a design that
+        # depends on that is visible rather than silently scored as if it were buildable.
+        metrics["min_beam_clearance"] = float(beam_gap_min)
         metrics["min_cw_rope_tension"] = float(cw_T_min)
         metrics["cw_rope_compression_impulse"] = float(cw_impulse)
         metrics["string_compression_impulse"] = float(string_impulse)
@@ -1088,6 +1104,63 @@ class TrebuchetSimulator:
         )
         Q_psi = self._cw_swing_coupling * sin_pt * theta_dot**2 - self._cw_swing_gravity_k * cos_p
         return Q_theta, Q_psi, -self._cw_swing_coupling * cos_pt
+
+    def beam_frame(self, theta: float) -> Tuple[float, float, float, float]:
+        """(ex, ey, nx, ny): unit vectors along the beam and normal to it, at `theta`.
+
+        `e` points from the pivot out along the long arm - the same direction the arm
+        tip lies in - and `n` is `e` turned a quarter turn counter-clockwise, so
+        (e, n) is a right-handed frame that rotates with the beam. Every beam-contact
+        quantity below is expressed in it.
+        """
+        sin_t, cos_t = math.sin(theta), math.cos(theta)
+        return cos_t, sin_t, -sin_t, cos_t
+
+    def beam_contact_geometry(self, theta: float, px: float, py: float):
+        """Where the projectile sits relative to the beam, in the beam's own frame.
+
+        Returns (s, d, gap, on_span):
+
+          s       distance along the beam from the pivot, positive toward the tip. The
+                  beam occupies s in [-arm_back_length, +arm_length]; the short end
+                  exists on the traditional machine only.
+          d       signed perpendicular distance from the beam's centreline, along n.
+          gap     |d| - projectile_radius, clamped to the segment: the clearance
+                  between the sphere's surface and the beam. Negative means the two
+                  are interpenetrating, which nothing in the model prevents yet.
+          on_span whether the closest point of the beam is its interior rather than an
+                  end cap - i.e. whether s falls inside the span. Off the end, the
+                  nearest feature is a corner and the contact normal is no longer n,
+                  so the sustained-contact regimes are only valid while this is True.
+
+        The beam is treated as a line segment of zero thickness: the real thing is
+        ARM_CROSS_SECTION_WIDTH across, but that width is already only used for mass
+        and drag, and giving it a thickness here would put the contact surface half a
+        width off the line every other part of the model calls "the arm".
+        """
+        ex, ey, nx, ny = self.beam_frame(theta)
+        rx, ry = px, py - self._h_T
+        s = rx * ex + ry * ey
+        d = rx * nx + ry * ny
+        s_min, s_max = -self._arm_back_length, self._l_a
+        on_span = s_min <= s <= s_max
+        if on_span:
+            gap = abs(d) - self._r_p
+        else:
+            # Nearest end cap: measure to the corner point rather than to the line,
+            # so a stone level with the beam but past its tip reads as clear.
+            s_end = s_min if s < s_min else s_max
+            gap = math.hypot(s - s_end, d) - self._r_p
+        return s, d, gap, on_span
+
+    def beam_clearance(self, y, regime: str) -> float:
+        """Surface clearance between the projectile and the beam for a launch state.
+
+        Positive is clear, negative is interpenetrating. This is the event function a
+        contact regime arms on, and the diagnostic `min_beam_clearance` reports.
+        """
+        pos = self.projectile_position_velocity(y)[0] if regime == TAUT else (float(y[2]), float(y[3]))
+        return self.beam_contact_geometry(float(y[0]), pos[0], pos[1])[2]
 
     def _grounded_geometry(self, theta, px):
         """Sling geometry for a projectile lying on the ground under an arm at `theta`.
