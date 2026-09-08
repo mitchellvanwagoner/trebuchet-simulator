@@ -5,17 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Setup (Windows venv lives in .venv/)
+# Setup, from any Python - builds .venv/ and installs the project into it.
+# Also the repair step after this folder is copied or synced to another machine.
+py bootstrap.py
 .venv\Scripts\activate
-pip install -e ".[dev]"
 
 # Run all tests / a single test
-pytest
-pytest tests/test_physics.py -k test_name
+python -m pytest
+python -m pytest tests/test_physics.py -k test_name
 
 # Launch the Streamlit web UI (opens browser at localhost:8501).
-# Rebuilds .venv automatically if it is missing or stale - a venv records
-# absolute paths, so moving the project folder breaks it until this repairs it.
+# Rebuilds .venv automatically if it is missing or stale, via bootstrap.py.
 python run.py
 
 # CLI simulation and optimization
@@ -24,6 +24,21 @@ trebuchet optimize --target-distance 30 --lock counter_weight_mass=14
 ```
 
 There is no linter configured. Saved CLI outputs (GIFs, plots) land in `outputs/` (git-ignored).
+
+`bootstrap.py` is the one setup path, and it is also where the venv's portability is
+written down, because only one part of that is fixable. `pyvenv.cfg` names an absolute
+`home` outside the project (the base interpreter), and the `Scripts\*.exe` console
+wrappers embed an absolute shebang to the venv's own python - neither has a relative form,
+which is why a `.venv` copied between the two Windows accounts this repo is synced across
+dies with "did not find executable" and has to be rebuilt. What *is* fixable is pip's
+editable `.pth`: `bootstrap.relink()` rewrites its absolute path to `src/` as one relative
+to site-packages after every install, since site.py resolves a non-absolute `.pth` line
+against the directory it was found in - so renaming or moving the project folder on one
+machine no longer breaks the install. Copying the project and running `py bootstrap.py` is
+the portable operation; copying a built venv is not one, extras and compiled wheels
+(numba, scipy) being per-ABI and per-OS regardless of paths. Prefer `python -m pytest`
+over bare `pytest` for the same reason - it goes through the interpreter rather than the
+absolute-shebang wrapper.
 
 ## Architecture
 
