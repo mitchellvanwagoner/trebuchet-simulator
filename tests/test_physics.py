@@ -193,8 +193,14 @@ def test_slack_sling_launch_detaches_and_snaps_instead_of_pushing():
     # Segments are a stitched alternation - two consecutive segments of the same
     # regime would mean a spurious switch that changed nothing.
     assert all(a != b for a, b in zip(regimes, regimes[1:]))
+    # Every regime where the sling carries nothing counts, not just the airborne one:
+    # a rope is slack whether the stone it is not pulling is in the air, lying on the
+    # ground, or resting against the beam. This fixture reaches the beam as well.
+    from trebuchet_sim.physics import SLACK_BEAM, SLACK_GROUND
+
     assert sol.slack_time == pytest.approx(
-        sum(seg.t1 - seg.t0 for seg in sol.segments if seg.regime == "slack")
+        sum(seg.t1 - seg.t0 for seg in sol.segments
+            if seg.regime in ("slack", SLACK_GROUND, SLACK_BEAM))
     )
 
     # The counterweight rope is still a rigid link, so it keeps the feasibility-style
@@ -298,7 +304,11 @@ def test_constraint_tensions_satisfy_newtons_law_for_the_projectile():
             # rope is pulling (or exactly slack at the boundary) everywhere inside it.
             assert string_tension >= -1e-9 * scale
 
-    assert sampled >= 8  # the fixture has several taut stretches; keep coverage real
+    # Several taut stretches, so the law is checked on more than one segment. The floor
+    # came down from 8 when the beam became a contact surface: part of what this fixture
+    # used to spend in TAUT it now spends riding the arm, where the projectile's force
+    # balance has a normal force in it and constraint_tensions is not the right question.
+    assert sampled >= 4
 
 
 def test_release_velocity_is_true_speed_not_speed_squared():

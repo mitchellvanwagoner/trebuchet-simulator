@@ -165,11 +165,19 @@ def test_one_launch_walks_all_four_regimes_and_still_throws():
     # The set of regimes rather than the exact sequence: a launch that reaches all four
     # has been round the loop more than once by definition, and pinning the order would be
     # pinning how many times, which is a property of the draw and not of the model.
-    assert set(seg.regime for seg in result.solution.segments) == {
+    # A superset, not an equality: this launch also touches the beam, which is a regime
+    # family of its own (tests/test_beam_contact.py). What matters here is that all four
+    # of the sling-and-ground combinations are reached in one throw.
+    assert set(seg.regime for seg in result.solution.segments) >= {
         "taut", "slack", "slack_ground", "taut_ground",
     }
     assert result.metrics["release_occurred"] is True
-    assert result.distance > 50.0
+    # It still throws properly, which is the point - the four regimes are reached on the
+    # way to an answer worth having rather than in a launch that fizzles. The bar came
+    # down from 50 m when the beam became a contact surface: this design was reaching its
+    # old range partly by passing its stone through its own arm, and now rides the arm
+    # instead. Same fault the shipped pulley defaults had (tests/test_beam_contact.py).
+    assert result.distance > 20.0
     # It landed and lay there for part of the launch; the snaps are the sling coming taut
     # over it again, which are separate events from the landings that preceded them.
     assert result.metrics["projectile_ground_contacts"] >= 1

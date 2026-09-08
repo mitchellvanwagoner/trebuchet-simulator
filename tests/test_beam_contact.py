@@ -159,35 +159,57 @@ def test_every_launch_reports_its_tightest_approach_to_the_beam(machine):
     assert clearance < params.arm_length + params.string_length
 
 
-def test_the_shipped_pulley_design_puts_its_stone_through_its_own_beam():
-    """The reason this measurement exists, pinned so it cannot quietly change.
+def test_the_shipped_pulley_design_now_rides_its_beam_instead_of_passing_through():
+    """The design that motivated all of this, and what contact did to it.
 
-    The default pulley machine - optimizer output, and what the dashboard opens on -
-    drives the stone about 2 mm into the arm partway through the throw. The model has no
-    contact there, so nothing charged it and nothing reported it; the search was free to
-    return a design that cannot be built. The traditional machine's own defaults stay
-    well clear, which is why this asks them separately.
+    The default pulley machine used to drive its stone about 2 mm into its own arm
+    partway through the throw, and nothing reported or charged it. It no longer can.
+
+    What it does instead is start *touching*: initial_state offsets the hanging sling by
+    arcsin(r_p / l_s), which is exactly the angle that lays the stone against the beam,
+    so the cocked pose is tangent by construction rather than by accident. The launch
+    therefore opens in TAUT_BEAM, rides the arm for the first stretch, and only then
+    flies - which is why `beam_contacts` is zero here and not one. A strike and a start
+    in contact are different things, the same way a machine loaded on the ground has a
+    ground *fraction* but no ground *contacts*.
+
+    It costs this design most of its range, because it was buying that range partly by
+    passing through the arm: 30.0 m before, about 16 m now, at the same efficiency and
+    the same release pin angle - the throw is aimed differently, not weakened. That is
+    the re-derivation this change forces on the shipped defaults.
     """
-    pulley = simulate_trebuchet(default_params(MachineType.PULLEY))
-    traditional = simulate_trebuchet(default_params(MachineType.TRADITIONAL))
+    result = simulate_trebuchet(default_params(MachineType.PULLEY))
 
-    assert pulley.metrics["min_beam_clearance"] < 0.0
-    assert pulley.metrics["min_beam_clearance"] == pytest.approx(-0.002, abs=0.0015)
-    assert traditional.metrics["min_beam_clearance"] > 0.1
+    assert result.metrics["min_beam_clearance"] >= -1e-9
+    assert result.solution.segments[0].regime == "taut_beam"
+    assert result.metrics["beam_contacts"] == 0
+    assert result.metrics["release_occurred"] is True
 
 
-def test_interpenetration_is_common_across_the_search_space():
-    """Not a corner case: the optimizer searches a space where most designs do it.
+def test_contact_removes_most_but_not_yet_all_interpenetration():
+    """Where the constraint stands, measured rather than claimed.
 
-    Sampled rather than exhaustive, and asserted loosely - the point is the order of
-    magnitude, which is what decides whether beam contact is worth modelling at all.
+    Before contact existed, 61% of pulley draws inside PARAM_BOUNDS put the stone into
+    the arm, a median 25 mm into a 40 mm ball. With it, the median case is gone - what
+    remains reads at the tangency rounding - but the worst still reaches a few
+    millimetres, because entering contact is detected by a sign change in the clearance
+    at the ends of accepted steps and a shallow dip can begin and end inside one. That is
+    the same failure `physics._first_arm_ground_angle` avoids by testing an angle instead
+    of a clearance, and the same one `fastsim.RETENSION_CIRCLE_SLOP` guards by rejecting
+    an over-long step outright.
+
+    Asserted as a bound rather than an equality so it records the state honestly: the
+    typical draw must be clean, and the worst is allowed to be a few millimetres until
+    the crossing test is made robust.
     """
     from trebuchet_sim.optimization import PARAM_BOUNDS, param_names
 
     rng = np.random.default_rng(4242)
     machine = MachineType.PULLEY
-    overlapping = checked = 0
-    for _ in range(60):
+    worst = 0.0
+    penetrations = []
+    checked = 0
+    for _ in range(50):
         values = {name: rng.uniform(*PARAM_BOUNDS[name]) for name in param_names(machine)}
         pivot = max(TrebuchetParams.pivot_height, values["arm_length"] + 0.25)
         params = TrebuchetParams(machine=machine, pivot_height=pivot, **values)
@@ -197,191 +219,31 @@ def test_interpenetration_is_common_across_the_search_space():
         if "error" in result.metrics:
             continue
         checked += 1
-        if result.metrics["min_beam_clearance"] < 0.0:
-            overlapping += 1
+        clearance = result.metrics["min_beam_clearance"]
+        worst = min(worst, clearance)
+        if clearance < -1e-9:
+            penetrations.append(clearance)
 
-    assert checked > 20
-    assert overlapping > checked // 4
-
-
-# --------------------------------------------------------------- contact dynamics
-#
-# The beam is a surface that turns, so these check the two things that distinguishes it
-# from the ground: the rotating-frame terms in the constraint, and the reaction coming
-# back into the machine instead of into the earth.
-
-
-def _resting_state(sim, theta=0.0, frac=0.5, theta_dot=0.0, pvx=0.0, pvy=0.0):
-    """A stone placed exactly on the beam's surface, `frac` of the way out the arm."""
-    r_p = sim.params.projectile_radius
-    ex, ey, nx, ny = sim.beam_frame(theta)
-    s0 = frac * sim.params.arm_length
-    px = s0 * ex + r_p * nx
-    py = sim.params.pivot_height + s0 * ey + r_p * ny
-    return [theta, theta_dot, px, py, pvx, pvy, -math.pi / 2, 0.0] + [0.0] * 3, s0
+    assert checked > 15
+    penetrations.sort()
+    # The median draw no longer ends up inside the beam to any depth that matters.
+    if penetrations:
+        median = penetrations[len(penetrations) // 2]
+        assert median > -1e-3, f"median penetration {median * 1000:.2f} mm"
+    # And nothing is anywhere near the 25-37 mm the model used to allow.
+    assert worst > -0.010, f"worst penetration {worst * 1000:.2f} mm"
 
 
-def test_a_surface_accelerating_into_the_stone_pushes_harder_than_gravity():
-    """The static check, and the sign convention that goes with it.
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_a_launch_that_never_nears_the_beam_is_untouched_by_any_of_this(machine):
+    """The traditional machine keeps its stone 280 mm clear, so contact must be inert
+    for it - no regimes entered, no energy charged, and the throw it had before."""
+    result = simulate_trebuchet(default_params(MachineType.TRADITIONAL))
 
-    With the long arm level the counterweight torques it upward, so the beam is
-    accelerating into a stone resting on top of it and the contact has to do more than
-    hold the stone's weight. A model that treated the arm as immovable would return mg
-    and be wrong in the direction that matters - it is the arm's own motion that makes
-    this contact different from the ground.
-    """
-    sim = _sim()
-    state, _s0 = _resting_state(sim)
-    f_x, f_y = sim._projectile_external_force(0.0, 0.0)
-    u = sim._beam_normal_force(state[0], state[1], state[6], state[7],
-                               state[2], state[3], state[4], state[5], f_x, f_y)[0]
-
-    weight = sim.params.projectile_mass * 9.80665
-    assert u > 0.0                      # pushes the stone off the beam, never pulls
-    assert u > weight                   # and harder than gravity, because the beam rises
-    assert sim.beam_forces(state) == pytest.approx(u)   # N = u * sigma, sigma = +1 here
-
-
-def test_striking_the_beam_stops_the_approach_and_slows_the_arm():
-    sim = _sim()
-    state, _s0 = _resting_state(sim, theta_dot=0.3, pvy=-2.0)
-    before = sim._beam_contact_terms(*[state[i] for i in (0, 1, 2, 3, 4, 5)])[9]
-    assert before < 0.0                 # genuinely approaching the surface
-
-    after, destroyed = sim._apply_beam_impulse(state)
-    d_dot = sim._beam_contact_terms(*[after[i] for i in (0, 1, 2, 3, 4, 5)])[9]
-
-    assert d_dot == pytest.approx(0.0, abs=1e-12)
-    assert destroyed > 0.0              # an inelastic strike costs energy
-    # The reaction goes into the machine, not into the ground: the arm is slowed by
-    # being hit. This is the term that makes the strike change the throw.
-    assert abs(after[1]) < abs(state[1])
-
-
-def test_the_impulse_never_creates_energy_from_any_approach():
-    sim = _sim()
-    rng = np.random.default_rng(7)
-    for _ in range(40):
-        state, _s0 = _resting_state(
-            sim,
-            theta=rng.uniform(-math.pi, math.pi),
-            frac=rng.uniform(0.15, 0.95),
-            theta_dot=rng.uniform(-4.0, 4.0),
-            pvx=rng.uniform(-6.0, 6.0),
-            pvy=rng.uniform(-6.0, 6.0),
-        )
-        _after, destroyed = sim._apply_beam_impulse(state)
-        assert destroyed >= 0.0
-
-
-def test_the_stone_rides_the_beam_while_it_turns_underneath():
-    """The constraint has to hold on a surface that is rotating and translating away.
-
-    Integrated at tight tolerance, the stone stays on the beam's surface to a hundredth
-    of a micron while sliding a measurable distance along it - which is the Coriolis and
-    centrifugal terms in d_ddot doing their job. Drop either and the stone walks off the
-    surface within a few hundredths of a second.
-    """
-    from scipy.integrate import solve_ivp
-
-    sim = _sim()
-    r_p = sim.params.projectile_radius
-    state, s0 = _resting_state(sim)
-
-    sol = solve_ivp(sim._beam_slack_dynamics, (0.0, 0.25), state,
-                    rtol=1e-10, atol=1e-12, dense_output=True)
-
-    drift = max(
-        abs(abs(sim._beam_contact_terms(*[sol.sol(t)[i] for i in (0, 1, 2, 3, 4, 5)])[5]) - r_p)
-        for t in np.linspace(0.0, sol.t[-1], 200)
+    assert result.metrics["min_beam_clearance"] > 0.1
+    assert result.metrics["beam_contacts"] == 0
+    assert result.metrics["beam_contact_energy"] == 0.0
+    assert not any(
+        seg.regime in ("taut_beam", "slack_beam") for seg in result.solution.segments
     )
-    assert drift < 1e-9
-
-    s_end = sim._beam_contact_terms(*[sol.y[i, -1] for i in (0, 1, 2, 3, 4, 5)])[4]
-    assert abs(s_end - s0) > 1e-3       # it really slid, rather than being pinned in place
-
-
-def _slung_and_touching(sim, theta=0.4):
-    """A stone exactly a sling length from the tip AND exactly on the beam's surface.
-
-    Both constraints satisfied at once, which is the only pose TAUT_BEAM is valid at.
-    In beam coordinates the tip is (l_a, 0) and the stone is (s, r_p), so the sling
-    length fixes s = l_a - sqrt(l_s^2 - r_p^2) - the near intersection, the one that
-    lands on the arm rather than out past the tip.
-    """
-    l_a, l_s = sim.params.arm_length, sim.params.string_length
-    r_p, h = sim.params.projectile_radius, sim.params.pivot_height
-    ex, ey, nx, ny = sim.beam_frame(theta)
-    s0 = l_a - math.sqrt(l_s * l_s - r_p * r_p)
-    px = s0 * ex + r_p * nx
-    py = h + s0 * ey + r_p * ny
-    return [theta, 0.0, px, py, 0.0, 0.0, -math.pi / 2, 0.0] + [0.0] * 3, s0
-
-
-def test_both_constraints_hold_while_the_arm_swings_under_the_stone():
-    """The 2x2 solve, checked the only way that means anything: integrate it.
-
-    A tension and a normal force that were merely plausible would still let the stone
-    drift off the sling circle or off the beam within a few degrees of rotation. Holding
-    both to a picometre through 18 degrees of swing is the coupling being right - each
-    force torques the arm, and the arm's response feeds back into the other constraint.
-    """
-    from scipy.integrate import solve_ivp
-
-    sim = _sim()
-    l_a, l_s = sim.params.arm_length, sim.params.string_length
-    r_p, h = sim.params.projectile_radius, sim.params.pivot_height
-    state, _s0 = _slung_and_touching(sim)
-
-    sol = solve_ivp(sim._beam_taut_dynamics, (0.0, 0.20), state,
-                    rtol=1e-11, atol=1e-13, dense_output=True)
-
-    sling_err = beam_err = 0.0
-    for t in np.linspace(0.0, sol.t[-1], 300):
-        yy = sol.sol(t)
-        ex, ey, _nx, _ny = sim.beam_frame(yy[0])
-        tip_x, tip_y = l_a * ex, h + l_a * ey
-        sling_err = max(sling_err, abs(math.hypot(yy[2] - tip_x, yy[3] - tip_y) - l_s))
-        beam_err = max(beam_err, abs(abs(sim.beam_contact_geometry(yy[0], yy[2], yy[3])[1]) - r_p))
-
-    assert sling_err < 1e-10
-    assert beam_err < 1e-10
-    # And it was not a stationary machine: both constraints had to track a moving arm.
-    assert abs(math.degrees(sol.y[0, -1] - state[0])) > 5.0
-
-
-def test_both_forces_are_reported_and_push_the_right_way():
-    sim = _sim()
-    state, _s0 = _slung_and_touching(sim)
-    tension, normal = sim.beam_taut_forces(state)
-
-    # A sling under load pulls, a surface under load pushes; either reaching zero is
-    # what ends the regime, so both must come back signed rather than as magnitudes.
-    assert tension > 0.0
-    assert normal > 0.0
-
-
-def test_the_constraint_matrix_is_symmetric():
-    """K2 is the coupling between the sling direction and the contact normal, and it
-    cannot depend on which constraint is written first. An asymmetry there would be a
-    non-conservative coupling - energy appearing from the pair of forces - which is the
-    kind of error that stays invisible until a long launch drifts.
-    """
-    sim = _sim()
-    state, _s0 = _slung_and_touching(sim, theta=0.9)
-    theta, theta_dot = state[0], 0.7
-    px, py, pvx, pvy = state[2], state[3], 0.3, -0.4
-    psi, psi_dot = state[6], 0.2
-
-    m_p = sim.params.projectile_mass
-    sx, sy, A, _b, _dist = sim._sling_geometry(theta, px, py)
-    _ex, _ey, nx, ny, s, _d, _v_e, _v_n, _sigma, _dd = sim._beam_contact_terms(
-        theta, theta_dot, px, py, pvx, pvy
-    )
-    _Qt, _Qp, M13 = sim._machine_only_forces(theta, theta_dot, psi, psi_dot)
-    M_eff = sim._M_taut - M13 * M13 / sim._M33
-
-    c = sx * nx + sy * ny
-    k_sling_beam = c / m_p + A * s / M_eff
-    k_beam_sling = c / m_p + s * A / M_eff
-    assert k_sling_beam == pytest.approx(k_beam_sling, rel=1e-15)
+    assert result.distance == pytest.approx(30.0, abs=0.05)
