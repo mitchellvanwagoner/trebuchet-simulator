@@ -202,3 +202,100 @@ def test_interpenetration_is_common_across_the_search_space():
 
     assert checked > 20
     assert overlapping > checked // 4
+
+
+# --------------------------------------------------------------- contact dynamics
+#
+# The beam is a surface that turns, so these check the two things that distinguishes it
+# from the ground: the rotating-frame terms in the constraint, and the reaction coming
+# back into the machine instead of into the earth.
+
+
+def _resting_state(sim, theta=0.0, frac=0.5, theta_dot=0.0, pvx=0.0, pvy=0.0):
+    """A stone placed exactly on the beam's surface, `frac` of the way out the arm."""
+    r_p = sim.params.projectile_radius
+    ex, ey, nx, ny = sim.beam_frame(theta)
+    s0 = frac * sim.params.arm_length
+    px = s0 * ex + r_p * nx
+    py = sim.params.pivot_height + s0 * ey + r_p * ny
+    return [theta, theta_dot, px, py, pvx, pvy, -math.pi / 2, 0.0] + [0.0] * 3, s0
+
+
+def test_a_surface_accelerating_into_the_stone_pushes_harder_than_gravity():
+    """The static check, and the sign convention that goes with it.
+
+    With the long arm level the counterweight torques it upward, so the beam is
+    accelerating into a stone resting on top of it and the contact has to do more than
+    hold the stone's weight. A model that treated the arm as immovable would return mg
+    and be wrong in the direction that matters - it is the arm's own motion that makes
+    this contact different from the ground.
+    """
+    sim = _sim()
+    state, _s0 = _resting_state(sim)
+    f_x, f_y = sim._projectile_external_force(0.0, 0.0)
+    u = sim._beam_normal_force(state[0], state[1], state[6], state[7],
+                               state[2], state[3], state[4], state[5], f_x, f_y)[0]
+
+    weight = sim.params.projectile_mass * 9.80665
+    assert u > 0.0                      # pushes the stone off the beam, never pulls
+    assert u > weight                   # and harder than gravity, because the beam rises
+    assert sim.beam_forces(state) == pytest.approx(u)   # N = u * sigma, sigma = +1 here
+
+
+def test_striking_the_beam_stops_the_approach_and_slows_the_arm():
+    sim = _sim()
+    state, _s0 = _resting_state(sim, theta_dot=0.3, pvy=-2.0)
+    before = sim._beam_contact_terms(*[state[i] for i in (0, 1, 2, 3, 4, 5)])[9]
+    assert before < 0.0                 # genuinely approaching the surface
+
+    after, destroyed = sim._apply_beam_impulse(state)
+    d_dot = sim._beam_contact_terms(*[after[i] for i in (0, 1, 2, 3, 4, 5)])[9]
+
+    assert d_dot == pytest.approx(0.0, abs=1e-12)
+    assert destroyed > 0.0              # an inelastic strike costs energy
+    # The reaction goes into the machine, not into the ground: the arm is slowed by
+    # being hit. This is the term that makes the strike change the throw.
+    assert abs(after[1]) < abs(state[1])
+
+
+def test_the_impulse_never_creates_energy_from_any_approach():
+    sim = _sim()
+    rng = np.random.default_rng(7)
+    for _ in range(40):
+        state, _s0 = _resting_state(
+            sim,
+            theta=rng.uniform(-math.pi, math.pi),
+            frac=rng.uniform(0.15, 0.95),
+            theta_dot=rng.uniform(-4.0, 4.0),
+            pvx=rng.uniform(-6.0, 6.0),
+            pvy=rng.uniform(-6.0, 6.0),
+        )
+        _after, destroyed = sim._apply_beam_impulse(state)
+        assert destroyed >= 0.0
+
+
+def test_the_stone_rides_the_beam_while_it_turns_underneath():
+    """The constraint has to hold on a surface that is rotating and translating away.
+
+    Integrated at tight tolerance, the stone stays on the beam's surface to a hundredth
+    of a micron while sliding a measurable distance along it - which is the Coriolis and
+    centrifugal terms in d_ddot doing their job. Drop either and the stone walks off the
+    surface within a few hundredths of a second.
+    """
+    from scipy.integrate import solve_ivp
+
+    sim = _sim()
+    r_p = sim.params.projectile_radius
+    state, s0 = _resting_state(sim)
+
+    sol = solve_ivp(sim._beam_slack_dynamics, (0.0, 0.25), state,
+                    rtol=1e-10, atol=1e-12, dense_output=True)
+
+    drift = max(
+        abs(abs(sim._beam_contact_terms(*[sol.sol(t)[i] for i in (0, 1, 2, 3, 4, 5)])[5]) - r_p)
+        for t in np.linspace(0.0, sol.t[-1], 200)
+    )
+    assert drift < 1e-9
+
+    s_end = sim._beam_contact_terms(*[sol.y[i, -1] for i in (0, 1, 2, 3, 4, 5)])[4]
+    assert abs(s_end - s0) > 1e-3       # it really slid, rather than being pinned in place

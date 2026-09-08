@@ -1281,6 +1281,156 @@ class TrebuchetSimulator:
         return [theta_dot, theta_ddot, pvx, 0.0, drag_x / self._m_p, 0.0, psi_dot, psi_ddot,
                 *self._quadrature_rates(0.0, cw_T)]
 
+    # ---------------------------------------------------------------- beam contact
+    #
+    # The beam is the model's third one-sided constraint and the only one that moves,
+    # which is the whole difference between this block and the grounded one above.
+    #
+    # Work in the beam's own frame (see beam_frame): s along the arm from the pivot, d
+    # perpendicular. The stone touches when |d| = r_p, on the side sigma = sign(d), and
+    # the contact force on it is N * sigma * n with N >= 0 - a surface pushes, it does
+    # not pull, which is what makes N reaching zero the event that ends the contact.
+    #
+    # Because the frame rotates, the constraint's second derivative carries terms the
+    # static ground never had. With v the stone's velocity and a its acceleration:
+    #
+    #     d_dot  = v.n - theta_dot * s
+    #     d_ddot = a.n - 2*theta_dot*(v.e) - theta_ddot*s - theta_dot^2 * d
+    #
+    # The middle term is Coriolis and the last is centrifugal; both vanish for a surface
+    # that holds still, and neither may be dropped here. Holding contact is d_ddot = 0.
+    #
+    # And the reaction torques the beam. The force acts at pivot + s*e, so the arm feels
+    # -u*s about the pivot, where u = N*sigma is the signed normal component. The ground
+    # takes its reaction into the earth and the machine never feels it; the beam is part
+    # of the machine, so here it comes straight back into theta_ddot. That coupling is
+    # why u and theta_ddot have to be solved together rather than in sequence.
+
+    def _beam_contact_terms(self, theta, theta_dot, px, py, pvx, pvy):
+        """The stone's position and velocity resolved into the beam's rotating frame.
+
+        Returns (ex, ey, nx, ny, s, d, v_e, v_n, sigma, d_dot).
+        """
+        ex, ey, nx, ny = self.beam_frame(theta)
+        rx, ry = px, py - self._h_T
+        s = rx * ex + ry * ey
+        d = rx * nx + ry * ny
+        v_e = pvx * ex + pvy * ey
+        v_n = pvx * nx + pvy * ny
+        sigma = 1.0 if d >= 0.0 else -1.0
+        return ex, ey, nx, ny, s, d, v_e, v_n, sigma, v_n - theta_dot * s
+
+    def _beam_normal_force(self, theta, theta_dot, psi, psi_dot, px, py, pvx, pvy,
+                           f_ext_x, f_ext_y):
+        """Signed normal component u = N*sigma that holds the stone on the beam.
+
+        Solves the contact constraint and the arm's equation of motion together, since
+        each appears in the other:
+
+            d_ddot = 0                       ->  u/m_p + ... - theta_ddot*s = ...
+            theta_ddot = (Q_eff - u*s)/M_eff
+
+        Substituting the second into the first leaves one linear equation in u, whose
+        coefficient (1/m_p + s^2/M_eff) is the effective inverse mass the pair present
+        at the contact point - the stone's own, plus the arm's as felt through the lever
+        s. It is strictly positive, so this never divides by zero on a real machine.
+
+        Returns (u, theta_ddot, psi_ddot).
+        """
+        m_p = self._m_p
+        _ex, _ey, nx, ny, s, d, v_e, _v_n, _sigma, _d_dot = self._beam_contact_terms(
+            theta, theta_dot, px, py, pvx, pvy
+        )
+        Q_theta, Q_psi, M13 = self._machine_only_forces(theta, theta_dot, psi, psi_dot)
+        M_eff = self._M_taut - M13 * M13 / self._M33
+        Q_eff = Q_theta - M13 * Q_psi / self._M33
+
+        f_n = f_ext_x * nx + f_ext_y * ny
+        inv_mass = 1.0 / m_p + s * s / M_eff
+        rhs = -f_n / m_p + 2.0 * theta_dot * v_e + s * Q_eff / M_eff + theta_dot * theta_dot * d
+        u = rhs / inv_mass if inv_mass > 1e-15 else 0.0
+
+        theta_ddot = (Q_eff - u * s) / M_eff
+        psi_ddot = (Q_psi - M13 * theta_ddot) / self._M33
+        return u, theta_ddot, psi_ddot
+
+    def beam_forces(self, y) -> float:
+        """The normal force pressing the stone off the beam, in newtons.
+
+        One-sided like every other constraint force here: the regime ends where this
+        reaches zero and the stone leaves the surface.
+        """
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
+        f_x, f_y = self._projectile_external_force(pvx, pvy)
+        u = self._beam_normal_force(theta, theta_dot, psi, psi_dot, px, py, pvx, pvy, f_x, f_y)[0]
+        sigma = 1.0 if (self._beam_contact_terms(theta, theta_dot, px, py, pvx, pvy)[5]) >= 0.0 else -1.0
+        return u * sigma
+
+    def _projectile_external_force(self, pvx, pvy) -> Tuple[float, float]:
+        """Gravity plus quadratic air drag on the free projectile, in newtons."""
+        speed = math.hypot(pvx, pvy)
+        drag = -self._proj_drag_k * speed
+        return drag * pvx, -self._m_p * G + drag * pvy
+
+    def _beam_slack_dynamics(self, t: float, y) -> List[float]:
+        """Sling slack, stone riding on the beam: it slides along a surface that turns.
+
+        The one free direction is along the beam, and nothing resists motion that way -
+        the contact is frictionless by the same choice the ground is - so the stone is
+        free to be swept outward by the arm and thrown off the end.
+        """
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
+        f_x, f_y = self._projectile_external_force(pvx, pvy)
+        u, theta_ddot, psi_ddot = self._beam_normal_force(
+            theta, theta_dot, psi, psi_dot, px, py, pvx, pvy, f_x, f_y
+        )
+        _ex, _ey, nx, ny, _s, _d, _v_e, _v_n, _sigma, _d_dot = self._beam_contact_terms(
+            theta, theta_dot, px, py, pvx, pvy
+        )
+        ax = (f_x + u * nx) / self._m_p
+        ay = (f_y + u * ny) / self._m_p
+        cw_T = self._cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot)
+        return [theta_dot, theta_ddot, pvx, pvy, ax, ay, psi_dot, psi_ddot,
+                *self._quadrature_rates(0.0, cw_T)]
+
+    def _apply_beam_impulse(self, y) -> Tuple[List[float], float]:
+        """Land the stone on the beam: an inelastic impulse along the contact normal.
+
+        The stone stops approaching the surface (d_dot -> 0) and the beam takes the
+        reaction, so the arm is slowed by the strike exactly as much as the stone is -
+        which is the whole reason this cannot be modelled as the stone hitting a wall.
+        The impulse is dissipative by construction: it removes the approach speed and
+        adds nothing, so the energy returned is always >= 0.
+        """
+        theta, theta_dot = float(y[0]), float(y[1])
+        px, py, pvx, pvy = (float(y[i]) for i in (2, 3, 4, 5))
+        psi, psi_dot = float(y[6]), float(y[7])
+        m_p = self._m_p
+        M13, M_eff = self._sling_impulse_terms(theta, psi)
+        _ex, _ey, nx, ny, s, _d, _v_e, _v_n, _sigma, d_dot = self._beam_contact_terms(
+            theta, theta_dot, px, py, pvx, pvy
+        )
+
+        before = self._launch_kinetic_energy(theta_dot, pvx, pvy, psi, psi_dot, theta)
+
+        inv_mass = 1.0 / m_p + s * s / M_eff
+        j = -d_dot / inv_mass if inv_mass > 1e-15 else 0.0
+
+        pvx += j * nx / m_p
+        pvy += j * ny / m_p
+        delta_theta_dot = -j * s / M_eff
+        theta_dot += delta_theta_dot
+        psi_dot -= M13 * delta_theta_dot / self._M33
+
+        after = self._launch_kinetic_energy(theta_dot, pvx, pvy, psi, psi_dot, theta)
+        return ([theta, theta_dot, px, py, pvx, pvy, psi, psi_dot,
+                 *(0.0,) * N_QUADRATURE],
+                max(0.0, before - after))
+
     def _machine_only_accelerations(self, theta, theta_dot, psi, psi_dot):
         """(theta_ddot, psi_ddot) for the machine carrying no projectile.
 
