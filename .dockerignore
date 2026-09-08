@@ -19,6 +19,7 @@ CAD/
 docs/
 tests/
 run.py
+bootstrap.py
 user_defaults.json
 *.compose.yml
 docker-compose*.yml
