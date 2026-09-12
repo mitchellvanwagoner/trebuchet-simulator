@@ -95,6 +95,14 @@ _SEG_SLING_SLACK = 3   # string tension crossed zero: the sling lets go
 _SEG_RETENSION = 4     # tip-to-projectile distance grew back to the sling length
 _SEG_LANDING = 5       # the projectile reached the ground
 _SEG_LIFTOFF = 6       # the ground's normal force crossed zero: the sling has it again
+# Beam contact. Distinct statuses rather than reusing the ground's, because the caller
+# has to route them to different state maps and a shared code would make that a
+# second branch on the regime it just branched on.
+_SEG_BEAM_CONTACT = 7   # the stone reached the beam
+_SEG_BEAM_LIFTOFF = 8   # the beam stopped pushing: the stone leaves the arm
+_SEG_BEAM_SLACK = 9     # the sling let go while the stone stayed on the arm
+_SEG_BEAM_RETENSION = 10  # the sling came taut over a stone riding the arm
+_SEG_BEAM_SPAN = 11     # the stone slid off the end of the beam
 
 # The four states a launch can be in, mirroring physics.py's TAUT / SLACK / TAUT_GROUND /
 # SLACK_GROUND. The sling is either carrying load or not, and the projectile is either on
@@ -108,6 +116,10 @@ _TAUT = 0
 _SLACK = 1
 _TAUT_GROUND = 2
 _SLACK_GROUND = 3
+# The stone against the beam that is throwing it, sling loaded or not. Same numbering
+# role as the four above; see physics.TAUT_BEAM for what the regimes mean.
+_TAUT_BEAM = 4
+_SLACK_BEAM = 5
 
 # Cap on taut/slack regime switches, matching physics.MAX_LAUNCH_SEGMENTS. Each snap
 # destroys energy so the switching always dies out; the cap only guards numerical
@@ -147,6 +159,41 @@ MAX_RETENSION_SHRINKS = 20
 # already outside is not a step that escaped and must not be treated as one; the reference
 # engine's event, which arms on the way back down, simply carries it.
 RETENSION_CIRCLE_SLOP = 1e-12
+
+# How far from the beam still counts as touching it when settling the pose a launch opens
+# in, in metres. physics.BEAM_CONTACT_SLOP, and the same reasoning: the cocked hanging pose
+# is tangent to the arm by construction, so its clearance is zero to rounding and lands
+# either side by an ulp.
+BEAM_CONTACT_SLOP = 1e-12
+
+# How far inside the sling circle still counts as a taut sling when _settle_beam picks the
+# regime a stone arriving on the arm belongs in, in metres. physics.BEAM_SLING_TAUT_SLOP.
+BEAM_SLING_TAUT_SLOP = 1e-9
+
+# How many sub-intervals of an accepted step the stone's clearance from the beam is
+# sampled over before the step is declared contact-free.
+#
+# Every other event here is found by testing the sign at the step's two ends, which is
+# what the reference engine's solver does and is sound for a quantity that crosses zero
+# and stays across. The beam gap is not one: the stone swings past the arm, so the gap
+# dips through zero and comes back, and a step longer than the dip sees a positive sign at
+# both ends and steps clean over a collision. It is the same shape as the hazard
+# physics._first_arm_ground_angle sidesteps by testing the arm *angle* rather than the
+# beam's clearance - only here there is no monotone coordinate to reformulate onto, since
+# the stone's approach is not monotone in anything.
+#
+# So the step is scanned rather than merely bracketed. The draw that forced this is a
+# traditional machine whose stone passes 40 mm into the beam for 25 ms: the reference
+# engine reads three contacts and 3.95 J at every rtol from 1e-6 to 1e-10, and this engine
+# read none at all, because one 30 ms step spanned the whole excursion with +2.6e-4 m at
+# its near end and +1.6e-2 m at its far one. Eight sub-intervals put six samples inside
+# that dip. Measured over the same 196-launch sweep tests/test_fastsim.py uses, the
+# reference misses no crossing at this resolution, so this is what it takes to be as
+# reliable as the engine this one is ported from - not a stricter standard than it.
+#
+# The cost is eight gap evaluations per accepted step, and only in the two regimes that
+# arm contact at all.
+BEAM_SCAN_SUBSTEPS = 8
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -551,6 +598,203 @@ def _slack_derivs(y, c, projectile_mass, out):
     out[8], out[9], out[10] = _quadrature_rates(0.0, cw_T, c[27], c[26] > 0.5)
 
 
+# ------------------------------------------------------------------ beam contact
+#
+# Port of the beam-contact block in physics.py. The beam is the only constraint surface
+# that moves, so the constraint carries Coriolis and centrifugal terms and the reaction
+# torques the arm back - see the reference engine for the derivation. These are arranged
+# to take the same arithmetic in the same order, so the two stay comparable line for line.
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_terms(theta, theta_dot, px, py, pvx, pvy, h_T):
+    """(nx, ny, s, d, v_e, sigma, d_dot): the stone in the beam's rotating frame."""
+    ex, ey = np.cos(theta), np.sin(theta)
+    nx, ny = -ey, ex
+    rx, ry = px, py - h_T
+    s = rx * ex + ry * ey
+    d = rx * nx + ry * ny
+    v_e = pvx * ex + pvy * ey
+    v_n = pvx * nx + pvy * ny
+    sigma = 1.0 if d >= 0.0 else -1.0
+    return nx, ny, s, d, v_e, sigma, v_n - theta_dot * s
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_gap(theta, px, py, h_T, l_a, arm_back_length, r_p):
+    """Surface clearance between stone and beam; negative means overlapping.
+
+    Off either end the nearest feature is a corner rather than the centreline - the same
+    split physics.beam_contact_geometry makes, minus the pieces callers here never read.
+    """
+    ex, ey = np.cos(theta), np.sin(theta)
+    nx, ny = -ey, ex
+    rx, ry = px, py - h_T
+    s = rx * ex + ry * ey
+    d = rx * nx + ry * ny
+    s_min = -arm_back_length
+    s_max = l_a
+    if s >= s_min and s <= s_max:
+        return abs(d) - r_p
+    s_end = s_min if s < s_min else s_max
+    return np.sqrt((s - s_end) * (s - s_end) + d * d) - r_p
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_span_margin(theta, px, py, h_T, l_a, arm_back_length):
+    """Distance from the contact point to the nearer end of the beam; negative is past it."""
+    ex, ey = np.cos(theta), np.sin(theta)
+    s = px * ex + (py - h_T) * ey
+    a = s + arm_back_length
+    b = l_a - s
+    return a if a < b else b
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _projectile_external_force(pvx, pvy, proj_drag_k, projectile_mass):
+    """Gravity plus quadratic drag on the free stone."""
+    speed = np.sqrt(pvx * pvx + pvy * pvy)
+    drag = -proj_drag_k * speed
+    return drag * pvx, -projectile_mass * G + drag * pvy
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_slack_solve(y, c, projectile_mass, h_T):
+    """(theta_ddot, psi_ddot, ax, ay, normal) for a stone riding the beam, sling slack."""
+    M33 = c[4]
+    proj_drag_k = c[8]
+    M_taut = c[16]
+    theta = y[0]
+    theta_dot = y[1]
+    px = y[2]
+    py = y[3]
+    pvx = y[4]
+    pvy = y[5]
+    psi = y[6]
+    psi_dot = y[7]
+
+    nx, ny, s, d, v_e, sigma, _d_dot = _beam_terms(theta, theta_dot, px, py, pvx, pvy, h_T)
+    Q_theta, Q_psi, M13 = _machine_only_forces(theta, theta_dot, psi, psi_dot, c)
+    M_eff = M_taut - M13 * M13 / M33
+    Q_eff = Q_theta - M13 * Q_psi / M33
+
+    f_x, f_y = _projectile_external_force(pvx, pvy, proj_drag_k, projectile_mass)
+    f_n = f_x * nx + f_y * ny
+    inv_mass = 1.0 / projectile_mass + s * s / M_eff
+    rhs = (-f_n / projectile_mass + 2.0 * theta_dot * v_e + s * Q_eff / M_eff
+           + theta_dot * theta_dot * d)
+    u = rhs / inv_mass if inv_mass > 1e-15 else 0.0
+
+    theta_ddot = (Q_eff - u * s) / M_eff
+    psi_ddot = (Q_psi - M13 * theta_ddot) / M33
+    ax = (f_x + u * nx) / projectile_mass
+    ay = (f_y + u * ny) / projectile_mass
+    return theta_ddot, psi_ddot, ax, ay, u * sigma
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_taut_solve(y, c, projectile_mass, h_T):
+    """(theta_ddot, psi_ddot, ax, ay, tension, normal) with sling and beam both loaded.
+
+    The 2x2 physics.beam_taut_forces documents, with the same symmetric off-diagonal.
+    """
+    l_a = c[0]
+    M33 = c[4]
+    proj_drag_k = c[8]
+    M_taut = c[16]
+    theta = y[0]
+    theta_dot = y[1]
+    px = y[2]
+    py = y[3]
+    pvx = y[4]
+    pvy = y[5]
+    psi = y[6]
+    psi_dot = y[7]
+
+    sin_t = np.sin(theta)
+    cos_t = np.cos(theta)
+    tip_x = l_a * cos_t
+    tip_y = l_a * sin_t + h_T
+    dx = px - tip_x
+    dy = py - tip_y
+    dist = np.sqrt(dx * dx + dy * dy)
+    if dist < 1e-12:
+        dist = 1e-12
+    sx = dx / dist
+    sy = dy / dist
+    A = -l_a * sin_t * sx + l_a * cos_t * sy
+    b = -l_a * cos_t * sx - l_a * sin_t * sy
+
+    nx, ny, s, d, v_e, sigma, _d_dot = _beam_terms(theta, theta_dot, px, py, pvx, pvy, h_T)
+    Q_theta, Q_psi, M13 = _machine_only_forces(theta, theta_dot, psi, psi_dot, c)
+    M_eff = M_taut - M13 * M13 / M33
+    Q_eff = Q_theta - M13 * Q_psi / M33
+
+    f_x, f_y = _projectile_external_force(pvx, pvy, proj_drag_k, projectile_mass)
+    cc = sx * nx + sy * ny
+
+    rel_x = pvx + theta_dot * l_a * sin_t
+    rel_y = pvy - theta_dot * l_a * cos_t
+    w = rel_x * rel_x + rel_y * rel_y
+
+    K1 = 1.0 / projectile_mass + A * A / M_eff
+    K2 = cc / projectile_mass + A * s / M_eff
+    K3 = 1.0 / projectile_mass + s * s / M_eff
+    R1 = ((f_x * sx + f_y * sy) / projectile_mass - A * Q_eff / M_eff
+          - b * theta_dot * theta_dot + w / dist)
+    R2 = ((f_x * nx + f_y * ny) / projectile_mass - 2.0 * theta_dot * v_e
+          - s * Q_eff / M_eff - theta_dot * theta_dot * d)
+
+    det = K2 * K2 - K1 * K3
+    if abs(det) < 1e-15:
+        theta_ddot = Q_eff / M_eff
+        return theta_ddot, (Q_psi - M13 * theta_ddot) / M33, 0.0, 0.0, 0.0, 0.0
+    T = (K2 * R2 - R1 * K3) / det
+    u = (K1 * R2 - K2 * R1) / det
+
+    theta_ddot = (Q_eff + T * A - u * s) / M_eff
+    psi_ddot = (Q_psi - M13 * theta_ddot) / M33
+    ax = (f_x - T * sx + u * nx) / projectile_mass
+    ay = (f_y - T * sy + u * ny) / projectile_mass
+    return theta_ddot, psi_ddot, ax, ay, T, u * sigma
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_taut_derivs(y, c, projectile_mass, h_T, out):
+    theta_ddot, psi_ddot, ax, ay, T, _N = _beam_taut_solve(y, c, projectile_mass, h_T)
+    cw_T = _cw_link_tension(y[0], y[1], theta_ddot, y[6], y[7], c, c[24], c[25], c[26] > 0.5)
+    q1, q2, q3 = _quadrature_rates(T, cw_T, c[27], c[26] > 0.5)
+    out[0] = y[1]
+    out[1] = theta_ddot
+    out[2] = y[4]
+    out[3] = y[5]
+    out[4] = ax
+    out[5] = ay
+    out[6] = y[7]
+    out[7] = psi_ddot
+    out[8] = q1
+    out[9] = q2
+    out[10] = q3
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _beam_slack_derivs(y, c, projectile_mass, h_T, out):
+    theta_ddot, psi_ddot, ax, ay, _N = _beam_slack_solve(y, c, projectile_mass, h_T)
+    cw_T = _cw_link_tension(y[0], y[1], theta_ddot, y[6], y[7], c, c[24], c[25], c[26] > 0.5)
+    q1, q2, q3 = _quadrature_rates(0.0, cw_T, c[27], c[26] > 0.5)
+    out[0] = y[1]
+    out[1] = theta_ddot
+    out[2] = y[4]
+    out[3] = y[5]
+    out[4] = ax
+    out[5] = ay
+    out[6] = y[7]
+    out[7] = psi_ddot
+    out[8] = q1
+    out[9] = q2
+    out[10] = q3
+
+
 @njit(cache=True, fastmath=True, inline="always")
 def _derivs8(y, c, projectile_mass, h_T, regime, out):
     """Whichever of the three eight-component regimes' dynamics `regime` names.
@@ -563,6 +807,10 @@ def _derivs8(y, c, projectile_mass, h_T, regime, out):
         _slack_derivs(y, c, projectile_mass, out)
     elif regime == _TAUT_GROUND:
         _grounded_taut_derivs(y, c, projectile_mass, h_T, out)
+    elif regime == _TAUT_BEAM:
+        _beam_taut_derivs(y, c, projectile_mass, h_T, out)
+    elif regime == _SLACK_BEAM:
+        _beam_slack_derivs(y, c, projectile_mass, h_T, out)
     else:
         _grounded_slack_derivs(y, c, projectile_mass, out)
 
@@ -895,6 +1143,13 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     g_prev = (alpha - theta) - release_target
     gg_prev = theta - theta_arm_ground
     gl_prev = l_a * np.sin(theta) + l_s * np.sin(alpha) + h_T - ground_y
+    # Clearance from the beam. The cocked hanging pose is tangent to the arm by
+    # construction (see physics.BEAM_CONTACT_SLOP), so a segment can open with this at
+    # the rounding of zero; the launch loop settles that pose before stepping, and what
+    # is left here is an ordinary crossing.
+    gb_prev = _beam_gap(theta, l_a * np.cos(theta) + l_s * np.cos(alpha),
+                        l_a * np.sin(theta) + l_s * np.sin(alpha) + h_T,
+                        h_T, l_a, c[17], ground_y)
     # Not accumulated any more - the integrals do that - but still the event function for
     # the sling letting go, so it is carried step to step to bracket the zero crossing.
     string_T_prev, _cw_T_prev = _tensions(
@@ -1057,6 +1312,42 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
             # rising and neither engine fires. Accepting it here would instead let a
             # segment that begins on the line resolve the event at s = 0 and return a
             # zero-length segment, which is what the strictness is buying.
+            gb_new = _beam_gap(yn_1, l_a * np.cos(yn_1) + l_s * np.cos(yn_3),
+                               l_a * np.sin(yn_1) + l_s * np.sin(yn_3) + h_T,
+                               h_T, l_a, c[17], ground_y)
+            # Scanned rather than bracketed: the gap dips through zero and back, so the
+            # two ends of a step are not enough to say the stone missed the beam. See
+            # BEAM_SCAN_SUBSTEPS. The scan runs only from a step that starts clear - one
+            # that opens on the surface is a settled contact pose, not an approach.
+            s_beam = 2.0
+            if gb_prev > 0.0:
+                lo_s = 0.0
+                for j in range(1, BEAM_SCAN_SUBSTEPS + 1):
+                    hi_s = j / BEAM_SCAN_SUBSTEPS
+                    if j == BEAM_SCAN_SUBSTEPS:
+                        g_hi = gb_new
+                    else:
+                        th = _hermite(theta, yn_1, f0_1, k7_1, h, hi_s)
+                        al = _hermite(alpha, yn_3, f0_3, k7_3, h, hi_s)
+                        g_hi = _beam_gap(th, l_a * np.cos(th) + l_s * np.cos(al),
+                                         l_a * np.sin(th) + l_s * np.sin(al) + h_T,
+                                         h_T, l_a, c[17], ground_y)
+                    if g_hi <= 0.0:
+                        lo, hi = lo_s, hi_s
+                        for _ in range(50):
+                            mid = 0.5 * (lo + hi)
+                            th = _hermite(theta, yn_1, f0_1, k7_1, h, mid)
+                            al = _hermite(alpha, yn_3, f0_3, k7_3, h, mid)
+                            if _beam_gap(th, l_a * np.cos(th) + l_s * np.cos(al),
+                                         l_a * np.sin(th) + l_s * np.sin(al) + h_T,
+                                         h_T, l_a, c[17], ground_y) > 0.0:
+                                lo = mid
+                            else:
+                                hi = mid
+                        s_beam = 0.5 * (lo + hi)
+                        break
+                    lo_s = hi_s
+
             gl_new = l_a * np.sin(yn_1) + l_s * np.sin(yn_3) + h_T - ground_y
             s_land = 2.0
             if gl_prev > 0.0 and gl_new <= 0.0:
@@ -1073,7 +1364,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
 
             # scipy stops at whichever event comes first and breaks a tie on the order it
             # was given them, so the comparisons below run in that same order.
-            s = min(min(s_release, s_switch), min(s_land, s_ground))
+            s = min(min(s_release, s_switch), min(min(s_land, s_beam), s_ground))
             if s <= 1.0:
                 if s_release <= s:
                     status = _SEG_RELEASE
@@ -1081,6 +1372,8 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                     status = _SEG_SLING_SLACK
                 elif s_land <= s:
                     status = _SEG_LANDING
+                elif s_beam <= s:
+                    status = _SEG_BEAM_CONTACT
                 else:
                     status = _SEG_ARM_GROUND
                 theta_r = _hermite(theta, yn_1, f0_1, k7_1, h, s)
@@ -1105,6 +1398,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
             g_prev = g_new
             gg_prev = gg_new
             gl_prev = gl_new
+            gb_prev = gb_new
 
             factor = MAX_FACTOR if err_norm == 0.0 else min(MAX_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
@@ -1144,15 +1438,39 @@ def _eight_event(y, c, projectile_mass, h_T, regime, which):
       _SLACK         1 re-tension (separation reaches the sling)   2 the projectile lands
       _SLACK_GROUND  1 re-tension over a grounded projectile       - (nothing left to land)
       _TAUT_GROUND   1 lift-off (the normal force lets go)         2 the sling lets go
+      _TAUT_BEAM     1 the beam stops pushing                      2 the sling lets go
+      _SLACK_BEAM    1 the beam stops pushing                      2 re-tension
+
+    and a third, `which == 3`, which only the beam regimes and _SLACK arm: sliding off the
+    end of the beam for the former, and reaching the beam at all for the latter.
 
     Re-tension is the one event that fires on the way *up*, so it is returned negated and
     the caller can test every event the same way.
     """
+    if regime == _TAUT_BEAM:
+        if which == 3:
+            return _beam_span_margin(y[0], y[2], y[3], h_T, c[0], c[17])
+        _th, _ps, _ax, _ay, tension, normal = _beam_taut_solve(y, c, projectile_mass, h_T)
+        return normal if which == 1 else tension
+    if regime == _SLACK_BEAM:
+        if which == 3:
+            return _beam_span_margin(y[0], y[2], y[3], h_T, c[0], c[17])
+        if which == 1:
+            return _beam_slack_solve(y, c, projectile_mass, h_T)[4]
+        return -_tip_separation(y, c[0], c[1], h_T)
     if regime == _TAUT_GROUND:
+        if which == 3:
+            return 1.0            # the grounded regimes do not arm beam contact
         _theta_ddot, _psi_ddot, _ax, tension, normal = _grounded_taut_solve(
             y, c, projectile_mass, h_T
         )
         return normal if which == 1 else tension
+    if which == 3:
+        # _SLACK only: the stone reaching the beam. _SLACK_GROUND never arms it - the
+        # stone is in the dirt and the beam's own ground event ends the launch first.
+        if regime != _SLACK:
+            return 1.0
+        return _beam_gap(y[0], y[2], y[3], h_T, c[0], c[17], c[22])
     if which == 1:
         return -_tip_separation(y, c[0], c[1], h_T)
     return y[3] - c[22]
@@ -1206,6 +1524,9 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
     l_a = c[0]
     theta_arm_ground = _first_arm_ground_angle(l_a, c[17], h_T, initial_arm_angle)
     has_ev2 = regime != _SLACK_GROUND
+    # A third: the beam regimes watch for sliding off an end, and _SLACK watches for
+    # reaching the beam in the first place.
+    has_ev3 = regime == _TAUT_BEAM or regime == _SLACK_BEAM or regime == _SLACK
     n = 8 + N_QUADRATURE
     k1 = np.empty(n); k2 = np.empty(n); k3 = np.empty(n); k4 = np.empty(n)
     k5 = np.empty(n); k6 = np.empty(n); k7 = np.empty(n)
@@ -1239,6 +1560,7 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
     gg_prev = y[0] - theta_arm_ground
     e1_prev = _eight_event(y, c, projectile_mass, h_T, regime, 1)
     e2_prev = _eight_event(y, c, projectile_mass, h_T, regime, 2) if has_ev2 else 1.0
+    e3_prev = _eight_event(y, c, projectile_mass, h_T, regime, 3) if has_ev3 else 1.0
     retension_shrinks = 0
     # Whether this segment opened on the sling circle - see RETENSION_CIRCLE_SLOP and the
     # step rejection below.
@@ -1360,14 +1682,69 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                         hi = mid
                 s_ev2 = 0.5 * (lo + hi)
 
-            s = min(min(s_ev1, s_ev2), s_ground)
+            e3_new = _eight_event(yn, c, projectile_mass, h_T, regime, 3) if has_ev3 else 1.0
+            s_ev3 = 2.0
+            # In _SLACK this event is the stone reaching the beam, which dips through zero
+            # and back, so the step is scanned (see BEAM_SCAN_SUBSTEPS). In the two beam
+            # regimes it is sliding off an end of a surface the stone is already on, which
+            # crosses and stays across like every other event here, so the two ends do.
+            if has_ev3 and e3_prev > 0.0 and regime == _SLACK:
+                lo_s = 0.0
+                for j in range(1, BEAM_SCAN_SUBSTEPS + 1):
+                    hi_s = j / BEAM_SCAN_SUBSTEPS
+                    if j == BEAM_SCAN_SUBSTEPS:
+                        g_hi = e3_new
+                    else:
+                        for i in range(n):
+                            stage[i] = _hermite(y[i], yn[i], k1[i], k7[i], h, hi_s)
+                        g_hi = _eight_event(stage, c, projectile_mass, h_T, regime, 3)
+                    if g_hi <= 0.0:
+                        lo, hi = lo_s, hi_s
+                        for _ in range(50):
+                            mid = 0.5 * (lo + hi)
+                            for i in range(n):
+                                stage[i] = _hermite(y[i], yn[i], k1[i], k7[i], h, mid)
+                            if _eight_event(stage, c, projectile_mass, h_T, regime, 3) > 0.0:
+                                lo = mid
+                            else:
+                                hi = mid
+                        s_ev3 = 0.5 * (lo + hi)
+                        break
+                    lo_s = hi_s
+            elif has_ev3 and e3_prev > 0.0 and e3_new <= 0.0:
+                lo, hi = 0.0, 1.0
+                for _ in range(50):
+                    mid = 0.5 * (lo + hi)
+                    for i in range(n):
+                        stage[i] = _hermite(y[i], yn[i], k1[i], k7[i], h, mid)
+                    if _eight_event(stage, c, projectile_mass, h_T, regime, 3) > 0.0:
+                        lo = mid
+                    else:
+                        hi = mid
+                s_ev3 = 0.5 * (lo + hi)
+
+            s = min(min(s_ev1, s_ev2), min(s_ev3, s_ground))
             if s <= 1.0:
                 # Same tie-break order the reference engine's event list gives: the
-                # regime's own two, then the beam.
+                # regime's own transitions in order, then the beam striking the ground.
                 if s_ev1 <= s:
-                    status = _SEG_LIFTOFF if regime == _TAUT_GROUND else _SEG_RETENSION
+                    if regime == _TAUT_GROUND:
+                        status = _SEG_LIFTOFF
+                    elif regime == _TAUT_BEAM or regime == _SLACK_BEAM:
+                        status = _SEG_BEAM_LIFTOFF
+                    else:
+                        status = _SEG_RETENSION
                 elif s_ev2 <= s:
-                    status = _SEG_SLING_SLACK if regime == _TAUT_GROUND else _SEG_LANDING
+                    if regime == _TAUT_GROUND:
+                        status = _SEG_SLING_SLACK
+                    elif regime == _TAUT_BEAM:
+                        status = _SEG_BEAM_SLACK
+                    elif regime == _SLACK_BEAM:
+                        status = _SEG_BEAM_RETENSION
+                    else:
+                        status = _SEG_LANDING
+                elif s_ev3 <= s:
+                    status = _SEG_BEAM_CONTACT if regime == _SLACK else _SEG_BEAM_SPAN
                 else:
                     status = _SEG_ARM_GROUND
                 for i in range(n):
@@ -1381,6 +1758,7 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
             gg_prev = gg_new
             e1_prev = e1_new
             e2_prev = e2_new
+            e3_prev = e3_new
 
             factor = MAX_FACTOR if err_norm == 0.0 else min(MAX_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
@@ -1399,27 +1777,30 @@ def _ground_start_state(theta0, psi_rest, l_a, l_s, h_T, ground_y, out):
     """The cocked pose with the projectile lying on the ground, or False if it cannot be.
 
     Scalar port of physics.TrebuchetSimulator.ground_start_state. A trebuchet is loaded by
-    laying the projectile out behind the machine with the sling stretched along the ground,
-    as far back from the pivot as the sling reaches - not by dangling it in mid-air, and
-    certainly not by burying it, which is where the hanging pose put it. So the projectile
-    starts on the ground at the far end of the sling, on the side the tip leans towards,
-    which is the side away from the throw.
+    laying the projectile out on the ground with the sling stretched to it - not by
+    dangling it in mid-air, and certainly not by burying it, which is where the hanging
+    pose put it. So the pose is pure geometry: the sling is a circle of radius `l_s` about
+    the cocked tip, the ground is the line the resting stone's centre lies on, and the
+    loaded position is where the two meet. Both lengths are to the stone's centre. A circle
+    crosses a line twice and the downrange root is taken - the higher x, the side the
+    machine throws towards.
 
     False when the sling cannot reach the ground from the cocked tip - a pulley machine's
     tip stands a metre up with a 24 cm sling - in which case the sling really does hang and
-    the six-component cocked pose describes it.
+    the six-component cocked pose describes it. That is the one case, and it is the circle
+    and the line failing to meet rather than a fallback: the sign of `drop` is not a test
+    here, only its magnitude, so a tip standing below the resting stone's own centre loads
+    like any other (see the reference for the 385 mm burial the sign test used to cause).
     """
     tip_x = l_a * np.cos(theta0)
     tip_y = l_a * np.sin(theta0) + h_T
-    # Measured to the resting stone's centre, which sits one radius up.
+    # Signed, and only ever squared: the tip may stand above the resting stone's centre or
+    # below it, and the circle meets the line just the same either way.
     drop = tip_y - ground_y
-    if drop < 0.0 or drop > l_s:
+    if abs(drop) > l_s:
         return False
     reach = np.sqrt(max(0.0, l_s * l_s - drop * drop))
-    if tip_x != 0.0:
-        px = tip_x + np.copysign(reach, tip_x)
-    else:
-        px = tip_x - reach
+    px = tip_x + reach
     out[0] = theta0
     out[1] = 0.0
     out[2] = px
@@ -1431,6 +1812,91 @@ def _ground_start_state(theta0, psi_rest, l_a, l_s, h_T, ground_y, out):
     for i in range(N_QUADRATURE):
         out[8 + i] = 0.0
     return True
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _apply_beam_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, h_T, out):
+    """The stone striking the beam: an inelastic impulse along the contact normal.
+
+    Scalar port of physics.TrebuchetSimulator._apply_beam_impulse. The approach rate goes
+    to zero and the arm takes the reaction, so the machine is slowed by the strike exactly
+    as much as the stone is. Dissipative by construction; returns the energy destroyed.
+    """
+    M33, cw_swing_coupling, M_taut = c[4], c[6], c[16]
+    theta, theta_dot = y[0], y[1]
+    px, py, pvx, pvy = y[2], y[3], y[4], y[5]
+    psi, psi_dot = y[6], y[7]
+
+    sin_t, cos_t = np.sin(theta), np.cos(theta)
+    cos_p, sin_p = np.cos(psi), np.sin(psi)
+    M13 = -cw_swing_coupling * (cos_p * cos_t + sin_p * sin_t)
+    M_eff = M_taut - M13 * M13 / M33
+
+    nx, ny, sc, _d, _v_e, _sigma, d_dot = _beam_terms(
+        theta, theta_dot, px, py, pvx, pvy, h_T
+    )
+
+    before = _launch_kinetic_energy(theta, theta_dot, pvx, pvy, psi, psi_dot, c,
+                                    projectile_mass, counter_weight_mass, has_pulley)
+
+    inv_mass = 1.0 / projectile_mass + sc * sc / M_eff
+    j = 0.0
+    if inv_mass > 1e-15:
+        j = -d_dot / inv_mass
+
+    pvx += j * nx / projectile_mass
+    pvy += j * ny / projectile_mass
+    delta_theta_dot = -j * sc / M_eff
+    theta_dot += delta_theta_dot
+    psi_dot -= M13 * delta_theta_dot / M33
+
+    after = _launch_kinetic_energy(theta, theta_dot, pvx, pvy, psi, psi_dot, c,
+                                   projectile_mass, counter_weight_mass, has_pulley)
+
+    out[0] = theta
+    out[1] = theta_dot
+    out[2] = px
+    out[3] = py
+    out[4] = pvx
+    out[5] = pvy
+    out[6] = psi
+    out[7] = psi_dot
+    out[8] = 0.0
+    out[9] = 0.0
+    out[10] = 0.0
+    return max(0.0, before - after)
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _settle_beam(y, c, projectile_mass, h_T, taut_out):
+    """Which regime a stone that has just arrived on the beam belongs in.
+
+    Scalar port of physics.TrebuchetSimulator._settle_beam. The extra case over the
+    grounded version is the span: a stone can be snapped onto the beam's *line* past the
+    end of the actual beam, where there is no surface to rest on at all. And over that,
+    which constraint is acting at all: a stone that reached the beam out of a slack stretch
+    is inside the sling circle, so the taut branches are not available to it and
+    _beam_taut_solve would be answering about a length nothing is holding - see the
+    reference for the 1.8e8 rad/s that produced.
+    """
+    if _beam_span_margin(y[0], y[2], y[3], h_T, c[0], c[17]) <= 0.0:
+        return _SLACK
+    tip_x = c[0] * np.cos(y[0])
+    tip_y = c[0] * np.sin(y[0]) + h_T
+    dx, dy = y[2] - tip_x, y[3] - tip_y
+    if np.sqrt(dx * dx + dy * dy) < c[1] - BEAM_SLING_TAUT_SLOP:
+        if _beam_slack_solve(y, c, projectile_mass, h_T)[4] >= 0.0:
+            return _SLACK_BEAM
+        return _SLACK
+    _th, _ps, _ax, _ay, tension, normal = _beam_taut_solve(y, c, projectile_mass, h_T)
+    if tension < 0.0:
+        if _beam_slack_solve(y, c, projectile_mass, h_T)[4] >= 0.0:
+            return _SLACK_BEAM
+        return _SLACK
+    if normal >= 0.0:
+        return _TAUT_BEAM
+    _taut_state_from_grounded(y, c, h_T, taut_out)
+    return _TAUT
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -1485,7 +1951,8 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
     the reference engine's segments.
 
     Returns (released, t, theta, theta_dot, psi, px, py, pvx, pvy, string_impulse,
-    cw_impulse, sling_deficit, snap_energy, ground_energy, arm_ground, start_py). The
+    cw_impulse, sling_deficit, snap_energy, ground_energy, beam_energy, arm_ground,
+    start_py). The
     projectile is reported as position and velocity rather than a sling angle, because a
     release out of a slack stretch has no sling angle to report - which is exactly how
     physics.LaunchSolution hands it over. `start_py` is where the projectile actually
@@ -1509,6 +1976,11 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
     cw_impulse = 0.0
     sling_deficit = 0.0
     snap_energy = 0.0
+    # Energy destroyed by the stone striking the beam. Kept apart from the snap and
+    # ground losses because it is a different fault - a design whose stone hits its own
+    # arm is one a builder would change - and because the reference engine reports the
+    # three separately, so folding them here would make the two disagree on all three.
+    beam_energy = 0.0
     ground_energy = 0.0
     arm_ground = False
     t = 0.0
@@ -1538,6 +2010,21 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
                                    l_a, l_s, h_T, slack)
             regime = _SLACK
+        # A hanging stone starts touching the beam by construction, not by accident: the
+        # cocked sling is offset by arcsin(r_p / l_s), which is exactly the angle that lays
+        # it against the arm. Settle that here rather than letting the contact event fire
+        # at t = 0 and return a zero-length segment - physics._initial_launch_regime does
+        # the same, and the two have to agree about which regime a launch opens in before
+        # they can agree about anything after it.
+        _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
+                               l_a, l_s, h_T, slack)
+        if _beam_gap(slack[0], slack[2], slack[3], h_T, l_a, c[17],
+                     c[22]) <= BEAM_CONTACT_SLOP:
+            regime = _settle_beam(slack, c, projectile_mass, h_T, taut)
+            if regime == _TAUT:
+                theta, theta_dot = taut[0], taut[1]
+                alpha, alpha_dot = taut[2], taut[3]
+                psi, psi_dot = taut[4], taut[5]
 
     for _ in range(MAX_LAUNCH_SEGMENTS):
         if t >= t_max:
@@ -1568,7 +2055,7 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                         -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a,
                         l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a,
                         string_impulse, cw_impulse, sling_deficit, snap_energy,
-                        ground_energy, arm_ground, start_py)
+                        ground_energy, beam_energy, arm_ground, start_py)
             if status == _SEG_ARM_GROUND:
                 arm_ground = True
                 break
@@ -1577,6 +2064,18 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
 
             _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
                                    l_a, l_s, h_T, slack)
+            if status == _SEG_BEAM_CONTACT:
+                beam_energy += _apply_beam_impulse(
+                    slack, c, projectile_mass, counter_weight_mass, has_pulley, h_T, landed
+                )
+                for i in range(8 + N_QUADRATURE):
+                    slack[i] = landed[i]
+                regime = _settle_beam(slack, c, projectile_mass, h_T, taut)
+                if regime == _TAUT:
+                    theta, theta_dot = taut[0], taut[1]
+                    alpha, alpha_dot = taut[2], taut[3]
+                    psi, psi_dot = taut[4], taut[5]
+                continue
             if status == _SEG_SLING_SLACK:
                 regime = _SLACK
                 continue
@@ -1611,6 +2110,52 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
         if status == _SEG_TMAX:
             break
 
+        if status == _SEG_BEAM_CONTACT:
+            # From _SLACK: the stone reached the arm with the sling carrying nothing.
+            beam_energy += _apply_beam_impulse(
+                slack, c, projectile_mass, counter_weight_mass, has_pulley, h_T, landed
+            )
+            for i in range(8 + N_QUADRATURE):
+                slack[i] = landed[i]
+            regime = _settle_beam(slack, c, projectile_mass, h_T, taut)
+            if regime == _TAUT:
+                theta, theta_dot = taut[0], taut[1]
+                alpha, alpha_dot = taut[2], taut[3]
+                psi, psi_dot = taut[4], taut[5]
+            continue
+        if status == _SEG_BEAM_SLACK:
+            # The sling let go while the stone stayed on the arm. The physical state
+            # carries over untouched, so the running integrals restart by hand - the same
+            # step TAUT_GROUND -> SLACK_GROUND needs, and for the same reason.
+            for i in range(N_QUADRATURE):
+                slack[8 + i] = 0.0
+            regime = _SLACK_BEAM
+            continue
+        if status == _SEG_BEAM_LIFTOFF or status == _SEG_BEAM_SPAN:
+            # Off the surface, or off the end of it. Either way the stone is free; whether
+            # it is still slung is what it was a moment ago.
+            for i in range(N_QUADRATURE):
+                slack[8 + i] = 0.0
+            if regime == _TAUT_BEAM:
+                _taut_state_from_grounded(slack, c, h_T, taut)
+                theta, theta_dot = taut[0], taut[1]
+                alpha, alpha_dot = taut[2], taut[3]
+                psi, psi_dot = taut[4], taut[5]
+                regime = _TAUT
+            else:
+                regime = _SLACK
+            continue
+        if status == _SEG_BEAM_RETENSION:
+            # The sling came taut over a stone riding the arm.
+            snap_energy += _apply_snap(slack, c, projectile_mass, h_T, snap_taut, snap_slack)
+            for i in range(8 + N_QUADRATURE):
+                slack[i] = snap_slack[i]
+            regime = _settle_beam(slack, c, projectile_mass, h_T, taut)
+            if regime == _TAUT:
+                theta, theta_dot = taut[0], taut[1]
+                alpha, alpha_dot = taut[2], taut[3]
+                psi, psi_dot = taut[4], taut[5]
+            continue
         if status == _SEG_LIFTOFF:
             # The sling has taken the projectile's weight off the ground.
             _taut_state_from_grounded(slack, c, h_T, taut)
@@ -1701,10 +2246,10 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                 -l_a * theta_dot * sin_t - l_s * alpha_dot * sin_a,
                 l_a * theta_dot * cos_t + l_s * alpha_dot * cos_a,
                 string_impulse, cw_impulse, sling_deficit, snap_energy, ground_energy,
-                arm_ground, start_py)
+                beam_energy, arm_ground, start_py)
     return (False, t, slack[0], slack[1], slack[6], slack[2], slack[3], slack[4], slack[5],
             string_impulse, cw_impulse, sling_deficit, snap_energy, ground_energy,
-            arm_ground, start_py)
+            beam_energy, arm_ground, start_py)
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -1919,7 +2464,8 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     """Scalar port of simulate_trebuchet's rtol=1e-6/dense_output=False path.
 
     Returns (released, distance, efficiency, string_impulse, cw_impulse, sling_deficit,
-    snap_energy, ground_energy). `cw_impulse` is the counterweight rope's compression
+    snap_energy, ground_energy, beam_energy). `cw_impulse` is the counterweight rope's
+    compression
     impulse (N*s, see
     physics._tension_metrics), which the objective's slack penalty charges; `sling_deficit`
     is the dimensionless share of the launch the sling spent under-loaded, weighted by how
@@ -1967,7 +2513,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
         # Sling tucked alongside the arm, angled just far enough off it to clear.
         arcsin_arg = projectile_radius / string_length
         if arcsin_arg > 1.0 or arcsin_arg < -1.0:
-            return False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         alpha0 = theta0 + np.pi - np.arcsin(arcsin_arg)
         psi0 = 0.0
     else:
@@ -1980,8 +2526,8 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     tension_floor = SLING_TENSION_FLOOR * projectile_mass * G
 
     (released, t_rel, theta_r, theta_dot_r, psi_r, x0, y0, vx0, vy0,
-     string_impulse, cw_impulse, sling_deficit, snap_energy, ground_energy, _arm_ground,
-     start_py) = _integrate_launch(
+     string_impulse, cw_impulse, sling_deficit, snap_energy, ground_energy, beam_energy,
+     _arm_ground, start_py) = _integrate_launch(
         theta0, alpha0, psi0, c, release_angle, 10.0, 1e-6, 1e-6,
         projectile_mass, counter_weight_mass, pulley_radius, has_pulley, tension_floor,
         pivot_height,
@@ -1994,11 +2540,11 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
         sling_deficit = 0.0
     if not released:
         return (False, 0.0, 0.0, string_impulse, cw_impulse, sling_deficit, snap_energy,
-                ground_energy)
+                ground_energy, beam_energy)
 
     if np.isnan(x0) or np.isnan(y0) or np.isnan(vx0) or np.isnan(vy0):
         return (False, 0.0, 0.0, string_impulse, cw_impulse, sling_deficit, snap_energy,
-                ground_energy)
+                ground_energy, beam_energy)
 
     proj_speed2 = vx0 * vx0 + vy0 * vy0
     proj_KE = 0.5 * projectile_mass * proj_speed2
@@ -2036,7 +2582,7 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     efficiency = max(0.0, efficiency)
 
     return (True, distance, efficiency, string_impulse, cw_impulse, sling_deficit,
-            snap_energy, ground_energy)
+            snap_energy, ground_energy, beam_energy)
 
 
 # Deliberately not cache=True, and neither is evaluate_population below. Both call
@@ -2069,7 +2615,7 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
         return INVALID_COST
 
     (released, distance, efficiency, _string_impulse, cw_impulse, sling_deficit,
-     snap_energy, ground_energy) = simulate_fast(
+     snap_energy, ground_energy, beam_energy) = simulate_fast(
         counter_weight_mass, pulley_radius, length_counterweight, counter_weight_rope_length,
         arm_length, string_length, release_angle,
         pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -2100,7 +2646,10 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     # The joules the launch destroyed in its discontinuities - a sling that let go and
     # came back, and a stone that reached the ground - which this engine has always
     # measured and, until the objective had a term for them, discarded.
-    jerk_cost = jerk_penalty_weight * (snap_energy + ground_energy)
+    # Beam contact is a jerk like the other two: an inelastic impulse that destroys
+    # energy the throw had. Charged the same way, so a design that reaches its range by
+    # bouncing the stone off its own arm pays for it.
+    jerk_cost = jerk_penalty_weight * (snap_energy + ground_energy + beam_energy)
 
     return (
         efficiency_weight * efficiency_cost + distance_weight * distance_cost

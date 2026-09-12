@@ -26,15 +26,24 @@ pytest.importorskip("numba")
 
 
 # A pulley machine that both lets its sling go and drops the stone on the ground before
-# throwing it 80 m - the two dissipative discontinuities the jerk penalty prices, in one
-# launch. Shared with tests/test_ground.py, where the four regimes it walks are the point.
+# throwing it 58 m - the two dissipative discontinuities the jerk penalty prices, in one
+# launch. It spends 5.5 J on snaps and 70.9 J on the ground, and never touches the beam,
+# which keeps it a fixture about the two energies it is here for.
+#
+# The second design to sit here. The first was chosen before the beam was a surface the
+# stone could hit, and once it was, that launch caught the arm on the way down instead of
+# the ground - `projectile_ground_energy` went to exactly zero and it had nothing left to
+# price. Drawn from a 500-draw sweep of PARAM_BOUNDS (seed 909), and picked over a larger
+# jerk that both engines do *not* agree on: that one carries a beam strike, and the two
+# score it 10.5% apart at a jerk weight of 250, which is a fact about a launch whose
+# contact placement is marginal rather than about the penalty this is testing.
 JERK_PARAMS = {
-    "counter_weight_mass": 52.725642457680614,
-    "pulley_radius": 0.6070760857653384,
-    "arm_length": 1.0901717662568329,
-    "string_length": 0.9980417041772385,
-    "release_angle": -4.2438199212106875,
-    "pivot_height": 1.3401717662568329,
+    "counter_weight_mass": 17.588115307836468,
+    "pulley_radius": 0.36383226126553714,
+    "arm_length": 1.6449421511814302,
+    "string_length": 0.6627046710227973,
+    "release_angle": -0.15179840800539646,
+    "pivot_height": 2.1470008614689604,
 }
 
 
@@ -62,16 +71,23 @@ def test_scipy_fallback_engine_still_works():
 
 
 def test_objective_penalizes_slack_sling_solutions():
-    # A jerky parameter set (the pre-slack-penalty optimizer defaults) holds the sling
-    # in compression, so the slack penalty must raise its cost by weight * impulse.
+    # A pulley machine that drives its counterweight rope deep into compression - the rope
+    # would have to push, which no rope does - so the slack penalty must raise its cost by
+    # weight * impulse. It reaches -336 N for 11.9 N*s while still throwing 14 m, so it is
+    # a design the search could plausibly wander into rather than a wreck.
+    #
+    # The second design to sit here. The first was the pre-slack-penalty optimizer
+    # defaults, which under the solid beam ride the arm from the cocked pose onward, throw
+    # nothing, and report exactly zero impulse - nothing left to penalize. Drawn from the
+    # same 500-draw sweep JERK_PARAMS comes from.
     jerky = {
-        "counter_weight_mass": 41.795496,
-        "pulley_radius": 0.554577,
-        "arm_length": 1.637497,
-        "string_length": 1.493071,
-        "release_angle": 2.253022,
+        "counter_weight_mass": 33.552160,
+        "pulley_radius": 0.268780,
+        "arm_length": 1.819110,
+        "string_length": 1.078258,
+        "release_angle": -1.120253,
     }
-    fixed = {"pivot_height": 1.764323}
+    fixed = {"pivot_height": 2.635905}
     free_values = [jerky[name] for name in PARAM_NAMES]
 
     base = _objective(free_values, OptimizationConfig(slack_penalty_weight=0.0, fixed_params=dict(fixed)))

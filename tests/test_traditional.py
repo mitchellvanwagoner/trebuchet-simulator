@@ -96,17 +96,21 @@ def test_traditional_launch_conserves_energy_with_dissipation_switched_off():
     )
     result = simulate_trebuchet(params, track_energy=True)
 
-    # This machine is loaded on the ground, so its launch does contain one discontinuity -
-    # the sling coming taut over the stone and picking it up - and that is a real loss
-    # rather than drift. Everything either side of it has to be flat, so the drift is
-    # measured against the total the launch is *allowed* to lose, which the launch reports
-    # for itself.
+    # A launch loaded on the ground may contain discontinuities - the sling coming taut
+    # over the stone, the stone landing - and those are real losses rather than drift. So
+    # the drift is measured against the total the launch is *allowed* to lose, which the
+    # launch reports for itself. Whether there is any such loss at all is a property of
+    # the geometry and not of the Lagrangian: this used to assert `allowed > 0`, which
+    # made it a test of the shipped default's loading stroke, and it duly broke when that
+    # stroke went away. Zero allowed loss is the sharper case, not a skipped one - hence
+    # the absolute floor beside the relative one, since approx(0.0, rel=...) demands exact.
     allowed = result.metrics["sling_snap_energy"] + result.metrics["projectile_ground_energy"]
-    assert allowed > 0.0
     totals = np.array([entry["total"] for entry in result.energy_history])
     drop = totals[0] - totals
     assert drop.min() > -1e-6 * abs(totals[0])            # never gains
-    assert drop.max() == pytest.approx(allowed, rel=1e-3)  # loses exactly what it recorded
+    assert drop.max() == pytest.approx(              # loses exactly what it recorded
+        allowed, rel=1e-3, abs=1e-6 * abs(totals[0])
+    )
 
 
 def test_counterweight_swing_is_inert_on_the_pulley_machine():
@@ -188,9 +192,11 @@ def test_the_pinned_counterweight_link_reports_its_load_but_is_never_charged():
 
     assert result.metrics["min_cw_rope_tension"] > 0.0
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
-    # The sling reads exactly zero while the machine is taking up the slack it was loaded
-    # with, and never less: a rope carries nothing or it pulls.
-    assert result.metrics["min_string_tension"] == 0.0
+    # A rope carries nothing or it pulls - never less than zero, whether or not this
+    # particular launch happens to have a slack stretch in it. The exact `== 0.0` that
+    # used to stand here was asserting that it does, which is the loading pose's business
+    # rather than the counterweight link's.
+    assert result.metrics["min_string_tension"] >= 0.0
     assert result.metrics["string_compression_impulse"] < 1e-9
 
 
@@ -428,30 +434,32 @@ def test_a_whipping_counterweight_pushes_its_pinned_link_and_is_not_charged_for_
     two-force member carries compression as readily as tension.
 
     So both halves matter: the tension diagnostic still has to *see* the compression,
-    because -900 N is a real member load somebody has to build for, and the feasibility
+    because -438 N is a real member load somebody has to build for, and the feasibility
     impulse has to stay at exactly zero, because there is nothing infeasible about it.
-    This design used to be scored out of contention for it.
+    A design like this used to be scored out of contention for it.
+
+    The geometry here is the second one to sit in this test. The first drove its link to
+    -900 N under the loading pose that laid the stone out on the far side of the cocked
+    tip; with the stone downrange instead (physics.ground_start_state) that machine reads
+    +150 N and has nothing left to demonstrate. This one is a sweep's most compressive
+    link among the designs that still throw properly - -438 N while throwing 74.2 m at
+    76% - which is the same pairing the old one was chosen for. The load is settled
+    rather than marginal: -438.3 / -435.9 / -439.1 N at rtol 1e-6 / 1e-8 / 1e-10, on a
+    launch that touches neither the ground nor the beam.
     """
     params = traditional_params(
-        counter_weight_mass=54.584208, length_counterweight=0.320627, arm_length=1.234251,
-        string_length=0.530571, release_angle=1.031954, pivot_height=0.914917,
-        counter_weight_rope_length=0.584211,
+        counter_weight_mass=34.212811, length_counterweight=0.377274, arm_length=0.954921,
+        string_length=1.119312, release_angle=1.080980, pivot_height=0.864735,
+        counter_weight_rope_length=0.850194,
     )
     result = simulate_trebuchet(params)
 
     assert result.metrics["release_occurred"] is True
-    assert result.distance > 20.0  # and it is not a wreck: it throws as far as the default
+    assert result.distance > 20.0  # and it is not a wreck: it throws further than the default
     # The load is real and is reported.
-    assert result.metrics["min_cw_rope_tension"] < -900.0
+    assert result.metrics["min_cw_rope_tension"] < -400.0
     # And it is not a fault: no rope, nothing to go slack, nothing to charge.
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
-    # Nothing else singles this design out either. Its slack share is the loading stroke
-    # every machine of this kind makes, its snap is that stroke ending, and the stone
-    # never touches the ground after it - so with the link no longer charged, the design
-    # stands or falls on range and efficiency like any other.
-    assert result.metrics["projectile_ground_contacts"] == 0
-    assert result.metrics["sling_snap_count"] == 1
-    assert result.solution.segments[0].regime == "slack_ground"
 
 
 def test_the_aftermath_carries_the_counterweight_swing_across_release():

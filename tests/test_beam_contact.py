@@ -159,48 +159,66 @@ def test_every_launch_reports_its_tightest_approach_to_the_beam(machine):
     assert clearance < params.arm_length + params.string_length
 
 
-def test_the_shipped_pulley_design_now_rides_its_beam_instead_of_passing_through():
+# The pulley design that motivated beam contact, kept here now that it is no longer the
+# shipped default. It was optimizer output for the 30 m target against a model where the
+# stone could pass through the arm, and that is exactly what it did - about 2 mm in,
+# partway through the throw, with nothing reporting or charging it. Making the beam solid
+# dropped it to 16.4 m against its own target and forced the re-derivation that replaced
+# it (see config.DEFAULT_OPTIMIZABLE_PARAMS), so it has to live here rather than be read
+# off the defaults, which now keep their stone clear.
+RETIRED_PULLEY_DESIGN = {
+    "counter_weight_mass": 59.988831,
+    "pulley_radius": 0.039764,
+    "arm_length": 0.365647,
+    "string_length": 0.331857,
+    "release_angle": -0.072812,
+}
+
+
+def test_the_design_that_used_to_pass_through_its_beam_now_rides_it():
     """The design that motivated all of this, and what contact did to it.
 
-    The default pulley machine used to drive its stone about 2 mm into its own arm
-    partway through the throw, and nothing reported or charged it. It no longer can.
+    What it does instead of passing through is start *touching*: initial_state offsets
+    the hanging sling by arcsin(r_p / l_s), which is exactly the angle that lays the
+    stone against the beam, so the cocked pose is tangent by construction rather than by
+    accident. The launch therefore opens in TAUT_BEAM, rides the arm for the first
+    stretch, and only then flies - which is why `beam_contacts` is zero here and not one.
+    A strike and a start in contact are different things, the same way a machine loaded
+    on the ground has a ground *fraction* but no ground *contacts*.
 
-    What it does instead is start *touching*: initial_state offsets the hanging sling by
-    arcsin(r_p / l_s), which is exactly the angle that lays the stone against the beam,
-    so the cocked pose is tangent by construction rather than by accident. The launch
-    therefore opens in TAUT_BEAM, rides the arm for the first stretch, and only then
-    flies - which is why `beam_contacts` is zero here and not one. A strike and a start
-    in contact are different things, the same way a machine loaded on the ground has a
-    ground *fraction* but no ground *contacts*.
-
-    It costs this design most of its range, because it was buying that range partly by
-    passing through the arm: 30.0 m before, about 16 m now, at the same efficiency and
-    the same release pin angle - the throw is aimed differently, not weakened. That is
-    the re-derivation this change forces on the shipped defaults.
+    It cost this design most of its range, because it was buying that range partly by
+    passing through the arm: 30.0 m before, 16.4 m now, at the same efficiency (90.1%)
+    and the same release pin angle (-4.2 deg) - the throw is aimed differently, not
+    weakened. The shipped defaults were re-derived off the back of it and land somewhere
+    else entirely: a 1.05 m arm that never touches its beam at all.
     """
-    result = simulate_trebuchet(default_params(MachineType.PULLEY))
+    result = simulate_trebuchet(TrebuchetParams(**RETIRED_PULLEY_DESIGN))
 
     assert result.metrics["min_beam_clearance"] >= -1e-9
     assert result.solution.segments[0].regime == "taut_beam"
     assert result.metrics["beam_contacts"] == 0
     assert result.metrics["release_occurred"] is True
+    assert result.distance == pytest.approx(16.4, abs=0.1)
 
 
-def test_contact_removes_most_but_not_yet_all_interpenetration():
+def test_contact_keeps_the_stone_out_of_the_beam():
     """Where the constraint stands, measured rather than claimed.
 
     Before contact existed, 61% of pulley draws inside PARAM_BOUNDS put the stone into
-    the arm, a median 25 mm into a 40 mm ball. With it, the median case is gone - what
-    remains reads at the tangency rounding - but the worst still reaches a few
-    millimetres, because entering contact is detected by a sign change in the clearance
-    at the ends of accepted steps and a shallow dip can begin and end inside one. That is
-    the same failure `physics._first_arm_ground_angle` avoids by testing an angle instead
-    of a clearance, and the same one `fastsim.RETENSION_CIRCLE_SLOP` guards by rejecting
-    an over-long step outright.
+    the arm, a median 25 mm into a 40 mm ball. Contact alone took the median case out but
+    left a worst of several millimetres, because entering contact was detected by a sign
+    change in the clearance at the ends of accepted steps and the stone swings *past* the
+    arm - so the clearance dips through zero and comes back, and a step longer than the
+    dip sees a positive sign at both ends. Both engines scan the step now
+    (physics.BEAM_SCAN_SUBSTEPS), which is the same fix in spirit that
+    `physics._first_arm_ground_angle` gets by testing an angle instead of a clearance and
+    that `fastsim.RETENSION_CIRCLE_SLOP` gets by rejecting an over-long step outright.
 
-    Asserted as a bound rather than an equality so it records the state honestly: the
-    typical draw must be clean, and the worst is allowed to be a few millimetres until
-    the crossing test is made robust.
+    What is left is four orders of magnitude smaller and is not a missed crossing at all:
+    ten of these 22 draws read a few tenths of a micrometre inside, which is the
+    constraint drifting while the stone rides the surface, and the worst of them is
+    0.41 um. The bound below is a micrometre, which clears that and is 25000x tighter than
+    what the model allowed before any of this.
     """
     from trebuchet_sim.optimization import PARAM_BOUNDS, param_names
 
@@ -226,18 +244,24 @@ def test_contact_removes_most_but_not_yet_all_interpenetration():
 
     assert checked > 15
     penetrations.sort()
-    # The median draw no longer ends up inside the beam to any depth that matters.
-    if penetrations:
-        median = penetrations[len(penetrations) // 2]
-        assert median > -1e-3, f"median penetration {median * 1000:.2f} mm"
-    # And nothing is anywhere near the 25-37 mm the model used to allow.
-    assert worst > -0.010, f"worst penetration {worst * 1000:.2f} mm"
+    # Nothing is anywhere near the 25-37 mm the model used to allow, nor the few
+    # millimetres that survived contact on its own: what is left is surface drift.
+    assert worst > -1e-6, f"worst penetration {worst * 1e6:.2f} um"
 
 
-@pytest.mark.parametrize("machine", list(MachineType))
-def test_a_launch_that_never_nears_the_beam_is_untouched_by_any_of_this(machine):
-    """The traditional machine keeps its stone 280 mm clear, so contact must be inert
-    for it - no regimes entered, no energy charged, and the throw it had before."""
+def test_a_launch_that_never_nears_the_beam_is_untouched_by_any_of_this():
+    """The traditional machine keeps its stone clear of the beam, so contact is inert for
+    it - no regimes entered, nothing charged.
+
+    Traditional only, and not parametrized: the pulley machine's stone *does* ride its
+    beam, which is what the rest of this file is about. The parametrize that used to sit
+    here ran the traditional machine twice and ignored its own argument.
+
+    What it does not assert is the distance. That used to pin the shipped default's 30 m,
+    which made this a test of the defaults rather than of contact being inert - and it
+    duly broke when the loading pose moved, on a launch that still never goes near the
+    beam. The four assertions below are the whole claim.
+    """
     result = simulate_trebuchet(default_params(MachineType.TRADITIONAL))
 
     assert result.metrics["min_beam_clearance"] > 0.1
@@ -246,4 +270,3 @@ def test_a_launch_that_never_nears_the_beam_is_untouched_by_any_of_this(machine)
     assert not any(
         seg.regime in ("taut_beam", "slack_beam") for seg in result.solution.segments
     )
-    assert result.distance == pytest.approx(30.0, abs=0.05)

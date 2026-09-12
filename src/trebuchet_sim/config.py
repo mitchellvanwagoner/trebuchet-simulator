@@ -58,59 +58,56 @@ AUTO_INITIAL_ARM_ANGLE = 1e30
 # no use as a default whatever it scores (see DEFAULT_TRADITIONAL_PARAMS for the draw that
 # made this a rule).
 #
-# Re-swept whenever the physics under it moves, which it has four times: when
-# `pivot_height` rose to 2.5 m, when the arm's drag torque was corrected, and now for two
-# modelling changes and two engine fixes at once.
+# Re-swept whenever the physics under it moves, which it has five times: when
+# `pivot_height` rose to 2.5 m, when the arm's drag torque was corrected, for two modelling
+# changes and two engine fixes at once, and now for the beam becoming a surface the stone
+# can hit.
+#
+# That last one is why this set looks nothing like the one before it, and why its
+# efficiency reads 74.8% against that set's 90.1%. The 90.1% machine was a 0.37 m arm on a
+# 0.33 m sling that swung its stone straight through its own beam - and was credited with
+# the throw. Nothing stopped it, so nothing charged it, and the search had been free to
+# buy range with a collision the model could not see. With the beam solid it throws 16.4 m
+# against its own 30 m target. The re-swept machine is three times the arm at 1.05 m and
+# keeps its stone clear the whole way: no beam contact, no ground contact, and its 74.8%
+# is what a pulley machine of this size is actually worth. See the beam-contact regimes in
+# physics.py and the step scan both engines needed to see them at all.
 #
 # `release_angle` stopped being the arm's angle in the world and became the release pin's
 # angle, measured from the arm to the sling. That is what a pin can actually sense, and it
 # is why this set exists rather than the previous one: under the old convention the
 # shipped design reached its release arm-angle on the sling's *third* pass, so a real pin
 # set for it would have fired on the first, at 11.35 m/s pointing backwards against the
-# 17.6 m/s the model claimed. This machine releases at -4.2 degrees of pin angle, on the
+# 17.6 m/s the model claimed. This machine releases at -67.2 degrees of pin angle, on the
 # first crossing, and is therefore buildable.
 #
 # And the pivot's dry bearing friction is now modelled (see
 # TrebuchetParams.bearing_friction_coefficient). It costs the same at every speed, so it
-# is charged per radian the arm turns - which is the thing this machine had most of, and
-# the search cut the rotation from 287 to 238 degrees in response. Efficiency reads 90.1%
-# against the 93.2% of the set before the pin angle and the friction, which is not the
-# machine getting worse but the model no longer giving it a free pivot.
+# is charged per radian the arm turns, which is the thing a short-armed machine has most
+# of. It is one of the reasons the short arm stopped winning once the beam was solid.
 #
-# One property this set does *not* have, and the comment here used to claim: its
-# counterweight rope pushes. It reaches -93.0 N for an impulse of 0.018 N*s, which is real
-# - this machine's weight really does hang on a rope over the axle, and a rope cannot push
-# - and every design in this basin does it, from -90 N to -133 N. It stays under the
-# 0.05 N*s the CLI and dashboard warn at, but it is not nothing. (The traditional machine
-# has no equivalent: its weight is pinned to the arm through a rigid strut, so compression
-# there is a member load rather than a fault. See physics._cw_link_tension.)
+# Its counterweight rope still pushes, but barely: -0.77 N for an impulse of
+# 0.0018 N*s, an order of magnitude under the previous set's 0.018 N*s and two under the
+# 0.05 N*s the CLI and dashboard warn at. That is real rather than noise - this machine's
+# weight hangs on a rope over the axle and a rope cannot push - and it is what
+# `slack_penalty_weight` is there to keep small. (The traditional machine has no
+# equivalent: its weight is pinned to the arm through a rigid strut, so compression there
+# is a member load rather than a fault. See physics._cw_link_tension.)
 #
-# It is also not the price of the efficiency, which is the surprise. Raising
-# `slack_penalty_weight` does not drive the search out of this basin and back to the broad
-# 1.0 m one; whenever it lands in this basin at all it finds the same short arm with the
-# compression an order of magnitude smaller, at the same range and the same efficiency -
-# best-of-16-seeds at the 30 m target reads 0.0216 / 0.0023 / 0.0008 / 0.0002 N*s at a
-# weight of 200 / 800 / 2000 / 2500, with efficiency flat at 90.0-90.4%. Which basin a
-# given run finds is the seed-dependent part and stays so at every weight, so those rows
-# are a trend and not a table to interpolate.
+# These five numbers are defined as what `trebuchet optimize --target-distance 30` returns
+# on the *shipped* weights, so tuning a weight to tidy them up is a calibration decision
+# about every search anyone runs rather than about this dict, and it belongs to whoever is
+# prepared to re-check the calibration in optimization.py against it.
 #
-# So the shipped 200 is simply not asking for something it could have almost free. It has
-# been left alone regardless: these five numbers are defined as what
-# `trebuchet optimize --target-distance 30` returns on the *shipped* weights, so moving the
-# weight to clean them up is a calibration decision about every search anyone runs, not
-# about this dict, and it belongs to whoever is prepared to re-check the calibration in
-# optimization.py against it.
-#
-# The seed matters: this machine's landscape has one narrow basin well below the broad one
-# around it, and only 8 of 48 seeds settle in it - the rest find a 1.0 m arm at a -69
-# degree pin for 73.5%. The shipped seed is not quite this machine's best of those 8,
-# because it has to serve the traditional machine too. See OptimizationConfig.seed.
+# The seed is still shared with the traditional machine - one seed has to serve both - and
+# still matters, though the landscape it is picking a basin out of has changed shape now
+# that the beam is solid. See OptimizationConfig.seed.
 DEFAULT_OPTIMIZABLE_PARAMS = {
-    "counter_weight_mass": 59.988831,  # kg
-    "pulley_radius": 0.039764,         # m
-    "arm_length": 0.365647,            # m
-    "string_length": 0.331857,         # m
-    "release_angle": -0.072812,        # radians (pin angle, sling measured from the arm)
+    "counter_weight_mass": 59.982328,  # kg
+    "pulley_radius": 0.049736,         # m
+    "arm_length": 1.047940,            # m
+    "string_length": 0.822843,         # m
+    "release_angle": -1.173475,        # radians (pin angle, sling measured from the arm)
 }
 
 
@@ -200,25 +197,32 @@ def resolve_initial_arm_angle(machine, arm_length: float, pivot_height: float) -
 # into a stone lobbed backwards. A design whose distance depends on which engine you ask is
 # not a default, whatever it scores.
 #
-# The arm is long and the pivot low because the cocked angle is no longer a number anyone
-# chose - it is whatever walks the long arm down to the ground, and an arm shorter than the
-# pivot is tall cannot get there. So this machine loads the way a real one does: the beam
-# down, the sling laid out along the ground behind it, the stone at the far end. Its launch
-# opens in the SLACK_GROUND regime, taking up the slack, which is a third of the run and is
-# charged as such by `sling_tension_deficit`.
+# The pivot is low because the cocked angle is no longer a number anyone chose - it is
+# whatever walks the long arm down to the ground, and an arm shorter than the pivot is tall
+# cannot get there. So this machine loads the way a real one does: the beam down, the sling
+# stretched to a stone lying on the ground, and the arm rotating away from it.
 #
-# 73.7% efficiency, against the 96.8% of the set before the pin angle and the friction.
-# Almost all of the difference is the bearing friction that set never paid, and the rest is
-# a release pin that has to fire on the sling's first pass. This machine's counterweight
-# link is never asked to push in the first place - it bottoms out at +156 N - which is
-# incidental rather than designed for: nothing charges it if it does, because a pinned
-# strut carries compression by design (see physics._cw_link_tension).
+# Which way it is stretched is the other thing that moved this set. The stone is laid out
+# *downrange* of the cocked tip now - ground_start_state takes the +x root of the loading
+# circle - and this machine's tip sweeps back and up, away from it, so the sling is
+# carrying load before anything moves. The launch opens in TAUT_GROUND rather than
+# SLACK_GROUND: it drags the stone back along the ground for 43% of the run, then whips it
+# forward, which is the stroke a real trebuchet makes. It never goes slack at all -
+# `string_slack_fraction` and `sling_tension_deficit` are both exactly zero, where the
+# far-side pose spent a third of every launch taking up slack and was charged for it.
+#
+# 93.1% efficiency at 17.9 kg all in, against the 73.7% of the set before the loading root
+# moved and the beam became solid. The stone never touches the beam and never lands, the
+# sling is under load throughout, and the counterweight link bottoms out at +61.9 N -
+# always in tension, which is incidental rather than designed for: nothing charges it if it
+# pushes, because a pinned strut carries compression by design (see
+# physics._cw_link_tension).
 DEFAULT_TRADITIONAL_PARAMS = {
-    "counter_weight_mass": 29.767338,   # kg
-    "length_counterweight": 0.262585,   # m
-    "arm_length": 1.492254,             # m
-    "string_length": 0.434998,          # m
-    "release_angle": 0.228646,          # radians (pin angle, sling measured from the arm)
+    "counter_weight_mass": 15.882893,   # kg
+    "length_counterweight": 0.290764,   # m
+    "arm_length": 1.078622,             # m
+    "string_length": 1.023034,          # m
+    "release_angle": 0.232733,          # radians (pin angle, sling measured from the arm)
 }
 
 # Fixed (never-optimized) fields whose defaults also differ per machine: the pivot the

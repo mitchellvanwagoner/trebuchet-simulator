@@ -53,6 +53,20 @@ SLACK_BEAM = "slack_beam"
 # RETENSION_CIRCLE_SLOP: a segment that opens exactly on a surface has nothing for an
 # ordinary sign-change test to arm on.
 BEAM_CONTACT_SLOP = 1e-12
+
+# How far inside the sling circle still counts as a taut sling, in metres, when deciding
+# which beam regime a stone that has just arrived on the arm belongs in (_settle_beam).
+# A stone arriving out of the taut regime, or off a snap, is on the circle to rounding -
+# its position is built from the sling length - so anything measurably inside it arrived
+# slack, and the taut contact regime is not available to it.
+BEAM_SLING_TAUT_SLOP = 1e-9
+
+# How many sub-intervals of an accepted step the stone's clearance from the beam is
+# sampled over before that step is declared contact-free. See the scan in
+# _integrate_launch for why the end points are not enough, and fastsim's own copy of this
+# constant, which has to match for the two engines to find the same contacts.
+BEAM_SCAN_SUBSTEPS = 8
+
 BEAM_REGIMES = (TAUT_BEAM, SLACK_BEAM)
 # Every regime that carries the projectile explicitly, i.e. everything but TAUT.
 EIGHT_STATE_REGIMES = (SLACK, TAUT_GROUND, SLACK_GROUND, TAUT_BEAM, SLACK_BEAM)
@@ -1025,13 +1039,24 @@ class TrebuchetSimulator:
             # a step and kinked inside it can undershoot - two of the Dormand-Prince
             # weights are negative - and an impulse the objective is charged for must
             # never come out able to pay the design back.
-            final = seg.sol.y[:, -1]
+            # `seg.t1`, not the solver's last step. A segment cut short by the beam scan
+            # (see _scan_missed_beam_contact) keeps the solver's own grid, which runs on
+            # past the cut into a trajectory the launch never took - straight into the
+            # beam, since that is what the scan found there. Reading the integrals off
+            # that grid's end would charge the launch for a stretch it did not make, and
+            # sampling the minima over it read the stone 4.6 mm inside an arm it had
+            # already been stopped by. Segments that ended on an event of their own are
+            # unaffected: for them the cut and the last step are the same instant.
+            truncated = seg.sol.sol is not None and seg.t1 < float(seg.sol.t[-1])
+            final = seg.sol.sol(seg.t1) if truncated else seg.sol.y[:, -1]
             string_impulse += max(0.0, float(final[-3]))
             cw_impulse += max(0.0, float(final[-2]))
             sling_deficit += max(0.0, float(final[-1]))
 
             ts = seg.sol.t
             for i in range(len(ts)):
+                if float(ts[i]) > seg.t1:
+                    break
                 t_i, y_i = float(ts[i]), seg.sol.y[:, i]
                 # A sling under load reports its tension whether or not the projectile
                 # it is pulling happens to be resting on the ground; a slack one carries
@@ -1872,6 +1897,11 @@ class TrebuchetSimulator:
             SLACK_GROUND: (self._grounded_slack_dynamics, [ground_retension_event]),
         }
 
+        # Which event object is the beam contact, per regime. Only the two airborne
+        # regimes arm it: a stone on the ground is not reaching the arm, and one already
+        # on the beam is watching for the ways off it instead.
+        _BEAM_CONTACT_EVENTS = {TAUT: taut_beam_contact_event, SLACK: slack_beam_contact_event}
+
         t = 0.0
         y, regime = self._initial_launch_regime()
 
@@ -1901,14 +1931,45 @@ class TrebuchetSimulator:
                 events = events + [arm_ground_event]
 
             atol = self._atol_taut if regime == TAUT else self._atol_eight
+            # Dense output is forced wherever beam contact is armed, whatever the caller
+            # asked for: the scan below needs the interpolant. Elsewhere it stays the
+            # caller's choice, which is what the optimizer's own callers switch off.
+            # Located in the list rather than tabulated: TAUT inserts the release event
+            # in front of its transitions, so the beam event's index moves with it.
+            beam_event = _BEAM_CONTACT_EVENTS.get(regime)
+            beam_index = events.index(beam_event) if beam_event is not None else -1
             sol = solve_ivp(dynamics, (t, t_max), y, events=events,
-                            dense_output=dense_output, rtol=rtol, atol=atol)
-            launch.segments.append(
-                LaunchSegment(sol=sol, t0=t, t1=float(sol.t[-1]), regime=regime)
-            )
+                            dense_output=dense_output or beam_index >= 0,
+                            rtol=rtol, atol=atol)
+            segment = LaunchSegment(sol=sol, t0=t, t1=float(sol.t[-1]), regime=regime)
+            launch.segments.append(segment)
 
             fired = [(float(sol.t_events[i][0]), i) for i in range(len(events))
                      if sol.t_events[i].size > 0]
+
+            # A contact the solver stepped clean over. Its beam event is a sign test at
+            # the ends of each step, which is sound for a quantity that crosses zero and
+            # stays across - and the stone's clearance from the arm is not one. The stone
+            # swings past the beam, so the clearance dips through zero and comes back, and
+            # a step longer than the dip reads positive at both ends. Measured over the
+            # 196-launch sweep in tests/test_fastsim.py, that happens in 19 of 62 pulley
+            # launches and 17 of 134 traditional ones, to a depth of 40 mm: the stone
+            # passes clean through the arm throwing it and nothing records a thing. It is
+            # the same hazard _first_arm_ground_angle sidesteps by testing the arm angle
+            # instead of the beam's clearance, and here there is no monotone coordinate to
+            # move onto - the stone's approach is not monotone in anything - so the step
+            # is scanned instead. See BEAM_SCAN_SUBSTEPS.
+            if beam_index >= 0:
+                missed = self._scan_missed_beam_contact(
+                    sol, regime, min(fired)[0] if fired else float(sol.t[-1])
+                )
+                if missed is not None:
+                    t_missed, y_missed = missed
+                    segment.t1 = t_missed
+                    fired = [(t_missed, beam_index)]
+                    sol.t_events[beam_index] = np.array([t_missed])
+                    sol.y_events[beam_index] = np.array([y_missed])
+
             if not fired:
                 break  # no event: integrated to t_max
             t, index = min(fired)
@@ -2143,6 +2204,47 @@ class TrebuchetSimulator:
             return state, TAUT_GROUND
         return self._taut_state_from_grounded(state), TAUT
 
+    def _scan_missed_beam_contact(self, sol, regime: str, t_end: float):
+        """The first beam contact inside `sol` that its event's end-point sign test missed.
+
+        Returns (t, state) for the earliest crossing strictly before `t_end`, or None.
+        The solver's own accepted steps are the grid - the same one the fast engine walks,
+        so the two look in the same places - and each is sampled at BEAM_SCAN_SUBSTEPS
+        interior points. A sample at or below zero brackets a crossing, which is then
+        bisected on the step's own interpolant to the same precision the solver's event
+        root-finder would have reached.
+        """
+        grid = sol.t
+        if len(grid) < 2:
+            return None
+        for a, b in zip(grid[:-1], grid[1:]):
+            if a >= t_end:
+                break
+            lo = a
+            for j in range(1, BEAM_SCAN_SUBSTEPS + 1):
+                hi = a + (b - a) * j / BEAM_SCAN_SUBSTEPS
+                if self.beam_clearance(sol.sol(hi), regime) > 0.0:
+                    lo = hi
+                    continue
+                for _ in range(60):
+                    mid = 0.5 * (lo + hi)
+                    if self.beam_clearance(sol.sol(mid), regime) > 0.0:
+                        lo = mid
+                    else:
+                        hi = mid
+                t_hit = 0.5 * (lo + hi)
+                if t_hit >= t_end:
+                    return None  # the solver already stopped at something earlier
+                if t_hit <= sol.t[0]:
+                    # The state the segment opened on, not an excursion inside it: a
+                    # segment entered from a beam regime starts at the surface to
+                    # rounding. Step past it and keep looking rather than giving up on
+                    # the segment, which would hide every later crossing behind it.
+                    lo = hi
+                    continue
+                return t_hit, sol.sol(t_hit)
+        return None
+
     def _settle_beam(self, state) -> Tuple[List[float], str]:
         """Which beam regime a stone that has just arrived on the arm belongs in.
 
@@ -2151,12 +2253,30 @@ class TrebuchetSimulator:
         own event fire at t0 would return a zero-length segment forever. The extra case
         here is the span - a stone can be snapped onto the line of the beam past the end
         of the actual beam, where there is no surface to rest on at all.
+
+        And the extra case over *that* is which of the two constraints is even acting. A
+        stone can reach the beam out of a slack stretch, and then the sling is not holding
+        it at all - it is somewhere inside the sling circle, and asking beam_taut_forces
+        about it is asking what tension holds a length that is not being held. The answer
+        is a number, and a number that comes out positive sends the launch into TAUT_BEAM
+        with the sling 39 mm long where the design says 697 - a state the taut dynamics
+        cannot represent, whose first step drives theta_dot to 1.8e8 and the launch to
+        infinity. So the separation is measured first and the taut branches are only
+        reachable from a sling that is actually at full stretch. Arrivals that are (out of
+        TAUT, or off a snap) sit exactly on the circle to rounding, which is what the slop
+        is sized for.
         """
         s, _d, _gap, on_span = self.beam_contact_geometry(
             float(state[0]), float(state[2]), float(state[3])
         )
         if not on_span:
             return state, SLACK
+        tip_x = self._l_a * math.cos(float(state[0]))
+        tip_y = self._l_a * math.sin(float(state[0])) + self._h_T
+        separation = math.hypot(float(state[2]) - tip_x, float(state[3]) - tip_y)
+        if separation < self._l_s - BEAM_SLING_TAUT_SLOP:
+            # A slack sling carries nothing, so the only question is the surface.
+            return (state, SLACK_BEAM) if self.beam_forces(state) >= 0.0 else (state, SLACK)
         tension, normal = self.beam_taut_forces(state)
         if tension < 0.0:
             # The sling is not carrying: the stone rides the beam on its own.
@@ -2347,8 +2467,8 @@ class TrebuchetSimulator:
 
         This is the sling angle only. Where the tip is low enough for the sling to
         reach the ground, the projectile does not hang there at all - it lies on the
-        ground, laid out behind the machine, and `ground_start_state` is what the
-        launch actually starts from.
+        ground downrange of the tip, and `ground_start_state` is what the launch
+        actually starts from.
         """
         p = self.params
         theta_i = float(p.initial_arm_angle)
@@ -2360,30 +2480,46 @@ class TrebuchetSimulator:
     def ground_start_state(self) -> "Optional[List[float]]":
         """The cocked pose with the projectile lying on the ground, or None.
 
-        A trebuchet is loaded by laying the projectile out behind the machine with the
-        sling stretched along the ground, as far back from the pivot as the sling
-        reaches - not by dangling it in mid-air, and certainly not by burying it, which
-        is where the hanging pose put it (23 mm under, on the traditional defaults).
-        So the projectile starts on the ground at the far end of the sling, on the side
-        the tip leans towards, which is the side away from the throw.
+        A trebuchet is loaded by laying the projectile out on the ground with the sling
+        stretched to it - not by dangling it in mid-air, and certainly not by burying it,
+        which is where the hanging pose put it (23 mm under, on the traditional defaults).
+        So the pose is pure geometry and is solved as such: the sling is a circle of
+        radius `string_length` about the cocked tip, the ground is the line the resting
+        stone's centre lies on, and the loaded position is where the two meet. Both
+        lengths are to the stone's *centre* - the sling runs to the middle of the pouch,
+        and the centre rests one projectile radius up - so the stone sits on the surface
+        rather than through it.
 
-        None when the sling cannot reach the ground from the cocked tip - a pulley
-        machine's tip stands a metre up with a 24 cm sling - in which case the sling
-        really does hang and initial_state describes it.
+        A circle crosses a line twice, and the downrange root is the one taken: the
+        higher x, on the side the machine throws towards. Loading that way is what the
+        two roots are actually a choice between, and it is a choice about the build
+        rather than about the arithmetic - the other root lays the stone out on the far
+        side of the tip instead. There is no sign test anywhere in here: which side of
+        the pivot the tip leans, and whether the tip stands above or below the stone's
+        own centre, both fall out of the same expression. That last one used to be a
+        bail-out (`drop < 0`), and it silently unloaded the machine - a traditional
+        trebuchet cocks its tip 50 mm up (config.TRADITIONAL_START_CLEARANCE), so a
+        stone of 50 mm radius or more stands taller than the tip it hangs from, which is
+        an ordinary thing for a stone to do and was read as "cannot be loaded". The
+        machine then fell back to the hanging pose and started 385 mm underground,
+        recording no ground contact, because nothing had gone down through the surface.
+
+        None only when the circle and the line do not meet at all: the sling cannot
+        reach the ground from the cocked tip, a pulley machine's tip standing a metre up
+        with a 24 cm sling. That is not a fallback but the other geometry - there is no
+        resting position to solve for, the sling really does hang, and initial_state
+        describes it.
         """
         theta_i = float(self.params.initial_arm_angle)
         tip_x = self._l_a * math.cos(theta_i)
         tip_y = self._l_a * math.sin(theta_i) + self._h_T
-        # Measured to the resting stone's centre, which sits one radius up.
+        # Signed, and only ever squared: the tip may stand above the resting stone's
+        # centre or below it, and the circle meets the line just the same either way.
         drop = tip_y - self._ground_y
-        if drop < 0.0 or drop > self._l_s:
+        if abs(drop) > self._l_s:
             return None
         reach = math.sqrt(max(0.0, self._l_s * self._l_s - drop * drop))
-        # Behind the machine: the tip leans to one side of the pivot at rest and the
-        # sling is laid out further that way, so the throw sweeps the projectile up and
-        # across rather than dragging it backwards through the frame.
-        px = tip_x + math.copysign(reach, tip_x) if tip_x != 0.0 else tip_x - reach
-        return [theta_i, 0.0, px, self._ground_y, 0.0, 0.0, self._psi_rest, 0.0,
+        return [theta_i, 0.0, tip_x + reach, self._ground_y, 0.0, 0.0, self._psi_rest, 0.0,
                 *(0.0,) * N_QUADRATURE]
 
     def simulate(
