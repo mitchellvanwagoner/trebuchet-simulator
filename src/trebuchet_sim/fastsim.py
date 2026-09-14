@@ -35,6 +35,23 @@ missing physics but as what they say they are: the impulse marks a rigid link (t
 counterweight rope) being pushed, and the deficit grades how close to slack a sling ran,
 which is the continuous signal the optimizer steers by (see optimization.py).
 
+Every kernel here is compiled with `fastmath=False`, deliberately, and it is the one
+compilation flag in this file worth arguing about. With fastmath on, the same source
+produced *different physics* depending on whether numba had just compiled it or had
+reloaded it from the on-disk cache: over a sweep of 8000 designs across both machines,
+2286 values moved between a cold run and a warm one, including designs crossing between a
+real score and INVALID_COST, and including the optimizer's own answer. The mechanism is
+that a cached function is reloaded as opaque object code while a freshly compiled one is
+still LLVM IR that can be inlined into its callers - and `reassoc` and `contract` then let
+LLVM reshape the arithmetic differently on the two paths. Dropping just those two flags
+cuts the divergence to 432 values but does not close it; `fastmath=False` closes it
+exactly, 0 of 8016. The launch is a stitched walk through regimes whose boundaries are
+sign tests on constraint forces, so a last-bit difference is not a last-bit difference for
+long: it decides whether a sling lets go, and the launch after that is a different launch.
+It costs about 8% on the hot path and takes a third off the cold compile - 177s under
+fastmath against 111s as shipped here - for an engine that answers the same question the
+same way twice.
+
 The integrator mirrors scipy's RK45: same Dormand-Prince tableau, same step-size
 control. Events (release angle, ground impact) are localized with a cubic Hermite
 interpolant built from the bracketing step's endpoint states/derivatives, refined by
@@ -245,7 +262,7 @@ BEAM_SLING_TAUT_SLOP = 1e-9
 BEAM_SCAN_SUBSTEPS = 8
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _probe_step(d0, d1, interval_length):
     """The trial step scipy takes before it can measure how fast the derivative changes.
 
@@ -257,7 +274,7 @@ def _probe_step(d0, d1, interval_length):
     return min(h0, interval_length)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _initial_step(h0, d1, d2, interval_length):
     """Second half of select_initial_step, once the probe has produced d2.
 
@@ -272,7 +289,7 @@ def _initial_step(h0, d1, d2, interval_length):
     return min(100.0 * h0, min(h1, interval_length))
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _hermite(y0, y1, f0, f1, h, s):
     """Cubic Hermite interpolant at fraction s in [0, 1] of a step of size h."""
     h00 = 2 * s**3 - 3 * s**2 + 1
@@ -309,7 +326,7 @@ def _hermite(y0, y1, f0, f1, h, s):
 #  26 has_pulley (1.0 / 0.0 - the tuple is floats)   27 tension_floor (N)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _quadrature_rates(string_T, cw_T, tension_floor, grades_cw_link):
     """Derivatives of the three running integrals; physics._quadrature_rates.
 
@@ -329,7 +346,7 @@ def _quadrature_rates(string_T, cw_T, tension_floor, grades_cw_link):
     )
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _trebuchet_dynamics(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c):
     """Scalar port of physics.TrebuchetSimulator.trebuchet_dynamics.
 
@@ -416,7 +433,7 @@ def _trebuchet_dynamics(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, c):
     return theta_dot, theta_ddot, alpha_dot, alpha_ddot, psi_dot, psi_ddot, q1, q2, q3
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _first_arm_ground_angle(l_a, l_back, h_T, initial_arm_angle):
     """The largest arm angle below the cocked one at which the beam touches the ground.
 
@@ -451,7 +468,7 @@ def _first_arm_ground_angle(l_a, l_back, h_T, initial_arm_angle):
     return best
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _machine_only_accelerations(theta, theta_dot, psi, psi_dot, c):
     """(theta_ddot, psi_ddot) for the machine carrying no projectile.
 
@@ -472,7 +489,7 @@ def _machine_only_accelerations(theta, theta_dot, psi, psi_dot, c):
             (M_taut * Q_psi - M13 * Q_theta) / det)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _machine_only_forces(theta, theta_dot, psi, psi_dot, c):
     """(Q_theta, Q_psi, M13) for the machine carrying no projectile.
 
@@ -512,7 +529,7 @@ def _machine_only_forces(theta, theta_dot, psi, psi_dot, c):
     return Q_theta, Q_psi, -cw_swing_coupling * cos_pt
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _grounded_geometry(theta, px, l_a, h_T, ground_y):
     """Sling geometry for a projectile lying on the ground under an arm at `theta`.
 
@@ -534,7 +551,7 @@ def _grounded_geometry(theta, px, l_a, h_T, ground_y):
     return ex, ey, a, b, dist
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _grounded_taut_solve(y, c, projectile_mass, h_T):
     """(theta_ddot, psi_ddot, ax, tension, normal) with the sling taut over the ground.
 
@@ -583,7 +600,7 @@ def _grounded_taut_solve(y, c, projectile_mass, h_T):
     return theta_ddot, psi_ddot, ax, tension, tension * ey + projectile_mass * G
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _grounded_taut_derivs(y, c, projectile_mass, h_T, out):
     """Sling taut, projectile sliding on the ground; the ground pins py and pvy at zero."""
     theta_ddot, psi_ddot, ax, tension, _normal = _grounded_taut_solve(y, c, projectile_mass, h_T)
@@ -599,7 +616,7 @@ def _grounded_taut_derivs(y, c, projectile_mass, h_T, out):
     out[8], out[9], out[10] = _quadrature_rates(tension, cw_T, c[27], c[26] > 0.5)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _grounded_slack_derivs(y, c, projectile_mass, out):
     """Sling slack and the projectile lying on the ground: the two are uncoupled.
 
@@ -622,7 +639,7 @@ def _grounded_slack_derivs(y, c, projectile_mass, out):
     out[8], out[9], out[10] = _quadrature_rates(0.0, cw_T, c[27], c[26] > 0.5)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _slack_derivs(y, c, projectile_mass, out):
     """Launch dynamics while the sling is slack, written into `out`.
 
@@ -655,7 +672,7 @@ def _slack_derivs(y, c, projectile_mass, out):
 # to take the same arithmetic in the same order, so the two stay comparable line for line.
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_terms(theta, theta_dot, px, py, pvx, pvy, h_T):
     """(nx, ny, s, d, v_e, sigma, d_dot): the stone in the beam's rotating frame."""
     ex, ey = np.cos(theta), np.sin(theta)
@@ -669,7 +686,7 @@ def _beam_terms(theta, theta_dot, px, py, pvx, pvy, h_T):
     return nx, ny, s, d, v_e, sigma, v_n - theta_dot * s
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_gap(theta, px, py, h_T, l_a, arm_back_length, r_p):
     """Surface clearance between stone and beam; negative means overlapping.
 
@@ -689,7 +706,7 @@ def _beam_gap(theta, px, py, h_T, l_a, arm_back_length, r_p):
     return np.sqrt((s - s_end) * (s - s_end) + d * d) - r_p
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_span_margin(theta, px, py, h_T, l_a, arm_back_length):
     """Distance from the contact point to the nearer end of the beam; negative is past it."""
     ex, ey = np.cos(theta), np.sin(theta)
@@ -699,7 +716,7 @@ def _beam_span_margin(theta, px, py, h_T, l_a, arm_back_length):
     return a if a < b else b
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _projectile_external_force(pvx, pvy, proj_drag_k, projectile_mass):
     """Gravity plus quadratic drag on the free stone."""
     speed = np.sqrt(pvx * pvx + pvy * pvy)
@@ -707,7 +724,7 @@ def _projectile_external_force(pvx, pvy, proj_drag_k, projectile_mass):
     return drag * pvx, -projectile_mass * G + drag * pvy
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_slack_solve(y, c, projectile_mass, h_T):
     """(theta_ddot, psi_ddot, ax, ay, normal) for a stone riding the beam, sling slack."""
     M33 = c[4]
@@ -741,7 +758,7 @@ def _beam_slack_solve(y, c, projectile_mass, h_T):
     return theta_ddot, psi_ddot, ax, ay, u * sigma
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_taut_solve(y, c, projectile_mass, h_T):
     """(theta_ddot, psi_ddot, ax, ay, tension, normal) with sling and beam both loaded.
 
@@ -808,7 +825,7 @@ def _beam_taut_solve(y, c, projectile_mass, h_T):
     return theta_ddot, psi_ddot, ax, ay, T, u * sigma
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_taut_derivs(y, c, projectile_mass, h_T, out):
     theta_ddot, psi_ddot, ax, ay, T, _N = _beam_taut_solve(y, c, projectile_mass, h_T)
     cw_T = _cw_link_tension(y[0], y[1], theta_ddot, y[6], y[7], c, c[24], c[25], c[26] > 0.5)
@@ -826,7 +843,7 @@ def _beam_taut_derivs(y, c, projectile_mass, h_T, out):
     out[10] = q3
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _beam_slack_derivs(y, c, projectile_mass, h_T, out):
     theta_ddot, psi_ddot, ax, ay, _N = _beam_slack_solve(y, c, projectile_mass, h_T)
     cw_T = _cw_link_tension(y[0], y[1], theta_ddot, y[6], y[7], c, c[24], c[25], c[26] > 0.5)
@@ -844,7 +861,7 @@ def _beam_slack_derivs(y, c, projectile_mass, h_T, out):
     out[10] = q3
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _derivs8(y, c, projectile_mass, h_T, regime, out):
     """Whichever of the three eight-component regimes' dynamics `regime` names.
 
@@ -864,7 +881,7 @@ def _derivs8(y, c, projectile_mass, h_T, regime, out):
         _grounded_slack_derivs(y, c, projectile_mass, out)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, l_a, l_s, h_T, out):
     """Map a taut state into the slack layout: the projectile cut loose where it stands."""
     sin_t, cos_t = np.sin(theta), np.cos(theta)
@@ -881,7 +898,7 @@ def _slack_state_from_taut(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, l_a
         out[8 + i] = 0.0
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _apply_snap(y, c, projectile_mass, h_T, taut_out, slack_out):
     """Inelastic re-tension snap, at the instant the string comes taut again.
 
@@ -953,7 +970,7 @@ def _apply_snap(y, c, projectile_mass, h_T, taut_out, slack_out):
     return energy_lost
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _launch_kinetic_energy(theta, theta_dot, pvx, pvy, psi, psi_dot, c,
                            projectile_mass, counter_weight_mass, has_pulley):
     """Kinetic energy of machine plus projectile, for pricing an impulse.
@@ -976,7 +993,7 @@ def _launch_kinetic_energy(theta, theta_dot, pvx, pvy, psi, psi_dot, c,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _apply_ground_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, h_T,
                           radial_target, out):
     """Impulse a projectile onto the ground, through the sling and the ground at once.
@@ -1038,7 +1055,7 @@ def _apply_ground_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley
     return max(0.0, before - after)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _taut_state_from_grounded(y, c, h_T, out):
     """Lift a grounded projectile into the taut six-component layout.
 
@@ -1066,7 +1083,7 @@ def _taut_state_from_grounded(y, c, h_T, out):
         out[6 + i] = 0.0
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot, c,
                      counter_weight_mass, pulley_radius, has_pulley):
     """Scalar port of physics.TrebuchetSimulator._cw_link_tension.
@@ -1087,7 +1104,7 @@ def _cw_link_tension(theta, theta_dot, theta_ddot, psi, psi_dot, c,
     )
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _tensions(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, theta_ddot, c,
               projectile_mass, counter_weight_mass, pulley_radius, has_pulley):
     """Scalar port of physics.TrebuchetSimulator.constraint_tensions (theta_ddot passed in)."""
@@ -1112,7 +1129,7 @@ def _tensions(theta, theta_dot, alpha, alpha_dot, psi, psi_dot, theta_ddot, c,
     return string_tension, cw_tension
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot,
                             c, release_angle, t_max, rtol, atol,
                             projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
@@ -1461,7 +1478,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     return _SEG_TMAX, t
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _tip_separation(y, l_a, l_s, h_T):
     """Tip-to-projectile distance minus the string length, on the eight-component layout.
 
@@ -1477,7 +1494,7 @@ def _tip_separation(y, l_a, l_s, h_T):
     return np.sqrt(dx * dx + dy * dy) - l_s
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _eight_event(y, c, projectile_mass, h_T, regime, which):
     """One of a regime's two transition events, signed so every crossing is downward.
 
@@ -1525,7 +1542,7 @@ def _eight_event(y, c, projectile_mass, h_T, regime, which):
     return y[3] - c[22]
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _eight_tensions(y, c, projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
                     h_T, regime):
     """(sling tension, counterweight-rope tension) on the eight-component layout.
@@ -1547,7 +1564,7 @@ def _eight_tensions(y, c, projectile_mass, counter_weight_mass, pulley_radius, h
     return string_T, cw_T
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                              projectile_mass, initial_arm_angle, h_T, out):
     """Integrate one stretch of whichever eight-component regime `regime` names.
@@ -1821,7 +1838,7 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
 
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _ground_start_state(theta0, psi_rest, l_a, l_s, h_T, ground_y, out):
     """The cocked pose with the projectile lying on the ground, or False if it cannot be.
 
@@ -1863,7 +1880,7 @@ def _ground_start_state(theta0, psi_rest, l_a, l_s, h_T, ground_y, out):
     return True
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _apply_beam_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, h_T, out):
     """The stone striking the beam: an inelastic impulse along the contact normal.
 
@@ -1916,7 +1933,7 @@ def _apply_beam_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, 
     return max(0.0, before - after)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _settle_beam(y, c, projectile_mass, h_T, taut_out):
     """Which regime a stone that has just arrived on the beam belongs in.
 
@@ -1948,7 +1965,7 @@ def _settle_beam(y, c, projectile_mass, h_T, taut_out):
     return _TAUT
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _settle_grounded(y, c, projectile_mass, h_T, taut_out):
     """Which grounded regime a just-landed or just-snapped projectile belongs in.
 
@@ -1969,7 +1986,7 @@ def _settle_grounded(y, c, projectile_mass, h_T, taut_out):
     return _TAUT
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                       projectile_mass, counter_weight_mass, pulley_radius, has_pulley,
                       tension_floor, h_T):
@@ -2301,14 +2318,14 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             beam_energy, arm_ground, start_py)
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _ballistic_dynamics(vx, vy, drag_scale, mass):
     speed = np.sqrt(vx * vx + vy * vy)
     drag_accel = -drag_scale * speed / mass if speed > 1e-12 else 0.0
     return vx, vy, drag_accel * vx, -G + drag_accel * vy
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _integrate_ballistic(x0, y0, vx0, vy0, mass, drag_coefficient, area, t_max, rtol, atol,
                          ground_y):
     """Integrate ballistic flight (with quadratic drag) until ground impact; returns impact_x.
@@ -2407,7 +2424,7 @@ def _integrate_ballistic(x0, y0, vx0, vy0, mass, drag_coefficient, area, t_max, 
     return x
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, fastmath=False, inline="always")
 def _machine_constants(counter_weight_mass, pulley_radius, length_counterweight,
                         counter_weight_rope_length, arm_length, string_length,
                         pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -2503,7 +2520,7 @@ def _machine_constants(counter_weight_mass, pulley_radius, length_counterweight,
     return c, (arm_mass, pulley_mass, projectile_area, arm_cm_offset, l_w)
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
                    counter_weight_rope_length, arm_length, string_length, release_angle,
                    pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -2634,23 +2651,24 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
             snap_energy, ground_energy, beam_energy)
 
 
-# Deliberately not cache=True, and neither is evaluate_population below. Both call
-# simulate_fast, and a cached _score reloaded from disk does not link against the
-# simulate_fast in this process: it answers from a stale copy, and the very first thing it
-# does with the answer is branch on it. Reloaded from cache it scored a design that throws
-# nothing - the reference and a freshly compiled simulate_fast both put it at 0.0 m - as
-# -144.9 instead of INVALID_COST, and differential evolution duly returned it as the winner
-# of its seed. The first run after clearing the cache was right and every run afterwards
-# was wrong, which is the tell: it is the reload, not the source. Compiling simulate_fast
-# first in the same process also fixed it, which is the same tell from the other side.
+# Cached like everything else here, which it was not for a long time. A cached _score
+# reloaded from disk used to disagree with a freshly compiled one: it scored a design that
+# throws nothing - the reference and a fresh simulate_fast both put it at 0.0 m - as -144.9
+# instead of INVALID_COST, and differential evolution returned it as the winner of its
+# seed. The first run after clearing the cache was right and every run afterwards was
+# wrong, which read as a fault in reloading a *caller* of a cached function, so the
+# objective was left compiling in-process every run - a few seconds each time.
 #
-# So the objective is the one part of the chain that is compiled in-process every time.
-# That is a few seconds once per run against an optimizer that then evaluates hundreds of
-# thousands of designs, and it is the difference between a search that scores what it
-# thinks it is scoring and one that does not. Everything below simulate_fast keeps its
-# cache - the fault is in reloading a *caller* of a cached function, not in the cache
-# itself.
-@njit(fastmath=True)
+# That was the symptom and not the fault. The cause was `fastmath`: a cached function comes
+# back as opaque object code while a freshly compiled one is still IR its callers can
+# inline, and `reassoc` and `contract` then let LLVM reshape the arithmetic differently on
+# the two paths (see the module docstring). With fastmath off the two paths agree exactly -
+# over 8000 designs across both machines, plus both machines' optimizer answers, a cached
+# objective is bit-identical to an uncached one on a cold run and on every warm one - so
+# there is nothing left for the cache to get wrong, and the per-run compile goes with it:
+# 5.35s of startup becomes 0.75s. The first run after any edit to this file still pays the
+# whole 111s compile, as it always has; every run after it pays 0.14s.
+@njit(cache=True, fastmath=False)
 def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_weight_rope_length,
            arm_length, string_length, release_angle,
            pivot_height, pulley_density, arm_density, projectile_mass, projectile_radius,
@@ -2713,7 +2731,7 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     )
 
 
-@njit(fastmath=True, parallel=True)  # not cached - see _score above
+@njit(cache=True, fastmath=False, parallel=True)  # cached - see _score above
 def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight,
                          arm_length, string_length, release_angle,
                          counter_weight_rope_length,

@@ -46,29 +46,39 @@ MAX_PHYSICAL_EFFICIENCY = 1.5
 PIVOT_FRICTION_SMOOTHING = 1e-3  # rad/s
 
 # "Resolve the cocked arm angle from the geometry" as a number, for the Numba engine, which
-# has no None to pass down. Deliberately a huge finite value rather than NaN: fastsim's
-# kernels are compiled with fastmath=True, which lets LLVM assume no NaNs and fold an
-# isnan() test to False, so a NaN sentinel silently arrives as a NaN arm angle.
+# has no None to pass down. A huge finite value rather than NaN. That was once forced -
+# fastsim's kernels were compiled with fastmath=True, which lets LLVM assume no NaNs and
+# fold an isnan() test to False, so a NaN sentinel arrived silently as a NaN arm angle -
+# and fastmath is off now, so a NaN would work. It stays finite anyway: a sentinel that
+# cannot be broken by a compiler flag is worth more than one that has to be checked against
+# the flags every time they move.
 AUTO_INITIAL_ARM_ANGLE = 1e30
 
 # Canonical defaults for the five optimizable parameters, shared by the CLI,
 # the web UI, and the tests so they can't drift apart. Optimizer output for the
 # 30 m target on the shipped weights and the shipped seed - `trebuchet optimize
-# --target-distance 30` reproduces every digit shown, though only to the six decimals
-# shown: the objective is compiled fastmath and parallel, and a freshly compiled kernel
-# and one reloaded from Numba's cache differ in the last bit or two, which differential
-# evolution carries into about the seventh significant figure of its answer (the pulley
-# machine happens to come out bit-identical either way; the traditional one moves by
-# ~1e-7 relative, on the same design). So the sling stays taut for the whole launch and
+# --target-distance 30` reproduces every digit shown, and now does so exactly: with
+# fastmath off the fast engine answers the same question the same way whether it has just
+# been compiled or reloaded from Numba's cache (see the fastsim module docstring), where
+# before it carried a last-bit difference into about the seventh significant figure of the
+# search's answer. So the sling stays taut for the whole launch and
 # the projectile never touches the ground. Both engines are asked, not just the one the
 # search runs on: a design the optimizer likes and physics.py then reports differently is
 # no use as a default whatever it scores (see DEFAULT_TRADITIONAL_PARAMS for the draw that
 # made this a rule).
 #
-# Re-swept whenever the physics under it moves, which it has five times: when
+# Re-swept whenever the physics under it moves, which it has six times: when
 # `pivot_height` rose to 2.5 m, when the arm's drag torque was corrected, for two modelling
-# changes and two engine fixes at once, and now for the beam becoming a surface the stone
-# can hit.
+# changes and two engine fixes at once, for the beam becoming a surface the stone can hit,
+# and now for fastmath coming off the fast engine - which does not change the model at all,
+# only which of two very slightly different answers it gives, but the defaults are defined
+# as what the documented command returns and that command now returns this.
+#
+# The swap costs 1.6 points of efficiency against the set derived under fastmath (73.2%
+# against 74.8%) on a machine that is otherwise the same shape - 1.08 m of arm against
+# 1.05 m - and buys back the counterweight rope: this one holds it in tension throughout,
+# bottoming out at +0.57 N, where that set pushed it to -0.77 N. A rope cannot push, so
+# that is the better machine as well as the reproducible one.
 #
 # That last one is why this set looks nothing like the one before it, and why its
 # efficiency reads 74.8% against that set's 90.1%. The 90.1% machine was a 0.37 m arm on a
@@ -93,13 +103,14 @@ AUTO_INITIAL_ARM_ANGLE = 1e30
 # is charged per radian the arm turns, which is the thing a short-armed machine has most
 # of. It is one of the reasons the short arm stopped winning once the beam was solid.
 #
-# Its counterweight rope still pushes, but barely: -0.77 N for an impulse of
-# 0.0018 N*s, an order of magnitude under the previous set's 0.018 N*s and two under the
-# 0.05 N*s the CLI and dashboard warn at. That is real rather than noise - this machine's
-# weight hangs on a rope over the axle and a rope cannot push - and it is what
-# `slack_penalty_weight` is there to keep small. (The traditional machine has no
-# equivalent: its weight is pinned to the arm through a rigid strut, so compression there
-# is a member load rather than a fault. See physics._cw_link_tension.)
+# Its counterweight rope stays in tension the whole way now, bottoming out at +0.57 N for
+# an impulse of exactly zero, where the two sets before it pushed to -0.77 N and -93.0 N.
+# Nothing was tightened to get that - `slack_penalty_weight` is unchanged - it is simply
+# the design this search lands on, and it is the one thing that says the answer describes a
+# machine: this weight hangs on a rope over the axle, and a rope cannot push. (The
+# traditional machine has no equivalent: its weight is pinned to the arm through a rigid
+# strut, so compression there is a member load rather than a fault. See
+# physics._cw_link_tension.)
 #
 # These five numbers are defined as what `trebuchet optimize --target-distance 30` returns
 # on the *shipped* weights, so tuning a weight to tidy them up is a calibration decision
@@ -110,11 +121,11 @@ AUTO_INITIAL_ARM_ANGLE = 1e30
 # still matters, though the landscape it is picking a basin out of has changed shape now
 # that the beam is solid. See OptimizationConfig.seed.
 DEFAULT_OPTIMIZABLE_PARAMS = {
-    "counter_weight_mass": 59.982328,  # kg
-    "pulley_radius": 0.049736,         # m
-    "arm_length": 1.047940,            # m
-    "string_length": 0.822843,         # m
-    "release_angle": -1.173475,        # radians (pin angle, sling measured from the arm)
+    "counter_weight_mass": 59.990289,  # kg
+    "pulley_radius": 0.052200,         # m
+    "arm_length": 1.080808,            # m
+    "string_length": 0.842225,         # m
+    "release_angle": -1.191392,        # radians (pin angle, sling measured from the arm)
 }
 
 
@@ -232,11 +243,11 @@ def resolve_initial_arm_angle(machine, arm_length: float, pivot_height: float) -
 # 3.5e15 efficiency - a collapsed denominator the objective was free to maximize - which the
 # reference engine did not release at all.
 DEFAULT_TRADITIONAL_PARAMS = {
-    "counter_weight_mass": 18.971939,   # kg
-    "length_counterweight": 0.191797,   # m
-    "arm_length": 0.729306,             # m
-    "string_length": 0.679611,          # m
-    "release_angle": 0.580128,          # radians (pin angle, sling measured from the arm)
+    "counter_weight_mass": 18.972330,   # kg
+    "length_counterweight": 0.191805,   # m
+    "arm_length": 0.729318,             # m
+    "string_length": 0.679623,          # m
+    "release_angle": 0.580148,          # radians (pin angle, sling measured from the arm)
 }
 
 

@@ -212,12 +212,16 @@ def _regimes_undecided(params, ref) -> bool:
     # 0.35%. Asking every eventful launch for a 1e-12 run would roughly double this file's
     # runtime; asking only the ones that touched the beam costs a fraction of that.
     # A decade-spaced ladder can step straight over a bistable draw, landing on the same
-    # branch at both ends and reading it as settled. Two traditional draws in the
-    # long-sling region do exactly that: one reads 2.0615 m at 1e-6 and 2.0639 m at 1e-8
-    # and looks converged, while at 1e-7 it reads 1.6290 m - the branch the fast engine
-    # takes, to 0.9%. So a launch that snapped at all is asked at 1e-7 too, which is where
-    # the flip shows. Slings that never let go cannot be bistable this way and are not
-    # asked.
+    # branch at both ends and reading it as settled. One traditional draw does exactly
+    # that: at rtol 1e-6, 1e-8 and 1e-10 it reads 21 segments, no beam contact and an
+    # efficiency of 0.0137 / 0.0132 / 0.0132, and looks converged - while at 1e-7 it reads
+    # 23 segments, *eight* beam contacts and 0.0254, nearly double. A draw whose stone
+    # either hits the arm eight times or not at all, depending on the tolerance, has no
+    # settled answer for two engines to meet on, and the efficiency band is what notices:
+    # this engine reads 0.0124, which is 1.36e-3 from the 1e-6 branch against a 1e-3 bound.
+    # So a launch that snapped at all is asked at 1e-7 too, where the flip shows. Slings
+    # that never let go cannot be bistable this way and are not asked. It costs one draw in
+    # 300 and none of the 62 pulley draws.
     probes = (1e-8, 1e-10, 1e-12) if ref.metrics.get("beam_contacts") else (1e-8, 1e-10)
     if ref.metrics.get("sling_snap_count"):
         probes = (1e-7,) + probes
@@ -580,24 +584,7 @@ def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
             # of the two at 0.4187305, matching the reference's own 1e-8 reading to 2e-4.
             # Neither reading is wrong; the quantity is simply not resolved to better than
             # that on a launch carrying a strike, and 15% is what covers it.
-            #
-            # A launch that never released gets a wider band again, for a different
-            # reason: not that the quantity is unresolved, but that it cannot reach any
-            # decision. The deficit is read by exactly one thing, the objective's snap
-            # penalty, and a design that does not release is refused by both engines
-            # before that penalty is applied - INVALID_COST either way, on a throw of
-            # 0.000 m either way. One draw in 300 needs it, and it is the long-sling
-            # region that the traditional machine's uncoupled sling opened up: a 1.652
-            # sling-to-arm ratio whose sling lets go once, where the reference is settled
-            # at 0.5410 (0.541001 / 0.541006 / 0.540996 / 0.540995 at rtol 1e-6 / 1e-7 /
-            # 1e-9 / 1e-10) and this engine reads 0.5142. That is a real 4.9% gap and it is
-            # banded rather than hidden: every draw that actually threw still meets the 1%.
-            if ref.metrics["beam_contacts"]:
-                deficit_band = 0.15
-            elif not ref_released:
-                deficit_band = 6e-2
-            else:
-                deficit_band = 1e-2
+            deficit_band = 0.15 if ref.metrics["beam_contacts"] else 1e-2
             assert sling_deficit == pytest.approx(
                 ref.metrics["sling_tension_deficit"], rel=deficit_band, abs=1e-3
             ), design
