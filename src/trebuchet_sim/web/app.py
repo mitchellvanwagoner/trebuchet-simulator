@@ -147,6 +147,19 @@ try:
 except ValueError:
     _OPT_WORKERS = -1
 
+# Threads the fast engine scores a generation across (OptimizationConfig.threads), which
+# is the setting that actually bites, since that engine is what the dashboard runs.
+# TREBUCHET_NUM_THREADS is read here for the per-run count and again in
+# fastsim._seed_thread_ceiling, before numba is imported, for the ceiling - one variable
+# so a server sets its core budget once. None leaves numba at one thread per core.
+try:
+    _OPT_THREADS = int(os.environ["TREBUCHET_NUM_THREADS"])
+except (KeyError, ValueError):
+    _OPT_THREADS = None
+else:
+    if _OPT_THREADS < 1:
+        _OPT_THREADS = None
+
 
 def _load_user_defaults() -> dict:
     """Saved input defaults, read once per session; {} when absent/corrupt."""
@@ -1182,6 +1195,7 @@ if optimize_clicked:
             locked_params=locked,
             fixed_params=fixed_params_all,
             workers=_OPT_WORKERS,
+            threads=_OPT_THREADS,
         )
         st.session_state.opt_log_rows = []
         st.session_state.opt_status = None

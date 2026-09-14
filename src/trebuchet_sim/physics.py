@@ -2217,18 +2217,31 @@ class TrebuchetSimulator:
         grid = sol.t
         if len(grid) < 2:
             return None
-        for a, b in zip(grid[:-1], grid[1:]):
+        # The step's own interpolant rather than the whole solution's. `sol.sol(t)` has
+        # to binary-search the segment list and tile the time out before it can evaluate,
+        # and this scan asks for BEAM_SCAN_SUBSTEPS probes on every accepted step of every
+        # segment - about 460 evaluations a launch, which measured 46% of the traditional
+        # machine's reference runtime and 6% of the pulley machine's. Every probe below
+        # lies inside the step it came from, which is the same segment that search would
+        # have landed on, so indexing straight into `interpolants` is the identical number
+        # for a fraction of the work.
+        interpolants = sol.sol.interpolants
+        for i, (a, b) in enumerate(zip(grid[:-1], grid[1:])):
             if a >= t_end:
                 break
+            step = interpolants[i]
             lo = a
             for j in range(1, BEAM_SCAN_SUBSTEPS + 1):
-                hi = a + (b - a) * j / BEAM_SCAN_SUBSTEPS
-                if self.beam_clearance(sol.sol(hi), regime) > 0.0:
+                # The last probe is the step's own end point, not a recomputed
+                # a + (b - a), which rounding can leave an ulp the far side of it - and
+                # outside the step is the one place this interpolant is extrapolating.
+                hi = b if j == BEAM_SCAN_SUBSTEPS else a + (b - a) * j / BEAM_SCAN_SUBSTEPS
+                if self.beam_clearance(step(hi), regime) > 0.0:
                     lo = hi
                     continue
                 for _ in range(60):
                     mid = 0.5 * (lo + hi)
-                    if self.beam_clearance(sol.sol(mid), regime) > 0.0:
+                    if self.beam_clearance(step(mid), regime) > 0.0:
                         lo = mid
                     else:
                         hi = mid
@@ -2242,7 +2255,7 @@ class TrebuchetSimulator:
                     # the segment, which would hide every later crossing behind it.
                     lo = hi
                     continue
-                return t_hit, sol.sol(t_hit)
+                return t_hit, step(t_hit)
         return None
 
     def _settle_beam(self, state) -> Tuple[List[float], str]:
@@ -2497,12 +2510,15 @@ class TrebuchetSimulator:
         side of the tip instead. There is no sign test anywhere in here: which side of
         the pivot the tip leans, and whether the tip stands above or below the stone's
         own centre, both fall out of the same expression. That last one used to be a
-        bail-out (`drop < 0`), and it silently unloaded the machine - a traditional
-        trebuchet cocks its tip 50 mm up (config.TRADITIONAL_START_CLEARANCE), so a
-        stone of 50 mm radius or more stands taller than the tip it hangs from, which is
-        an ordinary thing for a stone to do and was read as "cannot be loaded". The
-        machine then fell back to the hanging pose and started 385 mm underground,
-        recording no ground contact, because nothing had gone down through the surface.
+        bail-out (`drop < 0`), and it silently unloaded the machine - the traditional
+        machine was cocked with its tip 50 mm off the ground back when that angle was
+        solved for rather than chosen, so a stone of 50 mm radius or more stood taller
+        than the tip it hung from, which is an ordinary thing for a stone to do and was
+        read as "cannot be loaded". The machine then fell back to the hanging pose and
+        started 385 mm underground, recording no ground contact, because nothing had gone
+        down through the surface. The cocked tip is nowhere near the ground now, but a
+        signed drop is still the right shape: it is what lets the same expression solve a
+        tip below the stone's centre and a tip above it.
 
         None only when the circle and the line do not meet at all: the sling cannot
         reach the ground from the cocked tip, a pulley machine's tip standing a metre up

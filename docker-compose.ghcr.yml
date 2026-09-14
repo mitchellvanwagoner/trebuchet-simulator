@@ -8,6 +8,14 @@ services:
       # Optimizer worker cap; only used when the Numba fast engine is
       # unavailable (the image ships with it, so normally ignored).
       - TREBUCHET_OPT_WORKERS=${TREBUCHET_OPT_WORKERS:--1}
+      # How many threads the fast engine scores a generation across. This is the
+      # one that bites, since the image ships the fast engine: unset means one
+      # thread per core the container can see. It is read twice - once before
+      # numba is imported, to raise the ceiling above the core count, and once
+      # per run to set the count itself - so it is the only setting needed either
+      # way. Cap it below the core count to leave a busy server headroom, or
+      # raise it above to oversubscribe.
+      - TREBUCHET_NUM_THREADS=${TREBUCHET_NUM_THREADS:-}
     volumes:
       # Saved dashboard defaults (user_defaults.json). Point DATA_DIR at a host
       # folder to persist them, e.g. DATA_DIR=/mnt/user/appdata/treb-sim on Unraid.

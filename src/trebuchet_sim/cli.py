@@ -24,7 +24,12 @@ from trebuchet_sim.config import (
     MachineType,
     TrebuchetParams,
 )
-from trebuchet_sim.optimization import OptimizationConfig, optimize_trebuchet, param_names
+from trebuchet_sim.optimization import (
+    OptimizationConfig,
+    optimize_trebuchet,
+    param_names,
+    thread_count,
+)
 from trebuchet_sim.physics import SimulationResult, simulate_trebuchet
 from trebuchet_sim.visualization import (
     create_animation,
@@ -337,6 +342,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             param_bounds=ranges,
             fixed_params=fixed,
             display_progress=True,
+            threads=args.threads,
         )
     except ValueError as exc:  # a bad --range reads better without a traceback
         raise SystemExit(str(exc))
@@ -352,6 +358,18 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             print(f"  {name}: {low:g} to {high:g}{marker}")
     for name, value in sorted(locked.items()):
         print(f"  {name}: locked at {value:g}")
+
+    effective_threads = thread_count(config.threads)
+    if args.threads is not None and effective_threads != args.threads:
+        # Said out loud rather than silently applied: the ceiling is fixed at import, so
+        # the only way to actually get the requested count is to start over with the
+        # environment variable set.
+        print(f"\nNote: --threads {args.threads} capped at {effective_threads} - this process was "
+              f"started with {effective_threads} available. Set TREBUCHET_NUM_THREADS="
+              f"{args.threads} before launching to raise it.")
+    if effective_threads:
+        print(f"Scoring each generation across {effective_threads} thread"
+              f"{'s' if effective_threads != 1 else ''}.")
 
     optimal_params, sim_result, de_result = optimize_trebuchet(config)
 
@@ -464,6 +482,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Narrow (or widen) the search range for a parameter, instead of the default "
              "bounds. Repeatable, same parameter names as --lock. Angles in radians, e.g. "
              "--range arm_length=0.3:0.8 --range release_angle=0.2:1.2",
+    )
+    opt_parser.add_argument(
+        "--threads",
+        type=int,
+        metavar="N",
+        help="How many threads to score each generation across (default: one per core). "
+             "Capped at the count the process started with, so going above the core count "
+             "means setting TREBUCHET_NUM_THREADS before launching",
     )
     _add_output_args(opt_parser)
     opt_parser.set_defaults(func=cmd_optimize)

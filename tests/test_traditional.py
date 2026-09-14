@@ -39,35 +39,60 @@ def test_machine_type_round_trips_through_a_plain_string():
 def test_initial_arm_angle_resolves_per_machine():
     """None is not a usable start angle - __post_init__ resolves the machine's own.
 
-    The pulley machine's is a constant. The traditional machine's is geometry: whatever
-    puts the long arm's tip TRADITIONAL_START_CLEARANCE off the ground, on the branch that
-    has it down and behind the pivot. So it moves with the arm length and the pivot height
-    rather than being a number to keep in step with them by hand.
+    Both machines' are constants: where the beam is cocked is a property of how the
+    machine is loaded, not something the rest of the geometry solves for. The traditional
+    machine's is down and behind the pivot, with the counterweight raised in front.
     """
     assert TrebuchetParams(**DEFAULT_OPTIMIZABLE_PARAMS).initial_arm_angle == (
         DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY]
     )
 
     params = traditional_params()
-    tip_height = (
-        params.arm_length * np.sin(params.initial_arm_angle) + params.pivot_height
-    )
-    assert tip_height == pytest.approx(config.TRADITIONAL_START_CLEARANCE)
+    assert params.initial_arm_angle == DEFAULT_INITIAL_ARM_ANGLE[MachineType.TRADITIONAL]
     assert -np.pi < params.initial_arm_angle < -np.pi / 2  # down, and behind the pivot
 
-    # Lengthen the arm and the same rule lays it down further round.
-    longer = traditional_params(arm_length=params.arm_length * 1.5)
-    assert longer.initial_arm_angle < params.initial_arm_angle
-    assert longer.arm_length * np.sin(longer.initial_arm_angle) + longer.pivot_height == (
-        pytest.approx(config.TRADITIONAL_START_CLEARANCE)
-    )
+    # The pose is the machine's, not the beam's: neither of the two numbers that used to
+    # solve for it moves it any more.
+    for changed in (
+        traditional_params(arm_length=params.arm_length * 1.5),
+        traditional_params(pivot_height=params.pivot_height * 2.5),
+    ):
+        assert changed.initial_arm_angle == params.initial_arm_angle
 
-    # An arm too short to reach the ground is cocked as low as it goes, which is straight
-    # down - and there every gravity torque carries a cos(theta) and vanishes, so the
-    # machine sits on its own balance point and does not launch. That is the geometry
-    # reporting a pivot too tall for the arm, not a defect.
-    unreachable = traditional_params(arm_length=0.3, string_length=0.2)
-    assert unreachable.initial_arm_angle == pytest.approx(-np.pi / 2)
+    # And a caller who does want a particular pose still gets exactly it.
+    pinned = traditional_params(initial_arm_angle=-2.0)
+    assert pinned.initial_arm_angle == -2.0
+
+
+def test_a_pivot_taller_than_the_arm_still_launches():
+    """The cocked angle used to be solved by walking the arm's own tip down to the ground,
+    which has the wrong body touching it - a trebuchet rests its *projectile* there and
+    holds the beam clear. Worse, the arcsine had no solution once the pivot outstood the
+    arm, and the clamp then returned -pi/2: straight down, where every gravity torque
+    carries a cos(theta) and is identically zero. The machine sat on its own balance point
+    and threw nothing, so with the arm bound at 2.0 m every traditional design on a pivot
+    of 2.2 m or more scored INVALID_COST and an optimizer run there had a flat landscape to
+    converge on and no design to report.
+
+    From a pose that is simply chosen, the same machine launches. The stone hangs from the
+    tip rather than lying on the ground, which is the other loading geometry (see
+    physics.ground_start_state) rather than a failure.
+    """
+    from trebuchet_sim.physics import TrebuchetSimulator
+
+    tall = traditional_params(pivot_height=2.6)
+    assert tall.initial_arm_angle == DEFAULT_INITIAL_ARM_ANGLE[MachineType.TRADITIONAL]
+    assert tall.initial_arm_angle != pytest.approx(-np.pi / 2)
+
+    # Too high for the sling to reach the ground, so the stone hangs - the branch
+    # ground_start_state returns None for.
+    assert TrebuchetSimulator(tall).ground_start_state() is None
+
+    result = simulate_trebuchet(tall)
+    assert "error" not in result.metrics
+    assert result.metrics["release_occurred"]
+    assert result.distance > 1.0
+    assert result.efficiency > 0.0
 
 
 def test_traditional_machine_releases_and_throws():
@@ -185,12 +210,22 @@ def test_the_pinned_counterweight_link_reports_its_load_but_is_never_charged():
     the weight hangs a further `counter_weight_rope_length` below it. That is right for a
     rope hanger and wrong here: this linkage is pinned right through.
 
-    The shipped defaults happen to keep the link in tension throughout, so this asserts
-    both that the load is reported and that the fault metric is dead.
+    The shipped defaults drive the link to -58.5 N, so they demonstrate both halves
+    themselves: the load is reported, and the fault metric stays dead through a launch that
+    really does push. (They used to stay in tension throughout and the compression had to
+    be shown on a geometry chosen for it - see the whipping-counterweight test below, which
+    still carries a much harder case. The sign flipped when the cocked pose stopped being
+    solved from the beam reaching the ground; nothing about the linkage changed.) The load
+    The load is a real member load rather than a rounding, but it is not a settled number:
+    it reads -59.90 / -58.49 / -59.49 N at rtol 1e-6 / 1e-8 / 1e-10, wandering about 2.4%
+    without converging, because the peak is a brief minimum on a swinging link. The band
+    below covers that spread rather than pinning a digit the model does not have.
     """
     result = simulate_trebuchet(traditional_params())
 
-    assert result.metrics["min_cw_rope_tension"] > 0.0
+    # Compression, and a real member load - but on a strut, so it is reported and not
+    # charged. A rope reading this would be no machine at all.
+    assert result.metrics["min_cw_rope_tension"] == pytest.approx(-59.2, abs=1.5)
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
     # A rope carries nothing or it pulls - never less than zero, whether or not this
     # particular launch happens to have a slack stretch in it. The exact `== 0.0` that
@@ -282,6 +317,11 @@ def _objective_chosen_for(monkeypatch, machine) -> str:
     class _StubResult:
         # One value per free parameter, in the order build_params will read them.
         x = [0.0] * len(optimization.param_names(machine))
+        # A real OptimizeResult always carries the winning score, and optimize_trebuchet
+        # reads it to tell a search that found nothing from one that found a machine
+        # (see _no_valid_design_message). Any score under INVALID_COST stands for
+        # "the search found something", which is the case this stub is standing in for.
+        fun = 0.0
 
     def stub(func, bounds, **kwargs):
         captured["objective"] = func.func.__name__  # func is a functools.partial
@@ -441,11 +481,12 @@ def test_a_whipping_counterweight_pushes_its_pinned_link_and_is_not_charged_for_
     The geometry here is the second one to sit in this test. The first drove its link to
     -900 N under the loading pose that laid the stone out on the far side of the cocked
     tip; with the stone downrange instead (physics.ground_start_state) that machine reads
-    +150 N and has nothing left to demonstrate. This one is a sweep's most compressive
-    link among the designs that still throw properly - -438 N while throwing 74.2 m at
-    76% - which is the same pairing the old one was chosen for. The load is settled
-    rather than marginal: -438.3 / -435.9 / -439.1 N at rtol 1e-6 / 1e-8 / 1e-10, on a
-    launch that touches neither the ground nor the beam.
+    +150 N and has nothing left to demonstrate. This one was a sweep's most compressive
+    link among the designs that still throw properly, and it stays that pairing now that
+    the cocked angle is a chosen pose rather than one solved from the beam reaching the
+    ground: -378 N while throwing 68.0 m at 75.3%, where it read -438 N and 74.2 m at 76%
+    before. The load is settled rather than marginal: -378.2 / -378.2 / -380.5 N at rtol
+    1e-6 / 1e-8 / 1e-10, on a launch that touches neither the ground nor the beam.
     """
     params = traditional_params(
         counter_weight_mass=34.212811, length_counterweight=0.377274, arm_length=0.954921,
@@ -457,7 +498,7 @@ def test_a_whipping_counterweight_pushes_its_pinned_link_and_is_not_charged_for_
     assert result.metrics["release_occurred"] is True
     assert result.distance > 20.0  # and it is not a wreck: it throws further than the default
     # The load is real and is reported.
-    assert result.metrics["min_cw_rope_tension"] < -400.0
+    assert result.metrics["min_cw_rope_tension"] < -300.0
     # And it is not a fault: no rope, nothing to go slack, nothing to charge.
     assert result.metrics["cw_rope_compression_impulse"] == 0.0
 

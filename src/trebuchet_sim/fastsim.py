@@ -42,30 +42,79 @@ bisection - cheaper than scipy's dense-output event solver and accurate enough f
 optimizer's tolerance (see the `rtol=1e-6` note in `optimization._objective`).
 """
 
+import os
+
+# Numba fixes how many threads a process may ever use when it is first imported:
+# `set_num_threads` moves the count at runtime but will not go above that ceiling, and the
+# ceiling is read from NUMBA_NUM_THREADS at import time, which is why this runs before the
+# import below rather than beside the rest of the configuration. So TREBUCHET_NUM_THREADS
+# is the one place a machine can be given *more* threads than it has cores; asking for
+# fewer needs nothing here, since `optimization.thread_count` can lower the count per run
+# on its own. Left unset, numba's own default is one thread per core.
+_THREAD_ENV = "TREBUCHET_NUM_THREADS"
+
+
+def _seed_thread_ceiling() -> None:
+    """Raise numba's thread ceiling to TREBUCHET_NUM_THREADS, if that asks for more.
+
+    Only ever raises it. Lowering the ceiling here would also cap every later
+    `set_num_threads` call in the process, which would turn a per-run preference into a
+    limit nothing could lift.
+    """
+    requested = os.environ.get(_THREAD_ENV, "").strip()
+    if not requested:
+        return
+    try:
+        wanted = int(requested)
+    except ValueError:
+        return  # not a number; numba's default stands rather than the process failing
+    if wanted < 1:
+        return
+    try:
+        current = int(os.environ.get("NUMBA_NUM_THREADS", "") or (os.cpu_count() or 1))
+    except ValueError:
+        current = os.cpu_count() or 1
+    if wanted > current:
+        os.environ["NUMBA_NUM_THREADS"] = str(wanted)
+
+
+_seed_thread_ceiling()
+
 import numpy as np
-from numba import njit, prange
+from numba import config as numba_config, get_num_threads, njit, prange, set_num_threads
 
 from trebuchet_sim.config import (
     ARM_CROSS_SECTION_WIDTH,
     AUTO_INITIAL_ARM_ANGLE,
+    MAX_PHYSICAL_EFFICIENCY,
     DEFAULT_INITIAL_ARM_ANGLE,
     G,
     PIVOT_FRICTION_SMOOTHING,
     RHO_AIR,
     SLING_TENSION_FLOOR,
-    TRADITIONAL_START_CLEARANCE,
     MachineType,
 )
 
 # Local names so the JIT closes over plain floats rather than reaching into a module.
 _FRICTION_EPS = PIVOT_FRICTION_SMOOTHING
-_START_CLEARANCE = TRADITIONAL_START_CLEARANCE
 _PULLEY_COCKED_ANGLE = float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY])
+_TRADITIONAL_COCKED_ANGLE = float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.TRADITIONAL])
 _AUTO_ANGLE = AUTO_INITIAL_ARM_ANGLE
+_MAX_EFFICIENCY = MAX_PHYSICAL_EFFICIENCY
 
 PULLEY_THICKNESS = 0.0254  # m; matches TrebuchetParams.PULLEY_THICKNESS
 
 INVALID_COST = 1e6
+
+
+def thread_ceiling() -> int:
+    """The most threads `evaluate_population` can be given in this process.
+
+    Fixed when numba was imported (see `_seed_thread_ceiling`), so a caller that wants
+    more has to set TREBUCHET_NUM_THREADS before the interpreter reaches this module -
+    there is no way to lift it afterwards.
+    """
+    return int(numba_config.NUMBA_NUM_THREADS)
 
 # Dormand-Prince RK45 tableau (identical to scipy.integrate._ivp.rk.RK45)
 A21 = 1 / 5
@@ -2495,19 +2544,19 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
     # Cocked pose, mirroring physics.TrebuchetSimulator.initial_state.
     # config.AUTO_INITIAL_ARM_ANGLE is the "not pinned by the caller" sentinel (numba has
     # no None, and fastmath rules out NaN), and the angle is then resolved the way
-    # config.resolve_initial_arm_angle resolves it: a constant on the pulley machine, and
-    # on the traditional one whatever walks the long arm down to the ground.
+    # config.resolve_initial_arm_angle resolves it: a constant per machine. The
+    # traditional machine's used to be solved here too, walking its arm down until the
+    # tip cleared the ground - which put the wrong body on the ground and left every
+    # machine whose pivot outstood its arm clamped to the balance point, throwing nothing.
+    # Where the *stone* starts is still geometry, and still solved, just not here: see
+    # _ground_start_state, which rests it on the ground when the sling reaches and hangs
+    # it from the tip when it does not.
     theta0 = initial_arm_angle
     if initial_arm_angle >= _AUTO_ANGLE:
         if has_pulley:
             theta0 = _PULLEY_COCKED_ANGLE
         else:
-            ratio = (_START_CLEARANCE - pivot_height) / arm_length
-            if ratio > 1.0:
-                ratio = 1.0
-            elif ratio < -1.0:
-                ratio = -1.0
-            theta0 = -np.pi - np.arcsin(ratio)
+            theta0 = _TRADITIONAL_COCKED_ANGLE
     psi_rest = -np.pi / 2.0
     if has_pulley:
         # Sling tucked alongside the arm, angled just far enough off it to clear.
@@ -2611,7 +2660,11 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
            target_distance, efficiency_weight, distance_weight, mass_weight,
            slack_penalty_weight, snap_penalty_weight, jerk_penalty_weight):
     """Scalar port of optimization._objective's cost formula for one individual."""
-    if string_length > 0.95 * arm_length:
+    # Pulley machine only - see optimization._objective for why. That machine tucks its
+    # sling alongside the arm to cock, so a sling near the arm's own length has nowhere to
+    # lie; the traditional machine lays its sling out from the tip and is commonly slung
+    # as long as its arm or longer, so its only limit is the search range.
+    if has_pulley and string_length > 0.95 * arm_length:
         return INVALID_COST
 
     (released, distance, efficiency, _string_impulse, cw_impulse, sling_deficit,
@@ -2623,7 +2676,10 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
         joint_friction_coefficient, bearing_friction_coefficient, pivot_shaft_radius,
         has_pulley,
     )
-    if not released or distance <= 0.0 or efficiency <= 0.0:
+    # An efficiency above MAX_PHYSICAL_EFFICIENCY is a collapsed denominator, not a good
+    # machine, and it has to be rejected here rather than merely distrusted: this objective
+    # maximizes efficiency, so the bigger the nonsense the more certainly it wins its seed.
+    if not released or distance <= 0.0 or efficiency <= 0.0 or efficiency > _MAX_EFFICIENCY:
         return INVALID_COST
 
     # TrebuchetParams.total_mass: no pulley to weigh on the traditional machine, and its

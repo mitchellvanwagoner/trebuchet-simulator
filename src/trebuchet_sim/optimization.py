@@ -4,6 +4,7 @@ Pure computation only - no printing or interactive prompts. See cli.py for the
 command-line presentation layer built on top of this module.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import partial
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -14,6 +15,7 @@ from scipy.optimize import differential_evolution
 from trebuchet_sim.config import (
     AUTO_INITIAL_ARM_ANGLE,
     LINKAGE_PARAM,
+    MAX_PHYSICAL_EFFICIENCY,
     MachineType,
     TrebuchetParams,
 )
@@ -25,6 +27,11 @@ try:
     _FASTSIM_AVAILABLE = True
 except Exception:
     _FASTSIM_AVAILABLE = False
+
+# The cost a design scores when it cannot be simulated at all - no release, a geometry the
+# model refuses, or a sling longer than its arm. Both engines return exactly this (see
+# fastsim.INVALID_COST), so a search whose best score reaches it found nothing at all.
+INVALID_COST = 1e6
 
 PARAM_NAMES = ["counter_weight_mass", "pulley_radius", "arm_length", "string_length", "release_angle"]
 
@@ -75,9 +82,16 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     # 1.0 / 1.5 / 2.0 / 2.5 / 3.0 / 4.0 m, and the winning arm stops growing at about
     # 1.65 m - past a 2 m pivot the ground has stopped deciding the design at all.
     "arm_length": (0.1, 2.0),              # m
-    # Capped with the arm: the objective rejects a sling longer than 0.95 of its arm
-    # outright, so with the arm at 2.0 m nothing above 1.9 m can ever be scored, and a
-    # bound of 2.5 m was search space that only ever produced invalid designs.
+    # Shared by both machines, and for the pulley machine it is the binding limit twice
+    # over: the objective refuses a sling past 0.95 of that machine's arm, so with the arm
+    # at 2.0 m nothing above 1.9 m is ever scored there, and a bound of 2.5 m was search
+    # space that only ever produced invalid designs.
+    #
+    # For the traditional machine this range is the *only* limit. That machine lays its
+    # sling out from the tip rather than tucking it along the arm, and a real one is often
+    # slung as long as its long arm or longer, so nothing couples the two lengths - a
+    # caller who wants a longer sling than this raises the range (param_bounds reaches
+    # PARAM_LIMITS' 10 m) rather than lengthening the arm to earn it.
     "string_length": (0.1, 2.0),           # m
     # The release pin's angle, measured from the arm to the sling (see
     # config.TrebuchetParams.release_angle), not the arm's angle in the world - so the
@@ -237,12 +251,28 @@ class OptimizationConfig:
     population_size: int = 40
     absolute_tolerance: float = 0.001
     workers: int = -1                     # -1 = one process per CPU core; ignored when the fast engine runs
+    # How many threads the fast engine scores a population across. `workers` above is the
+    # scipy fallback's *process* count and does nothing when the fast engine runs, because
+    # that engine is one call per generation rather than one per design: it spreads the
+    # population over numba's own thread pool inside `evaluate_population`'s prange. So the
+    # two are separate settings for separate engines rather than one knob spelled twice.
+    #
+    # None means "leave numba where it is", which is one thread per core. An explicit count
+    # is clamped to `fastsim.thread_ceiling()` - a process cannot be given more threads
+    # than it was imported with, so going above the core count needs the
+    # TREBUCHET_NUM_THREADS environment variable instead (see fastsim._seed_thread_ceiling).
+    threads: Optional[int] = None
     display_progress: bool = False        # scipy's per-iteration convergence printout
     use_fast_engine: bool = True          # Numba-vectorized objective when available; falls back to scipy otherwise
 
     def __post_init__(self):
         # Accept a plain string, so a machine read back from saved JSON works unchanged.
         self.machine = MachineType(self.machine)
+
+        if self.threads is not None:
+            self.threads = int(self.threads)
+            if self.threads < 1:
+                raise ValueError(f"threads must be at least 1, got {self.threads}.")
 
         names = self.param_names
         unknown = set(self.locked_params) - set(names)
@@ -321,8 +351,17 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     """Differential-evolution objective: minimize weighted (-efficiency, distance error, mass)."""
     params = config.build_params(free_values)
 
-    if params.string_length > 0.95 * params.arm_length:
-        return 1e6
+    # Pulley machine only, and it is a statement about that machine's cocked pose rather
+    # than about slings. It tucks its sling alongside the arm to load (see
+    # simulate_fast's alpha0), so a sling approaching the arm's own length has nowhere to
+    # lie and the pose stops describing anything buildable.
+    #
+    # The traditional machine loads the other way - the sling laid out from the tip, to a
+    # stone on the ground or hanging - and a real one is commonly slung as long as its
+    # long arm or longer. Nothing about that pose degenerates, so its sling is bounded by
+    # the search range alone (PARAM_BOUNDS / param_bounds) and by nothing here.
+    if params.has_pulley and params.string_length > 0.95 * params.arm_length:
+        return INVALID_COST
 
     try:
         # Looser tolerance and no dense interpolants: the objective only reads
@@ -332,8 +371,12 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     except Exception:
         return 1e6
 
-    if result.distance <= 0 or result.efficiency <= 0:
-        return 1e6
+    # Mirrored from fastsim._score: an efficiency above MAX_PHYSICAL_EFFICIENCY means the
+    # potential energy the launch spent came out as very nearly nothing, so the ratio is a
+    # broken measurement. The objective maximizes efficiency, so it has to be refused
+    # rather than merely reported.
+    if result.distance <= 0 or result.efficiency <= 0 or result.efficiency > MAX_PHYSICAL_EFFICIENCY:
+        return INVALID_COST
 
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
@@ -441,6 +484,71 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
     )
 
 
+def _no_valid_design_message(config: OptimizationConfig) -> str:
+    """Why a search came back with nothing, in terms of the settings to change.
+
+    Worth saying out loud rather than just reporting a failure, because a search that
+    scores every design INVALID_COST has a perfectly flat landscape, converges on it, and
+    returns whichever design the population happened to be standing on - which reads
+    downstream as a result rather than as the absence of one. The settings that can empty
+    a search space are quoted back because the fix is always to move one of them, and the
+    run itself is the only thing that knows which were set.
+    """
+    locked = ", ".join(f"{name}={value:g}" for name, value in sorted(config.locked_params.items()))
+    narrowed = ", ".join(sorted(config.param_bounds))
+    pivot = float(config.fixed_params.get("pivot_height", TrebuchetParams.pivot_height))
+
+    reason = (
+        f"\nNo design in the search space produced a throw. Its fixed geometry stands on a "
+        f"{pivot:g} m pivot"
+    )
+    reason += f", with {locked} locked" if locked else ", with nothing locked"
+    reason += f" and the range narrowed on {narrowed}." if narrowed else " and default search ranges."
+    reason += (
+        "\nA locked parameter that rules out the rest of the space is the usual cause, followed by "
+        "ranges narrowed to a region where nothing releases, and then a pivot height the arm cannot "
+        "work against. Widen whichever of those this run set."
+    )
+    return f"The optimizer found no valid design for the {config.machine.value} machine.{reason}"
+
+
+def thread_count(requested: Optional[int] = None) -> int:
+    """How many threads the fast engine would actually use for `requested`.
+
+    `None` reports the count numba is already set to. A number is clamped to
+    `fastsim.thread_ceiling()`, since a process cannot be given more threads than it was
+    imported with - ask for more than the machine was started with and this is what says
+    so, rather than the count silently not taking. Raising the ceiling is
+    TREBUCHET_NUM_THREADS' job (see fastsim._seed_thread_ceiling).
+
+    Returns 0 when the fast engine is unavailable, there being no thread pool to report.
+    """
+    if not _FASTSIM_AVAILABLE:
+        return 0
+    if requested is None:
+        return int(fastsim.get_num_threads())
+    return max(1, min(int(requested), fastsim.thread_ceiling()))
+
+
+@contextmanager
+def _numba_threads(requested: Optional[int]):
+    """Run the block with numba's thread count set to `requested`, then put it back.
+
+    Restored on the way out because the count is process-wide: a dashboard that optimizes
+    twice, or a test that pins one thread, would otherwise leave every later run on
+    whatever the last one asked for.
+    """
+    if requested is None or not _FASTSIM_AVAILABLE:
+        yield
+        return
+    previous = fastsim.get_num_threads()
+    fastsim.set_num_threads(thread_count(requested))
+    try:
+        yield
+    finally:
+        fastsim.set_num_threads(previous)
+
+
 def optimize_trebuchet(
     config: Optional[OptimizationConfig] = None,
     progress_callback: Optional[ProgressCallback] = None,
@@ -459,7 +567,14 @@ def optimize_trebuchet(
         # signature to decide whether to pass the new-style OptimizeResult or legacy (xk, convergence).
         params = config.build_params(intermediate_result.x)
         try:
-            result = simulate_trebuchet(params)
+            # The same settings _objective scores at, rather than the display defaults
+            # (rtol=1e-8 with a dense interpolant). This runs once per generation while
+            # the search is waiting on it, and a progress row only reads distance,
+            # efficiency and the metrics dict - nothing that needs an interpolant, and
+            # nothing the last two digits of rtol can move. Matching the objective also
+            # makes the row honest: the distance shown is the one the generation was
+            # actually scored on, not a more accurate number DE never saw.
+            result = simulate_trebuchet(params, rtol=1e-6, dense_output=False)
         except Exception:
             result = None
         progress_callback(intermediate_result.nit, intermediate_result.fun, params, result)
@@ -467,18 +582,22 @@ def optimize_trebuchet(
     # fastsim models both linkages, so the machine no longer decides the engine.
     use_fast = config.use_fast_engine and _FASTSIM_AVAILABLE
     if use_fast:
-        de_result = differential_evolution(
-            partial(_objective_vectorized, config=config),
-            config.bounds,
-            seed=config.seed,
-            maxiter=config.max_iterations,
-            popsize=config.population_size,
-            atol=config.absolute_tolerance,
-            vectorized=True,
-            updating="deferred",
-            disp=config.display_progress,
-            callback=_report_generation if progress_callback is not None else None,
-        )
+        # The whole search runs inside one thread-count setting rather than one per
+        # generation: the count is process-wide state, and DE calls the objective
+        # hundreds of times.
+        with _numba_threads(config.threads):
+            de_result = differential_evolution(
+                partial(_objective_vectorized, config=config),
+                config.bounds,
+                seed=config.seed,
+                maxiter=config.max_iterations,
+                popsize=config.population_size,
+                atol=config.absolute_tolerance,
+                vectorized=True,
+                updating="deferred",
+                disp=config.display_progress,
+                callback=_report_generation if progress_callback is not None else None,
+            )
     else:
         de_result = differential_evolution(
             partial(_objective, config=config),
@@ -491,6 +610,14 @@ def optimize_trebuchet(
             disp=config.display_progress,
             callback=_report_generation if progress_callback is not None else None,
         )
+
+    if de_result.fun >= INVALID_COST:
+        # Every design the search touched scored INVALID_COST, so `de_result.x` is not a
+        # winner - it is wherever the population happened to be standing when a completely
+        # flat landscape met the convergence test. Simulating it and returning it anyway
+        # is what produced a results panel of blanks and a log of empty rows: the caller
+        # had no way to tell "here is the best machine" from "there was no machine".
+        raise ValueError(_no_valid_design_message(config))
 
     optimal_params = config.build_params(de_result.x)
     sim_result = simulate_trebuchet(optimal_params, track_energy=True, simulate_aftermath=True)

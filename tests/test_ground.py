@@ -102,13 +102,15 @@ def test_the_launch_starts_on_the_ground_rather_than_under_it(projectile_radius)
     the higher x, on the side the machine throws towards. Both lengths run to the stone's
     centre, so it sits on the surface rather than through it.
 
-    The radii straddle a cliff that used to be there. A traditional machine cocks its tip
-    TRADITIONAL_START_CLEARANCE (50 mm) off the ground, so any stone of 50 mm radius or
-    more stands taller than the tip its sling hangs from - an ordinary stone, but a
-    `drop < 0` bail-out read it as "cannot be loaded", dropped the machine back to the
-    hanging pose, and started it 385 mm underground. Nothing flagged it, because a stone
-    that begins below the surface never crosses it going down. 50 mm exactly is where the
-    sign test also lost to rounding, the tip computing out at 0.04999999999999993.
+    The radii straddle a cliff that used to be there. The traditional machine was once
+    cocked with its tip 50 mm off the ground - the angle was solved for rather than chosen
+    then - so any stone of 50 mm radius or more stood taller than the tip its sling hung
+    from. An ordinary stone, but a `drop < 0` bail-out read it as "cannot be loaded",
+    dropped the machine back to the hanging pose, and started it 385 mm underground.
+    Nothing flagged it, because a stone that begins below the surface never crosses it
+    going down. 50 mm exactly is where the sign test also lost to rounding, the tip
+    computing out at 0.04999999999999993. The cocked tip stands well clear of the ground
+    now, but the signed drop is what keeps every one of these radii on the surface.
     """
     params = _traditional_with(projectile_radius=projectile_radius)
     simulator = TrebuchetSimulator(params)
@@ -121,9 +123,15 @@ def test_the_launch_starts_on_the_ground_rather_than_under_it(projectile_radius)
     assert px > tip_x  # the downrange root of the two the circle offers
     assert np.hypot(px - tip_x, py - tip_y) == pytest.approx(params.string_length)
 
-    # And the launch that follows starts there and stays up.
+    # And the launch that follows starts there and stays up. Approximately, not exactly:
+    # the sling is already carrying enough load at this pose to lift the stone straight
+    # off the ground, so _settle_grounded opens the launch in TAUT rather than in a
+    # grounded regime, and there the projectile's position is reconstructed from the sling
+    # angle instead of carried as its own state. That round trip costs the last bit or two.
     result = simulate_trebuchet(params)
-    assert result.solution.projectile_state(0.0)[0] == (px, py)
+    start_x, start_y = result.solution.projectile_state(0.0)[0]
+    assert start_x == pytest.approx(px, abs=1e-12)
+    assert start_y == pytest.approx(py, abs=1e-12)
     assert _min_projectile_height(result) >= -1e-5
 
 

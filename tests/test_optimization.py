@@ -11,6 +11,7 @@ from trebuchet_sim.config import (
     TrebuchetParams,
 )
 from trebuchet_sim.optimization import (
+    INVALID_COST,
     PARAM_BOUNDS,
     PARAM_LIMITS,
     PARAM_NAMES,
@@ -19,6 +20,7 @@ from trebuchet_sim.optimization import (
     _objective,
     _objective_vectorized,
     optimize_trebuchet,
+    thread_count,
 )
 from trebuchet_sim.physics import simulate_trebuchet
 
@@ -363,3 +365,94 @@ def test_a_none_fixed_param_means_the_same_as_leaving_it_out():
         absent.build_params(values[:, 0]).initial_arm_angle
     )
     assert explicit.build_params(values[:, 0]).initial_arm_angle < -np.pi / 2
+
+
+def test_a_search_with_nothing_to_find_says_so_instead_of_returning_a_blank():
+    """A search space with no scoreable design in it has to be reported as such.
+
+    Every design scoring INVALID_COST leaves differential evolution a perfectly flat
+    landscape: it converges on that flatness and `de_result.x` is then wherever the
+    population happened to be standing, not a winner. Returning it anyway is what reached
+    the dashboard as a panel of blank metrics and a log of empty rows, with no way to tell
+    "here is the best machine" from "there was no machine".
+
+    A pulley machine's sling longer than 0.95 of its arm is the one rule either engine
+    refuses outright, before any integration, so locking both lengths there empties the
+    space exactly rather than nearly - and it is an ordinary thing to type by accident.
+    The rule is that machine's alone: it cocks with the sling tucked along the arm, where
+    the traditional machine lays its sling out from the tip and is bounded only by the
+    search range (see optimization._objective). The message names the locks because they
+    are what has to move.
+    """
+    config = OptimizationConfig(
+        machine=MachineType.PULLEY,
+        locked_params={"arm_length": 0.5, "string_length": 0.49},
+    )
+    # The premise: the space really is unscoreable, not merely hard.
+    rng = np.random.default_rng(3)
+    low = np.array([b[0] for b in config.bounds])[:, None]
+    high = np.array([b[1] for b in config.bounds])[:, None]
+    sample = low + (high - low) * rng.random((len(config.bounds), 400))
+    assert (_objective_vectorized(sample, config) >= INVALID_COST).all()
+
+    with pytest.raises(ValueError) as excinfo:
+        optimize_trebuchet(config)
+    message = str(excinfo.value)
+    assert "no valid design" in message
+    assert "pulley" in message
+    assert "arm_length=0.5" in message and "string_length=0.49" in message
+
+
+def test_thread_count_is_clamped_to_what_the_process_was_started_with():
+    """numba fixes the ceiling when it is imported, so asking for more has to report the
+    number actually used rather than silently not taking (see fastsim._seed_thread_ceiling).
+    """
+    from trebuchet_sim import fastsim
+
+    ceiling = fastsim.thread_ceiling()
+    assert thread_count(1) == 1
+    assert thread_count(ceiling) == ceiling
+    assert thread_count(ceiling + 1000) == ceiling
+    assert thread_count(0) == 1  # a nonsense count still has to name a real thread
+    assert thread_count(None) == fastsim.get_num_threads()
+
+
+def test_the_thread_count_cannot_move_a_score():
+    """evaluate_population gives each individual its own slot and never reduces across
+    them, so the number of threads is a throughput setting and nothing else. Asserted
+    bit-exactly rather than approximately: a thread count that moved a score by even an
+    ulp would make an optimizer run depend on the machine it was run on.
+    """
+    from trebuchet_sim import fastsim
+
+    config = OptimizationConfig()
+    rng = np.random.default_rng(17)
+    low = np.array([b[0] for b in config.bounds])[:, None]
+    high = np.array([b[1] for b in config.bounds])[:, None]
+    sample = low + (high - low) * rng.random((len(config.bounds), 500))
+
+    previous = fastsim.get_num_threads()
+    try:
+        fastsim.set_num_threads(1)
+        expected = _objective_vectorized(sample, config)
+        for count in (2, 3, fastsim.thread_ceiling()):
+            fastsim.set_num_threads(thread_count(count))
+            assert np.array_equal(_objective_vectorized(sample, config), expected)
+    finally:
+        fastsim.set_num_threads(previous)
+
+
+def test_optimizing_puts_the_thread_count_back():
+    """The count is process-wide, so a run that pinned it would otherwise decide how every
+    later run in the same process - a dashboard session, a test module - was scored.
+    """
+    from trebuchet_sim import fastsim
+
+    before = fastsim.get_num_threads()
+    optimize_trebuchet(OptimizationConfig(threads=1, max_iterations=2))
+    assert fastsim.get_num_threads() == before
+
+
+def test_a_thread_count_below_one_is_refused():
+    with pytest.raises(ValueError, match="threads must be at least 1"):
+        OptimizationConfig(threads=0)

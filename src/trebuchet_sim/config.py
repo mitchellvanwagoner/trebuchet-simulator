@@ -21,13 +21,20 @@ ARM_CROSS_SECTION_WIDTH = 0.05  # arm cross-section width, used for mass and dra
 # because it is flat across every design that has not already failed.
 SLING_TENSION_FLOOR = 1.0
 
-# How high the traditional machine's cocked arm tip sits above the ground, in metres.
-# That machine is loaded by walking the long arm down until it is all but touching, laying
-# the sling out along the ground behind it and setting the stone at the far end - so the
-# cocked arm angle is not a free choice, it is whatever puts the tip here (see
-# resolve_initial_arm_angle). Small and positive: exactly zero would have the beam's own
-# ground event firing at t=0.
-TRADITIONAL_START_CLEARANCE = 0.05  # m
+# The most efficiency a launch may report before it is read as a broken measurement rather
+# than a good machine. Efficiency is the projectile's kinetic energy over the potential
+# energy the launch spent, and energy conservation caps that at 1: the stone cannot leave
+# with more than the machine put in. Anything meaningfully above 1 means the denominator
+# has collapsed - a run that spun up without the counterweight descending, so it is
+# dividing a real kinetic energy by very nearly nothing.
+#
+# Left ungated, that is not a harmless bad number, because the objective *maximizes*
+# efficiency: a design measuring 3.5e15 scores -1.76e18 and wins its seed outright against
+# every real machine. One of 16 seeds on the traditional machine returned exactly that -
+# a 0.58 m arm on a 0.13 m sling that the fast engine threw 2516 m and the reference did
+# not release at all. The margin above 1 is for numerical slop in a genuine launch, not for
+# designs to live in; real winners measure 0.7-0.95 and nothing legitimate comes near it.
+MAX_PHYSICAL_EFFICIENCY = 1.5
 
 # Rotation speed below which the pivot's Coulomb friction is smoothed out, rad/s. Dry
 # friction is a sign function of the velocity, which is a discontinuity an adaptive
@@ -140,107 +147,123 @@ class MachineType(str, Enum):
 # which is what actually decides that machine's cocked angle.
 DEFAULT_INITIAL_ARM_ANGLE.update({
     MachineType.PULLEY: np.pi / 4,
-    MachineType.TRADITIONAL: -np.pi / 2,
+    # Long arm down and behind the pivot, counterweight raised in front of it, so the
+    # throw sweeps up and over toward +x. A pose, not a solved constraint - see
+    # resolve_initial_arm_angle for why this stopped being geometry.
+    MachineType.TRADITIONAL: -3 * np.pi / 4,
 })
 
 
 def resolve_initial_arm_angle(machine, arm_length: float, pivot_height: float) -> float:
     """The arm angle a machine is cocked at, when the caller has not pinned one.
 
-    The pulley machine's is a constant: its arm is short, it stands under a tall pivot,
-    and where it starts is a free choice.
+    A constant per machine: where the beam starts is a property of how the machine is
+    cocked, not something the rest of the geometry decides. `arm_length` and
+    `pivot_height` are still taken so callers do not have to care which machine needs
+    what, and so a future pose that does depend on them has somewhere to read them.
 
-    The traditional machine's is not a free choice at all - it is geometry. That machine
-    is loaded by walking the long arm down until the tip is all but on the ground, laying
-    the sling out along the ground behind it and setting the stone at the far end. So the
-    cocked angle is whatever puts the tip `TRADITIONAL_START_CLEARANCE` above the ground,
-    and it moves with the arm length and the pivot height rather than being carried as a
-    separate number that has to be re-chosen every time either of those changes:
+    The traditional machine's used to be solved rather than chosen: the arm was walked
+    down until its own *tip* all but touched the ground, which
+    made the cocked angle a function of the arm length and the pivot height. That had the
+    wrong body touching the ground. It is the projectile that rests on the ground when a
+    trebuchet is loaded - the beam is held clear of it - and where the stone goes is
+    already solved, and solved properly, by `physics.ground_start_state`: the sling is a
+    circle about the cocked tip, the ground is the line the resting stone's centre lies
+    on, the stone starts where they meet, and when the two do not meet the sling simply
+    hangs from the tip. Nothing about that needs the beam to be near the ground.
 
-        l_a * sin(theta) + h_T = clearance   ->   theta = -pi - asin((clearance - h_T)/l_a)
-
-    of the two arcsine branches, the one in (-pi, -pi/2) - long arm down and *behind* the
-    pivot, counterweight raised in front of it, so the throw sweeps up and over toward +x.
-
-    An arm shorter than the pivot is tall cannot reach that low however far it is walked
-    down; the closest it gets is straight down, at -pi/2, and the clamp below returns
-    exactly that. Such a machine does not launch, and that is the honest answer rather
-    than a defect: at -pi/2 every gravity torque about the pivot carries a cos(theta) and
-    is identically zero, so the machine is parked on its own balance point. The geometry
-    is saying the pivot is too tall for the arm.
+    Deriving it from the beam also broke machines that were otherwise fine. The arcsine
+    had no solution once the pivot stood taller than the arm was long, and the clamp then
+    returned -pi/2 - straight down, where every gravity torque about the pivot carries a
+    cos(theta) and is identically zero. The machine was parked on its own balance point
+    and threw nothing, so with the arm capped at 2.0 m every traditional design on a pivot
+    of 2.2 m or more scored INVALID_COST and a search there had a perfectly flat landscape
+    to converge on. The same machines launch normally from a pose that is simply chosen:
+    on a 2.6 m pivot the stone hangs from the tip instead of lying on the ground, which is
+    the other loading geometry rather than a failure.
     """
-    if MachineType(machine) is MachineType.PULLEY:
-        return float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY])
-    if arm_length <= 0.0:
-        # No arm, no geometry to solve: fall back to the clamp's own answer rather than
-        # dividing by zero. Nothing launches either way.
+    if MachineType(machine) is MachineType.TRADITIONAL:
         return float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.TRADITIONAL])
-    ratio = (TRADITIONAL_START_CLEARANCE - pivot_height) / arm_length
-    return float(-np.pi - np.arcsin(max(-1.0, min(1.0, ratio))))
+    return float(DEFAULT_INITIAL_ARM_ANGLE[MachineType.PULLEY])
 
 
 # Canonical defaults for the traditional machine, derived exactly the way the pulley
-# machine's are: optimizer output for the 30 m target on the shipped weights and seed,
-# with the fixed geometry below held. The counterweight rides the arm rather than a pulley,
-# so `length_counterweight` replaces `pulley_radius` as the linkage parameter, and the arm
-# is cocked at -140 degrees - not chosen, but wherever walking the long arm down to the
-# ground puts it (resolve_initial_arm_angle).
+# machine's are: optimizer output for the 30 m target on the shipped weights and seed, with
+# the fixed geometry below held, and checked against both engines before shipping. The
+# counterweight rides the arm rather than a pulley, so `length_counterweight` replaces
+# `pulley_radius` as the linkage parameter.
 #
-# The search is barely seed-sensitive: 47 of 48 seeds land within 0.005 of the same score,
-# on the same 1.49 m arm at the same 13 degree pin. The 48th is the reason the defaults are
-# now checked against *both* engines. It scores -145 against this set's +7.2 - by far the
-# best number any seed returns - on a design fastsim throws 30 m and physics.py throws
-# 0.0 m. Neither engine is misbehaving: the sling's tension dips to -0.024 N for 7 ms, the
-# fast engine resolves the dip and lets the sling go slack, and scipy's event test, which
-# only looks at the ends of its accepted steps, straddles the whole excursion with one 14 ms
-# step and sails past it. That one branch moves the release 0.7 s and turns a 30 m throw
-# into a stone lobbed backwards. A design whose distance depends on which engine you ask is
-# not a default, whatever it scores.
+# Re-swept when the cocked arm angle stopped being solved for and became a pose that is
+# simply chosen - see resolve_initial_arm_angle. The old angle was whatever walked the
+# long arm down until its own tip nearly touched the ground, which put the wrong body on
+# the ground: a trebuchet rests its *projectile* there and holds the beam clear. It also
+# had no solution at all once the pivot outstood the arm, and the clamp then parked the
+# machine on its balance point, so every traditional design on a pivot of 2.2 m or more
+# scored INVALID_COST and a search there had nothing to find. The arm now starts at -135
+# degrees on every geometry, and where the stone starts is still solved, by
+# physics.ground_start_state: resting on the ground when the sling reaches it, hanging
+# from the tip when it does not.
 #
-# The pivot is low because the cocked angle is no longer a number anyone chose - it is
-# whatever walks the long arm down to the ground, and an arm shorter than the pivot is tall
-# cannot get there. So this machine loads the way a real one does: the beam down, the sling
-# stretched to a stone lying on the ground, and the arm rotating away from it.
+# Re-swept a second time when the sling stopped being capped against the arm on this
+# machine (see optimization._objective): a traditional trebuchet is commonly slung as long
+# as its long arm or longer, and only the pulley machine's cocked pose needs the two
+# coupled. The winner still slings shorter than its arm, at a ratio of 0.932 - the freedom
+# changed which basin the search walked into rather than what it wanted.
 #
-# Which way it is stretched is the other thing that moved this set. The stone is laid out
-# *downrange* of the cocked tip now - ground_start_state takes the +x root of the loading
-# circle - and this machine's tip sweeps back and up, away from it, so the sling is
-# carrying load before anything moves. The launch opens in TAUT_GROUND rather than
-# SLACK_GROUND: it drags the stone back along the ground for 43% of the run, then whips it
-# forward, which is the stroke a real trebuchet makes. It never goes slack at all -
-# `string_slack_fraction` and `sling_tension_deficit` are both exactly zero, where the
-# far-side pose spent a third of every launch taking up slack and was charged for it.
+# This machine is loaded the way a real one is. Cocked, the tip stands 0.484 m up and the
+# stone lies on the ground at the downrange end of a stretched sling; the sling is already
+# carrying load, so it lifts the stone immediately rather than dragging it
+# (`projectile_ground_fraction` is exactly zero). It then turns 136.8 degrees and releases
+# at a 33.2 degree pin.
 #
-# 93.1% efficiency at 17.9 kg all in, against the 73.7% of the set before the loading root
-# moved and the beam became solid. The stone never touches the beam and never lands, the
-# sling is under load throughout, and the counterweight link bottoms out at +61.9 N -
-# always in tension, which is incidental rather than designed for: nothing charges it if it
-# pushes, because a pinned strut carries compression by design (see
-# physics._cw_link_tension).
+# 93.4% efficiency at 20.4 kg all in, against the 93.1% of the set before the pose changed.
+# The launch is a single taut segment from pose to release: `string_slack_fraction`,
+# `sling_snap_count` and `sling_tension_deficit` are all exactly zero, the sling's worst
+# tension is +7.1 N, and the stone touches neither the ground nor the beam, which it clears
+# by 0.617 m at worst. The counterweight link bottoms out at -58.5 N, i.e. in compression:
+# nothing is charged for that here, because this machine's weight is pinned to the arm
+# through a rigid strut and a pinned two-force member carries compression by design (see
+# physics._cw_link_tension). It is a member load to size for, not a fault.
+#
+# Barely seed-sensitive: measured over a 0-15 seed sweep before the sling was uncoupled,
+# all 16 returned a design, their scores spanned 1.28 with 14 inside 0.5 of the median, and
+# every one landed between 93.3% and 94.0% efficiency. That sweep is also what turned up
+# MAX_PHYSICAL_EFFICIENCY: before it existed, seed 14 won outright with a design measuring
+# 3.5e15 efficiency - a collapsed denominator the objective was free to maximize - which the
+# reference engine did not release at all.
 DEFAULT_TRADITIONAL_PARAMS = {
-    "counter_weight_mass": 15.882893,   # kg
-    "length_counterweight": 0.290764,   # m
-    "arm_length": 1.078622,             # m
-    "string_length": 1.023034,          # m
-    "release_angle": 0.232733,          # radians (pin angle, sling measured from the arm)
+    "counter_weight_mass": 18.971939,   # kg
+    "length_counterweight": 0.191797,   # m
+    "arm_length": 0.729306,             # m
+    "string_length": 0.679611,          # m
+    "release_angle": 0.580128,          # radians (pin angle, sling measured from the arm)
 }
+
 
 # Fixed (never-optimized) fields whose defaults also differ per machine: the pivot the
 # machine stands on, and the pin-to-weight link the counterweight hangs from.
 #
-# The pivot came down from 2.6 m when the cocked angle stopped being a free number and
-# became geometry (see resolve_initial_arm_angle). This machine is loaded with its long
-# arm walked down to the ground, and an arm shorter than its pivot is tall cannot get
-# there - at 2.6 m nothing inside the arm's own search range could, so every design would
-# have been cocked straight down on its balance point and none would have launched. At
-# 1.0 m an arm of 0.95 m or more reaches, which is most of the range and is also what a
-# traditional trebuchet looks like: the beam is longer than the frame is tall.
+# The pivot is 1.0 m, and it is now a choice rather than a consequence. It came down from
+# 2.6 m to satisfy the old cocked angle, which was solved by walking the long arm down to
+# the ground and had no solution at all once the pivot outstood the arm; at 2.6 m nothing
+# in the arm's search range could reach, so every design sat on its balance point and none
+# launched. That constraint is gone with the derivation (see resolve_initial_arm_angle),
+# and the whole pivot range works again: swept at 1.0 / 1.4 / 1.8 / 2.2 / 3.0 m, the share
+# of the search box that scores runs 13 / 27 / 29 / 30 / 31% and the best score found runs
+# -456.3 / -456.7 / -457.4 / -457.4 / -458.7, flattening by about 2 m.
 #
-# The tall-pivot argument that raised it in the first place does not apply here any more.
-# It was there to stop the beam digging itself in, but a machine cocked at the ground
-# rotates *away* from it - the first ground crossing after the cocked angle is more than
-# 250 degrees of rotation later on the shipped design - so the beam has the whole throw
-# to work in.
+# It stays at 1.0 m because the curve is nearly flat and the low frame is the better
+# machine to describe: the winner here is within 0.3% of the score anything taller returns,
+# and at 1.0 m the cocked tip stands 0.509 m up, which is low enough that the sling reaches
+# the ground and the stone is *loaded on it*. Raise the pivot and the stone has to hang
+# from the tip instead - still modelled, still launches, but no longer how anyone loads a
+# trebuchet.
+#
+# What no longer holds is the old reading of the arm bound. With the beam cocked at -135
+# degrees the tip sits at l_a*sin(-135) + h_T, so an arm longer than h_T/0.7071 - 1.41 m
+# here - starts underground and physics._cocked_beam_clearance refuses it outright. That is
+# a real cap on this machine's arm at this pivot, and it is why the search box is 13% valid
+# at 1.0 m against 30% at 2.0 m. The winner is a 0.69 m arm, well inside it.
 DEFAULT_TRADITIONAL_FIXED = {
     "pivot_height": 1.0,                 # m
     "counter_weight_rope_length": 0.5,   # m
