@@ -232,6 +232,10 @@ RETENSION_CIRCLE_SLOP = 1e-12
 # either side by an ulp.
 BEAM_CONTACT_SLOP = 1e-12
 
+# physics.TAUT_HANDOFF_TENSION: smallest sling tension that accepts a hand-off into the
+# taut regime. Not zero - at exactly zero the new segment trips its own slack event at t0.
+TAUT_HANDOFF_TENSION = 1e-9
+
 # How far inside the sling circle still counts as a taut sling when _settle_beam picks the
 # regime a stone arriving on the arm belongs in, in metres. physics.BEAM_SLING_TAUT_SLOP.
 BEAM_SLING_TAUT_SLOP = 1e-9
@@ -1934,6 +1938,34 @@ def _apply_beam_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, 
 
 
 @njit(cache=True, fastmath=False, inline="always")
+def _taut_or_slack(y, c, projectile_mass, h_T, taut_out):
+    """_TAUT if the sling can hold the stone there, _SLACK if it would have to push.
+
+    Scalar port of physics.TrebuchetSimulator._taut_or_slack, and the reason it exists is
+    worth carrying: every route into the airborne taut regime arrives having checked a
+    tension solved with some *other* constraint still acting - the ground's, or the beam's -
+    and that number stops describing the machine the moment the constraint is released. The
+    same state solved as a free taut sling can want a negative tension, and a taut segment
+    started there cannot recover, because its slack event is a downward zero crossing and a
+    tension that begins below zero never crosses it going down. It runs on a rope in
+    compression until the tension comes back up and crosses again: 0.19 s and 0.303 N*s on
+    the draw that found this.
+
+    Fills `taut_out` with the six-component state either way; the caller only reads it when
+    _TAUT comes back.
+    """
+    _taut_state_from_grounded(y, c, h_T, taut_out)
+    theta_ddot = _trebuchet_dynamics(taut_out[0], taut_out[1], taut_out[2], taut_out[3],
+                                     taut_out[4], taut_out[5], c)[1]
+    string_T, _cw_T = _tensions(taut_out[0], taut_out[1], taut_out[2], taut_out[3],
+                                taut_out[4], taut_out[5], theta_ddot, c,
+                                projectile_mass, c[24], c[25], c[26] > 0.5)
+    if string_T > TAUT_HANDOFF_TENSION:
+        return _TAUT
+    return _SLACK
+
+
+@njit(cache=True, fastmath=False, inline="always")
 def _settle_beam(y, c, projectile_mass, h_T, taut_out):
     """Which regime a stone that has just arrived on the beam belongs in.
 
@@ -1961,8 +1993,7 @@ def _settle_beam(y, c, projectile_mass, h_T, taut_out):
         return _SLACK
     if normal >= 0.0:
         return _TAUT_BEAM
-    _taut_state_from_grounded(y, c, h_T, taut_out)
-    return _TAUT
+    return _taut_or_slack(y, c, projectile_mass, h_T, taut_out)
 
 
 @njit(cache=True, fastmath=False, inline="always")
@@ -1982,8 +2013,7 @@ def _settle_grounded(y, c, projectile_mass, h_T, taut_out):
         return _SLACK_GROUND
     if normal >= 0.0:
         return _TAUT_GROUND
-    _taut_state_from_grounded(y, c, h_T, taut_out)
-    return _TAUT
+    return _taut_or_slack(y, c, projectile_mass, h_T, taut_out)
 
 
 @njit(cache=True, fastmath=False)
@@ -2203,11 +2233,11 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
             for i in range(N_QUADRATURE):
                 slack[8 + i] = 0.0
             if regime == _TAUT_BEAM:
-                _taut_state_from_grounded(slack, c, h_T, taut)
-                theta, theta_dot = taut[0], taut[1]
-                alpha, alpha_dot = taut[2], taut[3]
-                psi, psi_dot = taut[4], taut[5]
-                regime = _TAUT
+                regime = _taut_or_slack(slack, c, projectile_mass, h_T, taut)
+                if regime == _TAUT:
+                    theta, theta_dot = taut[0], taut[1]
+                    alpha, alpha_dot = taut[2], taut[3]
+                    psi, psi_dot = taut[4], taut[5]
             else:
                 regime = _SLACK
             continue
@@ -2223,12 +2253,13 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                 psi, psi_dot = taut[4], taut[5]
             continue
         if status == _SEG_LIFTOFF:
-            # The sling has taken the projectile's weight off the ground.
-            _taut_state_from_grounded(slack, c, h_T, taut)
-            theta, theta_dot = taut[0], taut[1]
-            alpha, alpha_dot = taut[2], taut[3]
-            psi, psi_dot = taut[4], taut[5]
-            regime = _TAUT
+            # The sling has taken the projectile's weight off the ground - by the grounded
+            # solve's reckoning, which is not the one the taut regime will use.
+            regime = _taut_or_slack(slack, c, projectile_mass, h_T, taut)
+            if regime == _TAUT:
+                theta, theta_dot = taut[0], taut[1]
+                alpha, alpha_dot = taut[2], taut[3]
+                psi, psi_dot = taut[4], taut[5]
             continue
         if status == _SEG_SLING_SLACK:
             # From _TAUT_GROUND; the physical state carries over unchanged, the integrals

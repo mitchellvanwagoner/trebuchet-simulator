@@ -270,3 +270,68 @@ def test_a_launch_that_never_nears_the_beam_is_untouched_by_any_of_this():
     assert not any(
         seg.regime in ("taut_beam", "slack_beam") for seg in result.solution.segments
     )
+
+
+def test_a_taut_handoff_is_refused_when_the_sling_would_have_to_push():
+    """Leaving a contact regime must not start a taut segment on a sling in compression.
+
+    Every route into the airborne taut regime arrives having checked a tension - and until
+    this was fixed, the wrong one. `grounded_forces` and `beam_taut_forces` each solve the
+    sling tension with their own constraint still acting, and that number stops describing
+    the machine the instant the constraint is released: the same state, re-solved as a free
+    taut sling, can want a negative tension. A taut segment started there cannot recover,
+    because its slack event is a downward zero crossing and a tension that begins below zero
+    never crosses it going down; the segment runs on a rope in compression until the tension
+    comes back up and crosses again.
+
+    This draw is the one that found it - a 0.143 m sling on a 1.22 m arm, ratio 0.117, which
+    reaches the beam and then leaves it. Its taut segment opened at -2.97 N, ran 0.19 s, and
+    banked 0.303 N*s of compression against the 0.005 N*s the engines are held to. Both
+    engines had it; both are checked here, and a rope carrying no compression is the whole
+    assertion - what the launch then does with the draw is the chaotic business of
+    tests/test_fastsim.py and not this test's.
+    """
+    numba = pytest.importorskip("numba")
+    from trebuchet_sim import fastsim
+    from trebuchet_sim.physics import simulate_trebuchet
+
+    values = {
+        "counter_weight_mass": 36.95836268352173,
+        "length_counterweight": 0.3795263143080952,
+        "arm_length": 1.222739433814692,
+        "string_length": 0.14332735495642523,
+        "release_angle": 2.4444070060993223,
+    }
+    params = TrebuchetParams(
+        machine=MachineType.TRADITIONAL, pivot_height=0.9865239634515247, **values
+    )
+
+    reference = simulate_trebuchet(params, rtol=1e-6, dense_output=False)
+    assert reference.metrics["string_compression_impulse"] <= 5e-3
+
+    fast = fastsim.simulate_fast(
+        params.counter_weight_mass, params.pulley_radius, params.length_counterweight,
+        0.0, params.arm_length, params.string_length, params.release_angle,
+        params.pivot_height, params.pulley_density, params.arm_density,
+        params.projectile_mass, params.projectile_radius, params.initial_arm_angle,
+        params.arm_drag_coefficient, params.projectile_drag_coefficient,
+        params.joint_friction_coefficient, params.bearing_friction_coefficient,
+        params.pivot_shaft_radius, params.has_pulley,
+    )
+    assert fast[3] <= 5e-3  # string_impulse
+
+
+def test_the_taut_handoff_threshold_is_positive():
+    """Zero would be the obvious threshold and is the wrong one.
+
+    A taut segment entered at exactly zero tension trips its own slack event at t0 and
+    returns a zero-length segment, so the launch stops making progress instead of moving.
+    Both engines carry the same small positive figure.
+    """
+    from trebuchet_sim import physics
+
+    assert physics.TAUT_HANDOFF_TENSION > 0.0
+    numba = pytest.importorskip("numba")
+    from trebuchet_sim import fastsim
+
+    assert fastsim.TAUT_HANDOFF_TENSION == physics.TAUT_HANDOFF_TENSION

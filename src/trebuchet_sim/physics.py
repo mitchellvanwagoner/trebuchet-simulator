@@ -58,6 +58,12 @@ BEAM_CONTACT_SLOP = 1e-12
 # which beam regime a stone that has just arrived on the arm belongs in (_settle_beam).
 # A stone arriving out of the taut regime, or off a snap, is on the circle to rounding -
 # its position is built from the sling length - so anything measurably inside it arrived
+# Smallest sling tension that will accept a hand-off into the taut regime, in newtons.
+# Not zero: a taut segment entered at exactly zero tension trips its own slack event at t0
+# and returns a zero-length segment, which is how a launch stops making progress. Matches
+# the threshold _apply_snap's own taut hand-off has always used.
+TAUT_HANDOFF_TENSION = 1e-9
+
 # slack, and the taut contact regime is not available to it.
 BEAM_SLING_TAUT_SLOP = 1e-9
 
@@ -2025,6 +2031,34 @@ class TrebuchetSimulator:
             return grounded, TAUT_GROUND
         return self._taut_state_from_grounded(grounded), TAUT
 
+    def _taut_or_slack(self, state) -> Tuple[List[float], str]:
+        """Hand a projectile to TAUT, unless the sling would have to push to hold it there.
+
+        Every route out of a contact regime and into the airborne taut one arrives having
+        checked a tension - but the *wrong* one. `grounded_forces` and `beam_taut_forces`
+        each solve the sling tension with their own constraint still acting, and the number
+        they return stops describing the machine the instant that constraint is released:
+        the same state, solved as a free taut sling, can want a negative tension. Handing it
+        straight to TAUT then starts a segment whose sling is already pushing, and the taut
+        segment's own slack event cannot save it - that event is a downward zero crossing,
+        and a tension that starts below zero never crosses it going down. The segment runs
+        on a rope in compression until the tension happens to come back up and cross again.
+
+        Measured on a traditional draw with a 0.117 sling-to-arm ratio: the taut segment
+        opened at -2.97 N, ran 0.19 s, and banked 0.303 N*s of compression impulse against a
+        0.005 tolerance - a rope pushing for a fifth of a second, which is what the
+        `string_compression_impulse` self-check exists to catch and was, correctly, catching.
+
+        So the tension is re-solved here in the regime actually being entered. The threshold
+        is the small positive one `_apply_snap`'s hand-off already uses rather than zero: at
+        exactly zero the new taut segment would trip its own slack event at t0 and return a
+        zero-length segment forever.
+        """
+        taut_state = self._taut_state_from_grounded(state)
+        if self.constraint_tensions(0.0, taut_state)[0] > TAUT_HANDOFF_TENSION:
+            return taut_state, TAUT
+        return state, SLACK
+
     def _taut_state_from_grounded(self, y8) -> List[float]:
         """Lift a grounded projectile into the taut (six-component) layout."""
         theta, theta_dot = float(y8[0]), float(y8[1])
@@ -2112,7 +2146,7 @@ class TrebuchetSimulator:
                 return state, SLACK_BEAM
             # Either the surface stopped pushing or the stone slid off an end; both
             # leave it airborne on a sling that is still loaded.
-            return self._taut_state_from_grounded(state), TAUT
+            return self._taut_or_slack(state)
 
         if regime == SLACK_BEAM:
             state = [float(v) for v in y_event]
@@ -2202,7 +2236,7 @@ class TrebuchetSimulator:
             return state, SLACK_GROUND
         if normal >= 0.0:
             return state, TAUT_GROUND
-        return self._taut_state_from_grounded(state), TAUT
+        return self._taut_or_slack(state)
 
     def _scan_missed_beam_contact(self, sol, regime: str, t_end: float):
         """The first beam contact inside `sol` that its event's end-point sign test missed.
@@ -2296,7 +2330,7 @@ class TrebuchetSimulator:
             return (state, SLACK_BEAM) if self.beam_forces(state) >= 0.0 else (state, SLACK)
         if normal >= 0.0:
             return state, TAUT_BEAM
-        return self._taut_state_from_grounded(state), TAUT
+        return self._taut_or_slack(state)
 
     def _beam_contact_state(self, launch: "LaunchSolution", t: float,
                             y8) -> Tuple[List[float], str]:

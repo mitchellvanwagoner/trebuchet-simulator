@@ -516,23 +516,20 @@ def test_fast_engine_matches_scipy_engine_on_every_launch(machine):
         (released, distance, efficiency, string_impulse, cw_impulse,
          sling_deficit, snap_energy, ground_energy, beam_energy) = fast
 
-        # A rope cannot push in either engine now. Asserted before the undecided exemptions
-        # below, because it is a statement about the model rather than about this draw -
-        # but only of draws that produced a launch, and that scoping is a known gap rather
-        # than a tidy-up.
+        # A rope cannot push in either engine. Asserted before the undecided exemptions
+        # below, and of every draw, because it is a statement about the model rather than
+        # about this draw.
         #
-        # One draw in 300 breaks it: a 0.143 m sling on a 1.22 m arm - a ratio of 0.117 -
-        # which the reference runs slack for 92% of its length through three snaps and four
-        # beam contacts before giving up without releasing. The fast engine comes out of
-        # that with 0.303 N*s of sling compression, i.e. its event solver lost a tension
-        # zero-crossing somewhere in the stitching. Both engines agree on the only thing
-        # the design decides - it throws nothing, 0.000 m either way, and the optimizer
-        # scores it INVALID_COST on both - so nothing downstream reads the number. It is
-        # still a real hole in the fast engine's segment stitching under a very short
-        # sling, and it is written down here rather than papered over with a bigger
-        # epsilon, which would blind the other 299 draws.
-        if ref.metrics.get("release_occurred", False):
-            assert string_impulse <= _STRING_COMPRESSION_EPS, design
+        # It was scoped to draws that released for a while, because one did break it: a
+        # 0.143 m sling on a 1.22 m arm - a ratio of 0.117 - came out of the stitching with
+        # 0.303 N*s of sling compression. That turned out to be a real bug rather than a
+        # tolerance, and in both engines: every route into the airborne taut regime checked
+        # a tension solved with some other constraint still acting, and handed the state
+        # over without re-solving it for the regime being entered (see
+        # physics.TrebuchetSimulator._taut_or_slack). A taut segment started on a negative
+        # tension cannot recover, because its slack event is a downward zero crossing. That
+        # draw now reads 1.2e-05 and the scoping is gone with it.
+        assert string_impulse <= _STRING_COMPRESSION_EPS, design
 
         if _undecided(ref.metrics) or _regimes_undecided(params, ref):
             # Nothing below is a shared answer for this draw - see _undecided and
