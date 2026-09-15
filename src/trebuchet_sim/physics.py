@@ -54,6 +54,18 @@ SLACK_BEAM = "slack_beam"
 # ordinary sign-change test to arm on.
 BEAM_CONTACT_SLOP = 1e-12
 
+# How far under where an airborne segment opened its landing test sits, in metres, when
+# the projectile opens that segment on the ground line or below it. Every landing event is
+# a downward crossing, and a segment that opens at the rounding of zero - a stone the sling
+# has just snatched off the ground comes out at -1.5e-16 m - has nothing to cross: the stone
+# rises a hair, comes back down, and the test that was never positive never fires. One
+# traditional draw swung its stone 63 mm underground that way. So the line is re-anchored
+# per segment to just under where the stone actually is. Big enough to clear rounding and
+# the micron-scale drift a grounded regime hands over, whose stone is already accelerating
+# upward and dips by picometres before it climbs; small enough that a stone genuinely
+# coming back down is caught a nanometre past the line.
+GROUND_REENTRY_SLOP = 1e-9
+
 # How far inside the sling circle still counts as a taut sling, in metres, when deciding
 # which beam regime a stone that has just arrived on the arm belongs in (_settle_beam).
 # A stone arriving out of the taut regime, or off a snap, is on the circle to rounding -
@@ -1807,6 +1819,10 @@ class TrebuchetSimulator:
         # _release_target). A one-element list because the event closure has to see the
         # value the loop below writes.
         release_target = [0.0]
+        # Where the landing events put the ground, relative to the real line: zero, unless
+        # the segment opened on the line or under it (see GROUND_REENTRY_SLOP). Written per
+        # segment by the loop below, like release_target.
+        landing_floor = [0.0]
 
         def release_event(t, y):
             return (y[2] - y[0]) - release_target[0]
@@ -1815,7 +1831,8 @@ class TrebuchetSimulator:
             return self.constraint_tensions(t, y)[0]
 
         def taut_landing_event(t, y):
-            return l_a * math.sin(y[0]) + l_s * math.sin(y[2]) + h_T - ground_y
+            return (l_a * math.sin(y[0]) + l_s * math.sin(y[2]) + h_T - ground_y
+                    - landing_floor[0])
 
         def retension_event(t, y):
             tip_x = l_a * math.cos(y[0])
@@ -1823,7 +1840,7 @@ class TrebuchetSimulator:
             return math.hypot(y[2] - tip_x, y[3] - tip_y) - l_s
 
         def slack_landing_event(t, y):
-            return y[3] - ground_y
+            return y[3] - ground_y - landing_floor[0]
 
         def liftoff_event(t, y):
             return self.grounded_forces(y)[1]
@@ -1870,6 +1887,14 @@ class TrebuchetSimulator:
             s = self.beam_contact_geometry(y[0], y[2], y[3])[0]
             return min(s - s_min, s_max - s)
 
+        # Or carried down onto the ground. A beam low enough to reach the dirt can press a
+        # stone riding it into the dirt, and neither beam regime used to watch for that:
+        # the stone went through the ground on the beam, then slid off into TAUT already
+        # below the line, where the landing event - a downward crossing - had no crossing
+        # left to find. One traditional draw swung its stone 137 mm underground that way.
+        def beam_ground_event(t, y):
+            return y[3] - ground_y - landing_floor[0]
+
         theta_arm_ground = self._theta_arm_ground
 
         def arm_ground_event(t, y):
@@ -1879,7 +1904,8 @@ class TrebuchetSimulator:
                       liftoff_event, ground_slack_event, arm_ground_event,
                       taut_beam_contact_event, slack_beam_contact_event,
                       beam_liftoff_event, beam_sling_slack_event,
-                      beam_slack_liftoff_event, beam_span_exit_event):  # noqa: E501
+                      beam_slack_liftoff_event, beam_span_exit_event,
+                      beam_ground_event):  # noqa: E501
             event.terminal = True
             event.direction = -1
         for event in (retension_event, ground_retension_event, beam_slack_retension_event):
@@ -1895,10 +1921,11 @@ class TrebuchetSimulator:
             SLACK: (self._launch_slack_dynamics,
                     [retension_event, slack_landing_event, slack_beam_contact_event]),
             TAUT_BEAM: (self._beam_taut_dynamics,
-                        [beam_liftoff_event, beam_sling_slack_event, beam_span_exit_event]),
+                        [beam_liftoff_event, beam_sling_slack_event, beam_span_exit_event,
+                         beam_ground_event]),
             SLACK_BEAM: (self._beam_slack_dynamics,
                          [beam_slack_liftoff_event, beam_slack_retension_event,
-                          beam_span_exit_event]),
+                          beam_span_exit_event, beam_ground_event]),
             TAUT_GROUND: (self._grounded_taut_dynamics, [liftoff_event, ground_slack_event]),
             SLACK_GROUND: (self._grounded_slack_dynamics, [ground_retension_event]),
         }
@@ -1927,6 +1954,10 @@ class TrebuchetSimulator:
                 release_target[0] = self._release_target(float(y[2]) - float(y[0]))
                 events.insert(0, release_event)
                 release_index = 0
+            if regime not in GROUNDED_REGIMES:
+                height = (self.projectile_position_velocity(y)[0][1] if regime == TAUT
+                          else float(y[3])) - ground_y
+                landing_floor[0] = min(0.0, height - GROUND_REENTRY_SLOP)
             # Unarmed when the beam can never reach the ground, and when it is already
             # at or past that angle - scipy would otherwise fire at t0 and return a
             # zero-length segment forever.
@@ -2144,6 +2175,8 @@ class TrebuchetSimulator:
                 state[-1 - i] = 0.0
             if index == 1:  # the sling let go while the stone stayed on the arm
                 return state, SLACK_BEAM
+            if index == 3:  # the beam carried the stone down onto the ground
+                return self._beam_landing_state(launch, t, state, sling_taut=True)
             # Either the surface stopped pushing or the stone slid off an end; both
             # leave it airborne on a sling that is still loaded.
             return self._taut_or_slack(state)
@@ -2159,6 +2192,8 @@ class TrebuchetSimulator:
                 if self.constraint_tensions(t, taut_state)[0] > 1e-9:
                     return self._settle_beam(self._slack_state_from_taut(taut_state))
                 return self._settle_beam(slack_state)
+            if index == 3:  # the beam carried the stone down onto the ground
+                return self._beam_landing_state(launch, t, state, sling_taut=False)
             # Off the surface, or off the end of it: free again, sling still slack.
             return state, SLACK
 
@@ -2339,6 +2374,27 @@ class TrebuchetSimulator:
         launch.beam_contact_times.append(float(t))
         launch.beam_energy_losses.append(energy)
         return self._settle_beam(state)
+
+    def _beam_landing_state(self, launch: "LaunchSolution", t: float, y8,
+                            sling_taut: bool) -> Tuple[List[float], str]:
+        """A stone riding the beam reaching the ground: land it, and let go of the beam.
+
+        The ground wins over the beam. Holding both contacts at once would be a regime of
+        its own - sling, beam and ground all acting - and a beam pressing a stone into the
+        dirt is only a stroke from striking the dirt itself, which ends the launch anyway.
+        So the landing is priced exactly as the airborne regimes price it - through the
+        sling as well when the sling is carrying, by the ground alone when it is not - and
+        the stone continues from the ground.
+        """
+        if sling_taut:
+            state, energy = self._apply_ground_impulse(y8, radial_target=0.0)
+        else:
+            state, energy = self._grounded_state_from_slack(y8)
+        launch.ground_times.append(float(t))
+        launch.ground_energy_losses.append(energy)
+        if sling_taut:
+            return self._settle_grounded(state)
+        return state, SLACK_GROUND
 
     def _aftermath_dynamics_taut(self, t: float, y) -> List[float]:
         """Single-DOF dynamics with the counterweight coupled through the taut rope."""

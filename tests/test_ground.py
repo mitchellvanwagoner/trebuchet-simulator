@@ -92,6 +92,52 @@ def test_the_projectile_never_goes_below_the_ground(machine):
     assert checked > 30
 
 
+def test_a_stone_riding_the_beam_is_set_down_on_the_ground_rather_than_through_it():
+    """A beam low enough to reach the dirt can carry the stone riding it down into the dirt.
+
+    Neither beam-contact regime used to watch the ground. On this draw - a traditional
+    machine on a pivot lower than its arm, loaded on the ground - the stone came to rest on
+    the beam, rode it 4.9 mm under the line, slid off into TAUT already below it, where the
+    landing event is a downward crossing with no crossing left to find, and swung 137 mm
+    underground. The random sweep above stands every pivot clear of its arm, so it cannot
+    reach this shape.
+    """
+    params = TrebuchetParams(
+        machine=MachineType.TRADITIONAL,
+        counter_weight_mass=37.858293791252876, length_counterweight=0.5123868432570576,
+        arm_length=1.4791411168880968, string_length=1.9857572592176083,
+        release_angle=-0.172059576525863, pivot_height=0.5413307800065783,
+        projectile_radius=0.044089843044687715, projectile_mass=0.35515697389473283,
+        initial_arm_angle=0.2712100310291484,
+    )
+    result = simulate_trebuchet(params, t_max=5.0)
+    assert "error" not in result.metrics
+    ground_y = params.projectile_radius
+    assert _min_projectile_height(result, samples=5000) >= ground_y - 1e-6
+
+
+def test_a_stone_snatched_off_the_ground_comes_back_down_onto_it_rather_than_through_it():
+    """A segment that opens on the ground line has no downward crossing left to find.
+
+    Here a slack sling over a stone lying on the ground comes taut and picks it up at
+    4 mm/s - and the taut segment that follows opens with the stone at -1.5e-16 m, the
+    rounding of the line rather than above it. The landing event had never been positive,
+    so when the swing brought the stone straight back down it never fired, and the stone
+    went 63 mm underground. See physics.GROUND_REENTRY_SLOP.
+    """
+    params = TrebuchetParams(
+        machine=MachineType.TRADITIONAL,
+        counter_weight_mass=55.15045821206423, length_counterweight=0.8241858124568844,
+        arm_length=0.2026470069447065, string_length=1.7456157974545559,
+        release_angle=-0.4193342727601208, pivot_height=1.0928399106506046,
+        projectile_radius=0.09446962021739262, projectile_mass=0.5051261135189091,
+        initial_arm_angle=-0.5667194404709714,
+    )
+    result = simulate_trebuchet(params, t_max=1.0)
+    assert "error" not in result.metrics
+    assert _min_projectile_height(result, samples=5000) >= params.projectile_radius - 1e-6
+
+
 @pytest.mark.parametrize("projectile_radius", [0.02, 0.04, 0.05, 0.0508, 0.12])
 def test_the_launch_starts_on_the_ground_rather_than_under_it(projectile_radius):
     """The cocked pose, which is where the stone was buried before anything moved.

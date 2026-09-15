@@ -169,6 +169,7 @@ _SEG_BEAM_LIFTOFF = 8   # the beam stopped pushing: the stone leaves the arm
 _SEG_BEAM_SLACK = 9     # the sling let go while the stone stayed on the arm
 _SEG_BEAM_RETENSION = 10  # the sling came taut over a stone riding the arm
 _SEG_BEAM_SPAN = 11     # the stone slid off the end of the beam
+_SEG_BEAM_LANDING = 12  # the beam carried the stone down onto the ground
 
 # The four states a launch can be in, mirroring physics.py's TAUT / SLACK / TAUT_GROUND /
 # SLACK_GROUND. The sling is either carrying load or not, and the projectile is either on
@@ -231,6 +232,10 @@ RETENSION_CIRCLE_SLOP = 1e-12
 # is tangent to the arm by construction, so its clearance is zero to rounding and lands
 # either side by an ulp.
 BEAM_CONTACT_SLOP = 1e-12
+
+# physics.GROUND_REENTRY_SLOP: how far under where an airborne segment opened its landing
+# test sits, in metres, when the stone opens that segment on the ground line or below it.
+GROUND_REENTRY_SLOP = 1e-9
 
 # physics.TAUT_HANDOFF_TENSION: smallest sling tension that accepts a hand-off into the
 # taut regime. Not zero - at exactly zero the new segment trips its own slack event at t0.
@@ -1213,6 +1218,11 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
     g_prev = (alpha - theta) - release_target
     gg_prev = theta - theta_arm_ground
     gl_prev = l_a * np.sin(theta) + l_s * np.sin(alpha) + h_T - ground_y
+    # Where the landing test puts the ground: the real line, unless the segment opened on
+    # it or under it - see physics.GROUND_REENTRY_SLOP. `land_y` replaces ground_y in the
+    # landing test and nowhere else.
+    land_y = ground_y + min(0.0, gl_prev - GROUND_REENTRY_SLOP)
+    gl_prev = gl_prev + ground_y - land_y
     # Clearance from the beam. The cocked hanging pose is tangent to the arm by
     # construction (see physics.BEAM_CONTACT_SLOP), so a segment can open with this at
     # the rounding of zero; the launch loop settles that pose before stepping, and what
@@ -1418,7 +1428,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                         break
                     lo_s = hi_s
 
-            gl_new = l_a * np.sin(yn_1) + l_s * np.sin(yn_3) + h_T - ground_y
+            gl_new = l_a * np.sin(yn_1) + l_s * np.sin(yn_3) + h_T - land_y
             s_land = 2.0
             if gl_prev > 0.0 and gl_new <= 0.0:
                 lo, hi = 0.0, 1.0
@@ -1426,7 +1436,7 @@ def _integrate_taut_segment(t0, theta, theta_dot, alpha, alpha_dot, psi, psi_dot
                     mid = 0.5 * (lo + hi)
                     th = _hermite(theta, yn_1, f0_1, k7_1, h, mid)
                     al = _hermite(alpha, yn_3, f0_3, k7_3, h, mid)
-                    if l_a * np.sin(th) + l_s * np.sin(al) + h_T - ground_y > 0.0:
+                    if l_a * np.sin(th) + l_s * np.sin(al) + h_T - land_y > 0.0:
                         lo = mid
                     else:
                         hi = mid
@@ -1512,11 +1522,17 @@ def _eight_event(y, c, projectile_mass, h_T, regime, which):
       _SLACK_BEAM    1 the beam stops pushing                      2 re-tension
 
     and a third, `which == 3`, which only the beam regimes and _SLACK arm: sliding off the
-    end of the beam for the former, and reaching the beam at all for the latter.
+    end of the beam for the former, and reaching the beam at all for the latter. A fourth,
+    `which == 4`, is the beam regimes' alone: the beam carrying the stone down onto the
+    ground (see beam_ground_event in physics.py).
 
     Re-tension is the one event that fires on the way *up*, so it is returned negated and
     the caller can test every event the same way.
     """
+    if which == 4:
+        if regime == _TAUT_BEAM or regime == _SLACK_BEAM:
+            return y[3] - c[22]
+        return 1.0
     if regime == _TAUT_BEAM:
         if which == 3:
             return _beam_span_margin(y[0], y[2], y[3], h_T, c[0], c[17])
@@ -1597,6 +1613,8 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
     # A third: the beam regimes watch for sliding off an end, and _SLACK watches for
     # reaching the beam in the first place.
     has_ev3 = regime == _TAUT_BEAM or regime == _SLACK_BEAM or regime == _SLACK
+    # And a fourth, the beam regimes alone: carried down onto the ground.
+    has_ev4 = regime == _TAUT_BEAM or regime == _SLACK_BEAM
     n = 8 + N_QUADRATURE
     k1 = np.empty(n); k2 = np.empty(n); k3 = np.empty(n); k4 = np.empty(n)
     k5 = np.empty(n); k6 = np.empty(n); k7 = np.empty(n)
@@ -1631,6 +1649,16 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
     e1_prev = _eight_event(y, c, projectile_mass, h_T, regime, 1)
     e2_prev = _eight_event(y, c, projectile_mass, h_T, regime, 2) if has_ev2 else 1.0
     e3_prev = _eight_event(y, c, projectile_mass, h_T, regime, 3) if has_ev3 else 1.0
+    e4_prev = _eight_event(y, c, projectile_mass, h_T, regime, 4) if has_ev4 else 1.0
+    # The landing tests - event 2 in _SLACK, event 4 in the beam regimes - put the ground
+    # just under where the stone opened, when it opened on the line or below it (see
+    # physics.GROUND_REENTRY_SLOP). The offsets are zero everywhere else.
+    land_off = 0.0
+    if regime == _SLACK or has_ev4:
+        land_off = min(0.0, y[3] - c[22] - GROUND_REENTRY_SLOP)
+    off2 = land_off if regime == _SLACK else 0.0
+    e2_prev -= off2
+    e4_prev -= land_off
     retension_shrinks = 0
     # Whether this segment opened on the sling circle - see RETENSION_CIRCLE_SLOP and the
     # step rejection below.
@@ -1738,7 +1766,8 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                         hi = mid
                 s_ev1 = 0.5 * (lo + hi)
 
-            e2_new = _eight_event(yn, c, projectile_mass, h_T, regime, 2) if has_ev2 else 1.0
+            e2_new = (_eight_event(yn, c, projectile_mass, h_T, regime, 2) - off2
+                      if has_ev2 else 1.0)
             s_ev2 = 2.0
             if has_ev2 and e2_prev > 0.0 and e2_new <= 0.0:
                 lo, hi = 0.0, 1.0
@@ -1746,7 +1775,7 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                     mid = 0.5 * (lo + hi)
                     for i in range(n):
                         stage[i] = _hermite(y[i], yn[i], k1[i], k7[i], h, mid)
-                    if _eight_event(stage, c, projectile_mass, h_T, regime, 2) > 0.0:
+                    if _eight_event(stage, c, projectile_mass, h_T, regime, 2) - off2 > 0.0:
                         lo = mid
                     else:
                         hi = mid
@@ -1793,7 +1822,20 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                         hi = mid
                 s_ev3 = 0.5 * (lo + hi)
 
-            s = min(min(s_ev1, s_ev2), min(s_ev3, s_ground))
+            e4_new = (_eight_event(yn, c, projectile_mass, h_T, regime, 4) - land_off
+                      if has_ev4 else 1.0)
+            s_ev4 = 2.0
+            if has_ev4 and e4_prev > 0.0 and e4_new <= 0.0:
+                lo, hi = 0.0, 1.0
+                for _ in range(50):
+                    mid = 0.5 * (lo + hi)
+                    if _hermite(y[3], yn[3], k1[3], k7[3], h, mid) - c[22] - land_off > 0.0:
+                        lo = mid
+                    else:
+                        hi = mid
+                s_ev4 = 0.5 * (lo + hi)
+
+            s = min(min(s_ev1, s_ev2), min(min(s_ev3, s_ev4), s_ground))
             if s <= 1.0:
                 # Same tie-break order the reference engine's event list gives: the
                 # regime's own transitions in order, then the beam striking the ground.
@@ -1815,6 +1857,8 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
                         status = _SEG_LANDING
                 elif s_ev3 <= s:
                     status = _SEG_BEAM_CONTACT if regime == _SLACK else _SEG_BEAM_SPAN
+                elif s_ev4 <= s:
+                    status = _SEG_BEAM_LANDING
                 else:
                     status = _SEG_ARM_GROUND
                 for i in range(n):
@@ -1829,6 +1873,7 @@ def _integrate_eight_segment(t0, y, c, regime, t_max, rtol, atol,
             e1_prev = e1_new
             e2_prev = e2_new
             e3_prev = e3_new
+            e4_prev = e4_new
 
             factor = MAX_FACTOR if err_norm == 0.0 else min(MAX_FACTOR, SAFETY * err_norm**ERROR_EXPONENT)
             h = h * factor
@@ -2240,6 +2285,31 @@ def _integrate_launch(theta0, alpha0, psi0, c, release_angle, t_max, rtol, atol,
                     psi, psi_dot = taut[4], taut[5]
             else:
                 regime = _SLACK
+            continue
+        if status == _SEG_BEAM_LANDING:
+            # The beam carried the stone down onto the ground. The ground wins over the
+            # beam, and the landing is priced the way physics._beam_landing_state prices
+            # it: through the sling as well when it is carrying, by the ground alone when not.
+            if regime == _TAUT_BEAM:
+                ground_energy += _apply_ground_impulse(
+                    slack, c, projectile_mass, counter_weight_mass, has_pulley, h_T, 0.0,
+                    landed
+                )
+                regime = _settle_grounded(landed, c, projectile_mass, h_T, taut)
+                if regime == _TAUT:
+                    theta, theta_dot = taut[0], taut[1]
+                    alpha, alpha_dot = taut[2], taut[3]
+                    psi, psi_dot = taut[4], taut[5]
+                else:
+                    for i in range(8 + N_QUADRATURE):
+                        slack[i] = landed[i]
+            else:
+                ground_energy += 0.5 * projectile_mass * slack[5] * slack[5]
+                slack[3] = ground_y
+                slack[5] = 0.0
+                for i in range(N_QUADRATURE):
+                    slack[8 + i] = 0.0
+                regime = _SLACK_GROUND
             continue
         if status == _SEG_BEAM_RETENSION:
             # The sling came taut over a stone riding the arm.
