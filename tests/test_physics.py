@@ -4,6 +4,7 @@ import numpy
 import pytest
 
 from trebuchet_sim import config
+from trebuchet_sim import physics
 from trebuchet_sim.config import DEFAULT_OPTIMIZABLE_PARAMS, TrebuchetParams
 from trebuchet_sim.physics import simulate_trebuchet
 
@@ -29,6 +30,62 @@ def test_energy_history_is_populated_when_tracking_enabled():
     assert result.energy_history[0]["total"] == math.fsum(
         [result.energy_history[0]["kinetic"], result.energy_history[0]["potential"]]
     )
+
+
+def test_energy_history_runs_past_the_release():
+    """The launch is the first half of the story; the plot used to stop there.
+
+    What the throw did with the energy happens afterwards - the stone trading speed for
+    height and then handing it all to the ground, the counterweight settling - so the
+    history carries on to the landing or POST_RELEASE_ENERGY_SECONDS, whichever is later.
+    """
+    result = simulate_trebuchet(default_params(), track_energy=True)
+    history = result.energy_history
+    t_release = result.metrics["t_release"]
+    expected_end = t_release + max(result.metrics["flight_time"], physics.POST_RELEASE_ENERGY_SECONDS)
+
+    assert history[-1]["time"] == pytest.approx(expected_end)
+    times = [entry["time"] for entry in history]
+    assert times == sorted(times)
+
+    # Continuous across the release: the sling letting go moves nothing and costs nothing,
+    # it just stops the two halves being one calculation.
+    before = [e for e in history if e["time"] <= t_release][-1]
+    after = [e for e in history if e["time"] > t_release][0]
+    assert after["total"] == pytest.approx(before["total"], rel=1e-3)
+
+    # And it ends with the stone down: its kinetic energy went to the ground, not downrange.
+    assert history[-1]["proj_ke"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_short_throw_still_gets_the_full_post_release_window():
+    """A stone that lands in under two seconds leaves the machine still swinging, so the
+    floor is what the history runs to rather than the flight.
+
+    A pin set well past full extension throws flat and low, which is the short flight the
+    shipped machine does not have (its stone is in the air for 4.7 s).
+    """
+    result = simulate_trebuchet(
+        default_params(counter_weight_mass=6.0, release_angle=-2.0), track_energy=True
+    )
+    t_release = result.metrics["t_release"]
+
+    assert result.metrics["flight_time"] < physics.POST_RELEASE_ENERGY_SECONDS
+    assert result.energy_history[-1]["time"] == pytest.approx(
+        t_release + physics.POST_RELEASE_ENERGY_SECONDS
+    )
+
+
+def test_the_post_release_tail_keeps_measuring_the_counterweight():
+    """The counterweight is still moving after the release - on the traditional machine it
+    is swinging on its pin - and its two energies are what the plot follows there."""
+    result = simulate_trebuchet(default_params(), track_energy=True)
+    t_release = result.metrics["t_release"]
+    tail = [e for e in result.energy_history if e["time"] > t_release]
+
+    assert any(e["cw_ke"] > 0.0 for e in tail)
+    # It keeps descending after the release, so its potential energy keeps falling.
+    assert tail[-1]["cw_pe"] < tail[0]["cw_pe"]
 
 
 def test_energy_history_is_none_when_tracking_disabled():
@@ -224,8 +281,10 @@ def test_sling_snap_only_ever_removes_energy():
     totals = np.array([entry["total"] for entry in result.energy_history])
     times = np.array([entry["time"] for entry in result.energy_history])
 
-    # Total energy is monotonically non-increasing across the whole launch: drag,
-    # joint friction and the snaps all remove energy and nothing adds any. The
+    # Total energy is monotonically non-increasing across the whole history - the launch
+    # and the settling after it alike: drag, joint friction, the snaps, the stone reaching
+    # the ground and the counterweight landing on it all remove energy, and nothing adds
+    # any. The
     # tolerance is scaled to the energy in the machine (~1e-7 J here) purely to absorb
     # float noise - a snap behaving like a spring would show up as a jump of order the
     # snap loss itself, ~1 J.

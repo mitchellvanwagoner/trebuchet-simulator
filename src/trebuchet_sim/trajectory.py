@@ -32,6 +32,18 @@ class BallisticTrajectory:
             x, y, _vx, _vy = self.solution.y[:, -1]
         return x, max(self.ground_level, y)
 
+    def velocity_at(self, t: float) -> Tuple[float, float]:
+        """Velocity (vx, vy) at time t since release; zero once the stone has landed.
+
+        The flight ends at the impact event, so past `flight_time` the integrator has
+        nothing to say and the stone is lying still - which is what the energy plot needs
+        to show it having given its kinetic energy to the ground rather than keeping it.
+        """
+        if self.solution is None or t >= self.flight_time:
+            return 0.0, 0.0
+        _x, _y, vx, vy = self.solution.sol(t)
+        return float(vx), float(vy)
+
 
 def integrate_ballistic_trajectory(
     x0: float,

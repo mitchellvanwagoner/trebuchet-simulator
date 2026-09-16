@@ -76,9 +76,10 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     # defaults can never return a beam that digs itself into the ground - see
     # physics._first_arm_ground_angle, which ends such a launch with no throw at all. The
     # floor is the traditional machine's own 1.8 m default arm, which has to stay inside
-    # its own search range. PARAM_LIMITS still reaches 10 m for anyone who raises the pivot
-    # to match, but there is not much waiting up there: holding this cap and sweeping the
-    # pivot, a pulley machine measures 93.8 / 93.5 / 105.0 / 105.9 / 106.1 / 107.6 m at
+    # its own search range. A param_bounds override lifts it for anyone who raises the
+    # pivot to match - PARAM_LIMITS puts no ceiling on it - but there is not much waiting up
+    # there: holding this cap and sweeping the pivot, a pulley machine measures
+    # 93.8 / 93.5 / 105.0 / 105.9 / 106.1 / 107.6 m at
     # 1.0 / 1.5 / 2.0 / 2.5 / 3.0 / 4.0 m, and the winning arm stops growing at about
     # 1.65 m - past a 2 m pivot the ground has stopped deciding the design at all.
     "arm_length": (0.1, 2.0),              # m
@@ -90,8 +91,8 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     # For the traditional machine this range is the *only* limit. That machine lays its
     # sling out from the tip rather than tucking it along the arm, and a real one is often
     # slung as long as its long arm or longer, so nothing couples the two lengths - a
-    # caller who wants a longer sling than this raises the range (param_bounds reaches
-    # PARAM_LIMITS' 10 m) rather than lengthening the arm to earn it.
+    # caller who wants a longer sling than this raises the range (param_bounds has no
+    # ceiling to reach) rather than lengthening the arm to earn it.
     "string_length": (0.1, 2.0),           # m
     # The release pin's angle, measured from the arm to the sling (see
     # config.TrebuchetParams.release_angle), not the arm's angle in the world - so the
@@ -107,18 +108,24 @@ PARAM_BOUNDS: Dict[str, Tuple[float, float]] = {
     "length_counterweight": (0.05, 1.0),   # m
 }
 
-# How far a caller may move a search range with OptimizationConfig.param_bounds, which is
-# wider than the defaults above: PARAM_BOUNDS is where the search starts looking, while
-# these are the values the model can still be trusted at. The lower ends are what stops a
-# zero or negative length reaching the equations of motion; the upper ends are loose
-# enough for a genuinely large machine. The arm can sweep a full turn before releasing.
+# How far a caller may move a search range with OptimizationConfig.param_bounds, and what
+# the dashboard's design-variable boxes accept. PARAM_BOUNDS is where the search starts
+# looking; these are not a cap on the machine. Every size and mass runs from zero up with no
+# ceiling, because a search range is the user's call about where a machine worth building
+# lies, and a limit here only ever turned a large machine away. Zero itself is allowed and
+# is simply not a machine: both objectives score a zero-sized design INVALID_COST rather
+# than hand it to the equations of motion. A range still has to be finite - differential
+# evolution samples uniformly across it - which OptimizationConfig checks separately.
+#
+# The release pin's angle is the one design variable that is naturally negative, so it keeps
+# a full turn rather than a floor of zero. That leaves out no pin position at all.
 PARAM_LIMITS: Dict[str, Tuple[float, float]] = {
-    "counter_weight_mass": (0.1, 1000.0),           # kg
-    "pulley_radius": (0.001, 2.0),                  # m
-    "arm_length": (0.05, 10.0),                     # m
-    "string_length": (0.05, 10.0),                  # m
+    "counter_weight_mass": (0.0, np.inf),           # kg
+    "pulley_radius": (0.0, np.inf),                 # m
+    "arm_length": (0.0, np.inf),                    # m
+    "string_length": (0.0, np.inf),                 # m
     "release_angle": (np.radians(-180), np.radians(180)),  # rad
-    "length_counterweight": (0.01, 5.0),            # m
+    "length_counterweight": (0.0, np.inf),          # m
 }
 
 
@@ -361,6 +368,11 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     # long arm or longer. Nothing about that pose degenerates, so its sling is bounded by
     # the search range alone (PARAM_BOUNDS / param_bounds) and by nothing here.
     if params.has_pulley and params.string_length > 0.95 * params.arm_length:
+        return INVALID_COST
+    # Mirrored from fastsim._score: a design variable at zero is no machine at all, and the
+    # search ranges reach down to zero (see PARAM_LIMITS).
+    linkage = params.pulley_radius if params.has_pulley else params.length_counterweight
+    if min(params.counter_weight_mass, linkage, params.arm_length, params.string_length) <= 0.0:
         return INVALID_COST
 
     try:

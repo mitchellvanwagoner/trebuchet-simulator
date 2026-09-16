@@ -261,11 +261,6 @@ DASHBOARD_CSS = f"""
   .st-key-anim_panel [data-testid="stElementContainer"] {{ flex: 1 1 auto !important; }}
   .st-key-anim_panel [data-testid="stElementContainer"],
   .st-key-anim_panel iframe {{ height: 100% !important; width: 100%; }}
-  .st-key-energy_panel {{ flex: none; }}
-  .st-key-energy_panel img {{
-    width: 100% !important; height: auto !important; display: block;
-    border-radius: 9px; border: 1px solid {BORDER};
-  }}
 
   /* ---------- Column: results (right) ---------- */
   [data-testid="stLayoutWrapper"]:has(> .st-key-results_panel) {{ flex: 1 1 0; min-height: 0; }}

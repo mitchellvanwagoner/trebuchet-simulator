@@ -15,11 +15,21 @@ import streamlit as st
 
 from trebuchet_sim.config import TrebuchetParams
 from trebuchet_sim.web import theme
-from trebuchet_sim.physics import SimulationResult, TrebuchetSimulator, sample_component_positions
+from trebuchet_sim.physics import (
+    POST_RELEASE_ENERGY_SECONDS,
+    SimulationResult,
+    TrebuchetSimulator,
+    sample_component_positions,
+)
 from trebuchet_sim.trajectory import integrate_ballistic_trajectory
+from trebuchet_sim.visualization import dark_plot_palette, visible_energy_series
 
 LAUNCH_SAMPLES = 150
 BALLISTIC_SAMPLES = 150
+# The machine settles for longer than the stone flies on a short throw, and the energy plot
+# runs that far too (physics.POST_RELEASE_ENERGY_SECONDS), so the machine is sampled over
+# whichever window is longer rather than over the flight alone.
+SETTLE_SAMPLES = 200
 
 # Three.js is vendored (pinned r128 - `examples/js/OrbitControls.js` was removed
 # from newer releases) and inlined into the animation HTML so it renders without
@@ -91,8 +101,10 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
     # with release_frames. Falls back to holding the release pose if the caller didn't
     # request aftermath tracking (result.aftermath is None).
     aftermath_frames = []
+    settle_time = 0.0
     if result.aftermath is not None and flight_time > 0:
-        t_aftermath = np.linspace(0, flight_time, BALLISTIC_SAMPLES)
+        settle_time = max(flight_time, POST_RELEASE_ENERGY_SECONDS)
+        t_aftermath = np.linspace(0, settle_time, SETTLE_SAMPLES)
         for t in t_aftermath:
             theta, theta_dot, regime = result.aftermath.state_at(float(t))
             # psi carried through as well: a pinned counterweight keeps swinging about
@@ -116,6 +128,7 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
     last_launch = launch_frames[-1] if launch_frames else None
 
     return {
+        "energy": _energy_payload(result),
         "geometry": {
             "pivot_height": params.pivot_height,
             "arm_length": params.arm_length,
@@ -135,9 +148,45 @@ def _build_timeline(params: TrebuchetParams, result: SimulationResult) -> dict:
         "hold_cw_pin": last_launch["cw_pin"] if last_launch else [0.0, 0.0],
         "t_release": t_release,
         "flight_time": flight_time,
-        "total_time": t_release + flight_time,
+        # The clock every part of the page shares, the energy chart included: the launch,
+        # then the longer of the stone's flight and the machine's settling.
+        "total_time": t_release + max(flight_time, settle_time),
         "final_distance": final_distance,
         "release_occurred": release_occurred,
+    }
+
+
+def _energy_payload(result: SimulationResult) -> "dict | None":
+    """The energy history as series the page can draw, or None when none was tracked.
+
+    Shipped with the frames rather than rendered to an image because the chart plays: it
+    draws itself up to the animation's current time, off the same clock, so a line arriving
+    at its peak and the arm reaching the top are the same instant on screen. Which series
+    appear, and in which colour, is visualization's list (see visible_energy_series), so the
+    CLI's saved figure and this chart never disagree.
+    """
+    history = result.energy_history
+    if not history:
+        return None
+    palette = dark_plot_palette()
+    return {
+        "t": [float(sample["time"]) for sample in history],
+        "series": [
+            {
+                "label": entry.short,
+                "color": palette[entry.role],
+                "dashed": entry.dashed,
+                # Which of the chart's two strips it belongs to, and the reason the chart has
+                # two: the counterweight's store of energy dwarfs the components it becomes,
+                # so they cannot share a scale (see visualization.ENERGY_SERIES).
+                "panel": entry.panels[0],
+                "values": [float(sample[entry.key]) for sample in history],
+            }
+            for entry in visible_energy_series(history)
+        ],
+        "release_color": palette["release"],
+        "axis_color": palette["muted"],
+        "grid_color": palette["grid"],
     }
 
 
@@ -172,10 +221,21 @@ _HTML_TEMPLATE = r"""
   html, body { margin: 0; padding: 0; overflow: hidden; background: __SCENE_BG__; }
   /* 100vh: fill whatever height the host gives the iframe (the Streamlit app
      stretches it with CSS), falling back to the height attribute otherwise. */
-  #treb-root { position: relative; width: 100%; height: 100vh; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
-  #treb-canvas { width: 100%; height: 100%; display: block; }
+  #treb-root {
+    position: relative; width: 100%; height: 100vh; display: flex; flex-direction: column;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  /* The renderer writes this one explicit pixel dimensions, so it is the child that does
+     not flex: the chart and the control bar take the height they need and the scene is
+     given what is left (see viewportSize). */
+  #treb-canvas { display: block; flex: 0 0 auto; }
+  #treb-chart-wrap {
+    flex: 0 0 auto; position: relative;
+    background: rgba(8, 13, 22, 0.82); border-top: 1px solid __BORDER__;
+  }
+  #treb-chart { display: block; width: 100%; height: 100%; }
   #treb-controls {
-    position: absolute; left: 0; right: 0; bottom: 0;
+    flex: 0 0 auto;
     display: flex; align-items: center; gap: 10px;
     padding: 7px 12px; background: rgba(8, 13, 22, 0.82); backdrop-filter: blur(6px);
     color: __TEXT__; font-size: 12.5px; border-top: 1px solid __BORDER__;
@@ -194,6 +254,7 @@ _HTML_TEMPLATE = r"""
 <body>
 <div id="treb-root">
   <canvas id="treb-canvas"></canvas>
+  <div id="treb-chart-wrap"><canvas id="treb-chart"></canvas></div>
   <div id="treb-controls">
     <button id="treb-playpause">Pause</button>
     <button id="treb-view">2D view</button>
@@ -224,6 +285,20 @@ _HTML_TEMPLATE = r"""
 
   const root = document.getElementById("treb-root");
   const canvas = document.getElementById("treb-canvas");
+  const chartWrap = document.getElementById("treb-chart-wrap");
+  const chartCanvas = document.getElementById("treb-chart");
+  const controlsBar = document.getElementById("treb-controls");
+
+  // The energy plot lives in this page rather than beside it precisely so it can share the
+  // clock below; a run with no tracked history simply has no chart and gives the scene the
+  // whole frame.
+  const ENERGY = DATA.energy;
+  const CHART_HEIGHT = 208;
+  if (ENERGY) {
+    chartWrap.style.height = CHART_HEIGHT + "px";
+  } else {
+    chartWrap.style.display = "none";
+  }
 
   // ---------- Scene setup ----------
   const scene = new THREE.Scene();
@@ -239,8 +314,14 @@ _HTML_TEMPLATE = r"""
   // Use the iframe's own viewport size, not root.clientWidth/Height: the
   // component's DOM layout may not have settled yet on first script execution,
   // but window.inner{Width,Height} reflect the host-assigned iframe size immediately.
+  // The scene takes the height the chart and the control bar leave it. Their heights are
+  // known here - one is set just above, the other is a styled bar already in the DOM -
+  // where the canvas's own is not yet.
   function viewportSize() {
-    return [window.innerWidth || root.clientWidth || 800, window.innerHeight || root.clientHeight || __HEIGHT__];
+    const w = window.innerWidth || root.clientWidth || 800;
+    const h = (window.innerHeight || root.clientHeight || __HEIGHT__)
+      - (ENERGY ? CHART_HEIGHT : 0) - (controlsBar.offsetHeight || 44);
+    return [w, Math.max(h, 140)];
   }
   let [vw, vh] = viewportSize();
 
@@ -721,7 +802,10 @@ _HTML_TEMPLATE = r"""
         cwPos = DATA.hold_counterweight;
         cwPin = DATA.hold_cw_pin;
       }
-      if (t >= totalTime) {
+      // Against the flight rather than the whole clock: the timeline runs to the later of
+      // the landing and the machine settling, so on a short throw the stone is down well
+      // before playback ends and the label would otherwise still claim it was in the air.
+      if (t - tRelease >= DATA.flight_time - 1e-9) {
         phase = "Landed";
         projPos = releaseFrames.length ? releaseFrames[releaseFrames.length - 1].projectile : DATA.hold_arm_tip;
       } else {
@@ -759,7 +843,163 @@ _HTML_TEMPLATE = r"""
     document.getElementById("treb-phase").textContent = phase;
     document.getElementById("treb-time").textContent = t.toFixed(2) + " / " + totalTime.toFixed(2) + " s";
     document.getElementById("treb-scrub").value = Math.round((t / totalTime) * 1000);
+    drawChart(t);
   }
+
+  // ---------- Energy chart ----------
+  // Drawn here, off the same clock as the scene, rather than shipped as a finished picture:
+  // each line extends to wherever playback has reached, so a curve turning over and the arm
+  // reaching the top are visibly the same instant, and scrubbing moves both together.
+  const chartCtx = ENERGY ? chartCanvas.getContext("2d") : null;
+  let chartW = 0, chartH = 0;
+  // The history can outrun the animation - it always covers the settling machine, which on
+  // a long throw ends before the stone lands - so the axis spans whichever is longer and
+  // the playhead simply stops short.
+  const chartSpan = ENERGY ? Math.max(totalTime, ENERGY.t[ENERGY.t.length - 1] || 0) : totalTime;
+
+  // One strip per panel, each on its own scale, for the reason the figure has always had two
+  // panels: the counterweight's store of energy is what the whole throw is spent out of -
+  // over a kilojoule on the shipped pulley machine - where the components it turns into are
+  // tens of joules, and on one pair of axes those are a flat line along the bottom. Each
+  // range is fixed for the run and padded, since a range that grew with the playhead would
+  // rescale the axes underneath the lines as they draw, which reads as the curves moving.
+  const strips = !ENERGY ? [] : [1, 2].map((panel) => {
+    const members = ENERGY.series.filter((s) => s.panel === panel);
+    let lo = 0, hi = 0;
+    members.forEach((s) => s.values.forEach((v) => {
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }));
+    const pad = (hi - lo) * 0.08 || 1;
+    return { series: members, min: lo - pad, max: hi + pad };
+  }).filter((strip) => strip.series.length > 0);
+
+  function layoutChart() {
+    if (!chartCtx) return;
+    const dpr = window.devicePixelRatio || 1;
+    chartW = chartWrap.clientWidth || window.innerWidth || 600;
+    chartH = chartWrap.clientHeight || CHART_HEIGHT;
+    chartCanvas.width = Math.round(chartW * dpr);
+    chartCanvas.height = Math.round(chartH * dpr);
+    chartCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function energyValueAt(series, t) {
+    const ts = ENERGY.t;
+    if (!ts.length || t < ts[0] || t > ts[ts.length - 1]) return null;
+    let lo = 0, hi = ts.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (ts[mid] <= t) lo = mid; else hi = mid;
+    }
+    const span = ts[hi] - ts[lo];
+    const frac = span > 1e-9 ? (t - ts[lo]) / span : 0;
+    return series.values[lo] + (series.values[hi] - series.values[lo]) * frac;
+  }
+
+  // Draws one strip's legend and returns where its plot area can start; the entries wrap
+  // onto as many rows as the iframe's width needs.
+  function drawChartLegend(ctx, series, y) {
+    ctx.font = "10px -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.textBaseline = "middle";
+    let x = 8;
+    series.forEach((s) => {
+      const itemW = 18 + ctx.measureText(s.label).width + 12;
+      if (x + itemW > chartW - 4 && x > 8) { x = 8; y += 12; }
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash(s.dashed ? [4, 3] : []);
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 14, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = ENERGY.axis_color;
+      ctx.fillText(s.label, x + 18, y);
+      x += itemW;
+    });
+    return y + 9;
+  }
+
+  function drawChart(t) {
+    if (!chartCtx || !chartW || !strips.length) return;
+    chartCtx.clearRect(0, 0, chartW, chartH);
+    const axisRoom = 13;   // the time labels, which only the bottom strip carries
+    const each = (chartH - axisRoom) / strips.length;
+    strips.forEach((strip, i) => {
+      drawStrip(chartCtx, strip, i * each, (i + 1) * each, t, i === strips.length - 1);
+    });
+  }
+
+  function drawStrip(ctx, strip, boxTop, boxBottom, t, isLast) {
+    const top = drawChartLegend(ctx, strip.series, boxTop + 10);
+    const left = 46, right = chartW - 8, bottom = boxBottom - 3;
+    if (bottom - top < 10 || right - left < 24) return;  // too short to plot into
+
+    const xOf = (tt) => left + ((right - left) * tt) / chartSpan;
+    const yOf = (v) => bottom - ((bottom - top) * (v - strip.min)) / (strip.max - strip.min);
+
+    ctx.font = "9px -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.strokeStyle = ENERGY.grid_color;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, top); ctx.lineTo(left, bottom); ctx.lineTo(right, bottom);
+    ctx.stroke();
+
+    ctx.fillStyle = ENERGY.axis_color;
+    ctx.textBaseline = "middle";
+    ctx.fillText(strip.max.toFixed(0) + " J", 4, top + 4);
+    ctx.fillText(strip.min.toFixed(0), 4, bottom - 4);
+    if (isLast) {
+      ctx.textBaseline = "top";
+      ctx.fillText("0 s", left, bottom + 3);
+      const endLabel = chartSpan.toFixed(1) + " s";
+      ctx.fillText(endLabel, right - ctx.measureText(endLabel).width, bottom + 3);
+    }
+
+    // Zero, when the axes straddle it: a component going negative - the counterweight
+    // below the pivot it is measured from - reads differently from one merely getting small.
+    if (strip.min < 0 && strip.max > 0) {
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(left, yOf(0)); ctx.lineTo(right, yOf(0)); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (tRelease > 0 && tRelease < chartSpan) {
+      ctx.strokeStyle = ENERGY.release_color;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(xOf(tRelease), top); ctx.lineTo(xOf(tRelease), bottom); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    strip.series.forEach((s) => {
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = s.dashed ? 1.3 : 1.7;
+      ctx.setLineDash(s.dashed ? [4, 3] : []);
+      ctx.beginPath();
+      let drawn = false;
+      for (let i = 0; i < ENERGY.t.length; i++) {
+        if (ENERGY.t[i] > t) break;
+        const px = xOf(ENERGY.t[i]), py = yOf(s.values[i]);
+        if (drawn) ctx.lineTo(px, py); else { ctx.moveTo(px, py); drawn = true; }
+      }
+      // Finish exactly at the playhead rather than at the last sample behind it, so the
+      // head of the line tracks the machine instead of stepping sample to sample.
+      const head = energyValueAt(s, t);
+      if (head !== null) {
+        const px = xOf(t), py = yOf(head);
+        if (drawn) ctx.lineTo(px, py); else ctx.moveTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    const playX = xOf(Math.min(t, chartSpan));
+    ctx.strokeStyle = ENERGY.axis_color;
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(playX, top); ctx.lineTo(playX, bottom); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  layoutChart();
 
   // ---------- Playback loop ----------
   let playing = true;
@@ -881,6 +1121,10 @@ _HTML_TEMPLATE = r"""
     camera.updateProjectionMatrix();
     if (!is3D) adjustAspect2D();
     renderer.setSize(vw, vh);
+    // The chart is a bitmap sized in device pixels, so a resize has to re-measure it and
+    // redraw at the current time rather than let the browser stretch the old one.
+    layoutChart();
+    drawChart(currentTime);
   });
 })();
 </script>

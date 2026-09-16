@@ -1,5 +1,7 @@
 """Trebuchet animation and energy-plot visualization."""
 
+from typing import NamedTuple
+
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -185,7 +187,7 @@ def save_animation_gif(anim: FuncAnimation, filename: str, fps: int = 30) -> Non
 # Dark palette for the web dashboard's embedded energy figure, kept in step with
 # web/theme.py. Imported lazily inside build_energy_figure so this module (used
 # by the CLI, which never touches the web package) keeps no web dependency.
-def _dark_plot_palette() -> dict:
+def dark_plot_palette() -> dict:
     from trebuchet_sim.web import theme
 
     return {
@@ -216,6 +218,51 @@ _LIGHT_PLOT_PALETTE = {
 }
 
 
+class EnergySeries(NamedTuple):
+    """One line on the energy plot, in the terms both renderings need.
+
+    `role` indexes the palettes above rather than naming a colour, so the light (CLI) and
+    dark (dashboard) versions stay in step. `panels` is which of the matplotlib figure's two
+    panels draw it - the counterweight appears in both, as the machine's store of energy up
+    top and as one component of the breakdown below - and the dashboard's animated chart
+    (web/animation3d.py) draws the whole list on one pair of axes.
+    """
+
+    key: str
+    label: str
+    short: str
+    role: str
+    dashed: bool
+    panels: tuple
+
+
+ENERGY_SERIES = (
+    EnergySeries("total", "Total Energy", "Total", "total", False, (1,)),
+    EnergySeries("proj_ke", "Projectile KE", "Proj KE", "proj", False, (2,)),
+    EnergySeries("arm_ke", "Arm KE", "Arm KE", "arm", False, (2,)),
+    EnergySeries("cw_ke", "Counterweight KE", "CW KE", "cw", False, (2,)),
+    EnergySeries("pulley_ke", "Pulley KE", "Pulley", "pulley", False, (2,)),
+    EnergySeries("proj_pe", "Projectile PE", "Proj PE", "proj", True, (2,)),
+    EnergySeries("arm_pe", "Arm PE", "Arm PE", "arm", True, (2,)),
+    # The top panel's own pair, and why there are two panels at all: this is the budget the
+    # throw is spent out of - over a kilojoule on the shipped pulley machine - where the
+    # components above are tens of joules. On one scale they would be a line along the axis.
+    EnergySeries("cw_pe", "Counterweight PE", "CW PE", "cw", True, (1,)),
+)
+
+
+def visible_energy_series(history: list) -> list:
+    """The series worth drawing for the machine this history came from.
+
+    The traditional machine has no pulley, so its pulley term is identically zero - a flat
+    line along the axis, crowding a legend that has to name it. Read off the history rather
+    than from the params, so anything holding a history can ask (the figure is handed one
+    without the machine that produced it).
+    """
+    has_pulley = any(sample["pulley_ke"] > 0.0 for sample in history)
+    return [series for series in ENERGY_SERIES if has_pulley or series.key != "pulley_ke"]
+
+
 def _legend_above(ax, ncol: int, fontsize: int) -> None:
     """Put an axes' legend in a horizontal strip just above the plot area.
 
@@ -244,7 +291,7 @@ def build_energy_figure(result: SimulationResult, compact: bool = False, dark: b
     """
     history = result.energy_history
     times = [e["time"] for e in history]
-    palette = _dark_plot_palette() if dark else _LIGHT_PLOT_PALETTE
+    palette = dark_plot_palette() if dark else _LIGHT_PLOT_PALETTE
 
     if compact:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 3.2))
@@ -264,16 +311,23 @@ def build_energy_figure(result: SimulationResult, compact: bool = False, dark: b
         return short if compact else full
 
     total_energies = [e["total"] for e in history]
-    ax1.plot(times, total_energies, "-", color=palette["total"], label=name("Total Energy", "Total"), linewidth=2.5, alpha=0.95)
-    ax1.plot(times, [e["cw_pe"] for e in history], "--", color=palette["cw"], label=name("Counterweight PE", "CW PE"), linewidth=2.2, alpha=0.9)
+    series = visible_energy_series(history)
+    for panel, ax in ((1, ax1), (2, ax2)):
+        for entry in series:
+            if panel not in entry.panels:
+                continue
+            # The top panel carries two lines and leads with them, so they are drawn
+            # heavier than the same quantity in the breakdown below.
+            if panel == 1:
+                width, alpha = (2.2, 0.9) if entry.dashed else (2.5, 0.95)
+            else:
+                width, alpha = (1.8, 0.75) if entry.dashed else (2.0, 1.0)
+            ax.plot(
+                times, [e[entry.key] for e in history], "--" if entry.dashed else "-",
+                color=palette[entry.role], label=name(entry.label, entry.short),
+                linewidth=width, alpha=alpha,
+            )
     ax1.set_ylabel("Energy (J)", fontsize=label_size)
-
-    ax2.plot(times, [e["proj_ke"] for e in history], "-", color=palette["proj"], label=name("Projectile KE", "Proj KE"), linewidth=2)
-    ax2.plot(times, [e["arm_ke"] for e in history], "-", color=palette["arm"], label="Arm KE", linewidth=2)
-    ax2.plot(times, [e["cw_ke"] for e in history], "-", color=palette["cw"], label=name("Counterweight KE", "CW KE"), linewidth=2)
-    ax2.plot(times, [e["pulley_ke"] for e in history], "-", color=palette["pulley"], label=name("Pulley KE", "Pulley"), linewidth=2)
-    ax2.plot(times, [e["proj_pe"] for e in history], "--", color=palette["proj"], label=name("Projectile PE", "Proj PE"), linewidth=1.8, alpha=0.75)
-    ax2.plot(times, [e["arm_pe"] for e in history], "--", color=palette["arm"], label=name("Arm PE", "Arm PE"), linewidth=1.8, alpha=0.75)
     ax2.set_xlabel("Time (s)", fontsize=label_size)
     ax2.set_ylabel("Energy (J)", fontsize=label_size)
 
@@ -282,7 +336,7 @@ def build_energy_figure(result: SimulationResult, compact: bool = False, dark: b
         # plot they sat on top of the curves - with six series the detail panel
         # has no empty corner for `loc="best"` to find.
         _legend_above(ax1, ncol=2, fontsize=legend_size)
-        _legend_above(ax2, ncol=6, fontsize=detail_legend_size)
+        _legend_above(ax2, ncol=4, fontsize=detail_legend_size)
         ax1.set_xlabel("Time (s)", fontsize=label_size)
         ax1.tick_params(labelsize=8)
         ax2.tick_params(labelsize=8)

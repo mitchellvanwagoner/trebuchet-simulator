@@ -48,9 +48,10 @@ cuts the divergence to 432 values but does not close it; `fastmath=False` closes
 exactly, 0 of 8016. The launch is a stitched walk through regimes whose boundaries are
 sign tests on constraint forces, so a last-bit difference is not a last-bit difference for
 long: it decides whether a sling lets go, and the launch after that is a different launch.
-It costs about 8% on the hot path and takes a third off the cold compile - 177s under
-fastmath against 111s as shipped here - for an engine that answers the same question the
-same way twice.
+It costs about 8% on the hot path and took a third off the cold compile at the time - 177s
+under fastmath against 111s without - for an engine that answers the same question the same
+way twice. (The cold compile is about 23s now; see the note above _derivs8 for where the
+rest of it went.)
 
 The integrator mirrors scipy's RK45: same Dormand-Prince tableau, same step-size
 control. Events (release angle, ground impact) are localized with a cubic Hermite
@@ -870,7 +871,23 @@ def _beam_slack_derivs(y, c, projectile_mass, h_T, out):
     out[10] = q3
 
 
-@njit(cache=True, fastmath=False, inline="always")
+# Not inline="always", and neither are _eight_event, _taut_or_slack or the two _settle_*
+# helpers, because that is where nearly all of a cold start went. Numba inlines in its own
+# IR, before type inference, so every call site receives a whole copy: _derivs8 is called
+# from eight places in _integrate_eight_segment and carries all five regimes' right-hand
+# sides, and _eight_event from thirteen, each carrying up to three constraint solves - some
+# eighty copies of the dynamics in one function, which numba then typed and LLVM optimized
+# as a single unit. That function alone took 81s of a 125s cold compile. As ordinary calls
+# each helper compiles once, and the whole engine compiles in 23.5s (_eight_event four
+# times over, once per event number, since `which` arrives as a literal).
+#
+# With fastmath off, where a call is inlined cannot move a bit (see the module docstring),
+# and it did not: 6000 launches across both machines, covering snaps, landings and beam
+# contact, and both machines' optimizer answers came back identical, compiled cold and
+# reloaded warm. The cost is 2-7% on the traditional machine's single-threaded scoring,
+# whose slack and beam segments are where these calls are made, and nothing measurable on
+# the pulley machine's. The taut stepper's own helpers stay inlined: that is the hot path.
+@njit(cache=True, fastmath=False)
 def _derivs8(y, c, projectile_mass, h_T, regime, out):
     """Whichever of the three eight-component regimes' dynamics `regime` names.
 
@@ -1508,7 +1525,7 @@ def _tip_separation(y, l_a, l_s, h_T):
     return np.sqrt(dx * dx + dy * dy) - l_s
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=False)
 def _eight_event(y, c, projectile_mass, h_T, regime, which):
     """One of a regime's two transition events, signed so every crossing is downward.
 
@@ -1982,7 +1999,7 @@ def _apply_beam_impulse(y, c, projectile_mass, counter_weight_mass, has_pulley, 
     return max(0.0, before - after)
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=False)
 def _taut_or_slack(y, c, projectile_mass, h_T, taut_out):
     """_TAUT if the sling can hold the stone there, _SLACK if it would have to push.
 
@@ -2010,7 +2027,7 @@ def _taut_or_slack(y, c, projectile_mass, h_T, taut_out):
     return _SLACK
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=False)
 def _settle_beam(y, c, projectile_mass, h_T, taut_out):
     """Which regime a stone that has just arrived on the beam belongs in.
 
@@ -2041,7 +2058,7 @@ def _settle_beam(y, c, projectile_mass, h_T, taut_out):
     return _taut_or_slack(y, c, projectile_mass, h_T, taut_out)
 
 
-@njit(cache=True, fastmath=False, inline="always")
+@njit(cache=True, fastmath=False)
 def _settle_grounded(y, c, projectile_mass, h_T, taut_out):
     """Which grounded regime a just-landed or just-snapped projectile belongs in.
 
@@ -2768,7 +2785,8 @@ def simulate_fast(counter_weight_mass, pulley_radius, length_counterweight,
 # objective is bit-identical to an uncached one on a cold run and on every warm one - so
 # there is nothing left for the cache to get wrong, and the per-run compile goes with it:
 # 5.35s of startup becomes 0.75s. The first run after any edit to this file still pays the
-# whole 111s compile, as it always has; every run after it pays 0.14s.
+# whole cold compile - 111s then, about 23s since the eight-component helpers stopped being
+# inlined (see _derivs8) - and every run after it pays 0.14s.
 @njit(cache=True, fastmath=False)
 def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_weight_rope_length,
            arm_length, string_length, release_angle,
@@ -2784,6 +2802,14 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     # lie; the traditional machine lays its sling out from the tip and is commonly slung
     # as long as its arm or longer, so its only limit is the search range.
     if has_pulley and string_length > 0.95 * arm_length:
+        return INVALID_COST
+    # A design variable at zero is not a small machine but no machine - a sling or an arm
+    # with no length, a weight with no mass, a linkage with no lever - and the equations of
+    # motion divide by all of them. The search ranges reach down to zero (see
+    # optimization.PARAM_LIMITS), and the L-BFGS-B polish that finishes a search can step
+    # exactly onto the end of a range.
+    linkage = pulley_radius if has_pulley else length_counterweight
+    if counter_weight_mass <= 0.0 or linkage <= 0.0 or arm_length <= 0.0 or string_length <= 0.0:
         return INVALID_COST
 
     (released, distance, efficiency, _string_impulse, cw_impulse, sling_deficit,

@@ -44,7 +44,6 @@ from trebuchet_sim.optimization import (
     param_names,
 )
 from trebuchet_sim.physics import simulate_trebuchet
-from trebuchet_sim.visualization import build_energy_figure
 
 st.set_page_config(page_title="Trebuchet Simulator", page_icon="🏰", layout="wide")
 
@@ -306,7 +305,6 @@ def _widget_key(prefix: str, name: str, machine: MachineType) -> str:
 st.session_state.setdefault("result", None)
 st.session_state.setdefault("sim_params", None)
 st.session_state.setdefault("anim_html", None)
-st.session_state.setdefault("energy_fig", None)
 st.session_state.setdefault("opt_log_rows", [])
 st.session_state.setdefault("opt_status", None)
 
@@ -351,15 +349,14 @@ def _store_result(params: TrebuchetParams, result) -> None:
     """Store a new result and pre-render its expensive outputs once.
 
     Streamlit reruns this script on every widget interaction; caching the
-    animation HTML and energy figure here keeps reruns cheap.
+    animation HTML here keeps reruns cheap. The energy plot rides along inside
+    it - it plays on the animation's clock, so the two are one component (see
+    web/animation3d.py) rather than a picture sitting under a scene.
     """
     st.session_state.sim_params = params
     st.session_state.result = result
     releasable = "error" not in result.metrics and result.metrics.get("release_occurred", True)
     st.session_state.anim_html = build_trebuchet_3d_html(params, result, height=ANIMATION_HEIGHT) if releasable else None
-    st.session_state.energy_fig = (
-        build_energy_figure(result, compact=True, dark=True) if result.energy_history else None
-    )
 
 
 def _length_pair_input(
@@ -476,7 +473,7 @@ def _range_unit(kind: str, imperial: bool) -> _DisplayUnit:
 
 def _si_input(
     container, label: str, key: str, unit: _DisplayUnit,
-    si_default: "float | None", si_min: float, si_max: float,
+    si_default: "float | None", si_min: float, si_max: "float | None",
     clearable: bool,
 ) -> "float | None":
     """One parameter box (or ft/in pair), in canonical SI and out again.
@@ -486,15 +483,19 @@ def _si_input(
     rerun, which is the only way Streamlit lets a box be emptied - blank is
     meaningful for the optimizable params (nothing to lock to) and for the
     optional ones. False passes the default as `value=`, so the box always
-    holds a number; the required fixed params use that.
+    holds a number; the required fixed params use that. `si_max` None leaves
+    the box with no upper limit.
 
     Returns None only when the box is blank.
     """
     if unit.is_pair:
         return _length_pair_input(container, label, key, si_default, si_min, si_max)
 
-    lo, hi = unit.to_display(si_min), unit.to_display(si_max)
-    default = None if si_default is None else min(max(unit.to_display(si_default), lo), hi)
+    lo = unit.to_display(si_min)
+    hi = None if si_max is None else unit.to_display(si_max)
+    default = None if si_default is None else max(unit.to_display(si_default), lo)
+    if default is not None and hi is not None:
+        default = min(default, hi)
 
     if clearable:
         if default is not None:
@@ -506,6 +507,17 @@ def _si_input(
         key=key, format=f"%.{INPUT_DECIMALS}f",
     )
     return None if shown is None else unit.to_si(shown)
+
+
+def _design_limits(name: str) -> "tuple[float, float | None]":
+    """The (min, max) a design variable's boxes accept, in SI; max None means uncapped.
+
+    PARAM_LIMITS rather than PARAM_BOUNDS, for the value box as well as the range boxes:
+    the default search range is where the optimizer starts looking, not a limit on the
+    machine someone may type in.
+    """
+    low, high = PARAM_LIMITS[name]
+    return low, (None if math.isinf(high) else high)
 
 
 def _optimizable_input(
@@ -531,7 +543,7 @@ def _optimizable_input(
         which params were locked.
     """
     unit = _display_unit(kind, imperial)
-    si_min, si_max = PARAM_BOUNDS[name]
+    si_min, si_max = _design_limits(name)
 
     saved_entry = _saved_for(machine, "optimizable").get(name)
     if not isinstance(saved_entry, dict):  # stale/pre-toggle save format - fall back to un-locked defaults
@@ -542,7 +554,9 @@ def _optimizable_input(
     fallback_si = saved_entry.get("value")
     if fallback_si is None:
         fallback_si = DEFAULT_MACHINE_PARAMS[machine][name]
-    fallback_si = min(max(fallback_si, si_min), si_max)
+    fallback_si = max(fallback_si, si_min)
+    if si_max is not None:
+        fallback_si = min(fallback_si, si_max)
 
     # Keyed wrapper so the stylesheet can tint the whole row when the lock is
     # on (see the [class*="st-key-param_"] rule) - a 20px toggle on its own is
@@ -573,13 +587,14 @@ def _range_input(container, label: str, name: str, machine: MachineType, imperia
     which is what the "Ranges" button counts.
 
     Bounds are clamped to PARAM_LIMITS rather than PARAM_BOUNDS, so the search can be
-    widened past the defaults as well as narrowed; OptimizationConfig enforces the same
-    envelope, and min >= max is corrected here rather than raised, since half of every
-    edit passes through that state as the user types.
+    widened past the defaults as well as narrowed - for sizes and masses, anywhere from
+    zero up; OptimizationConfig enforces the same envelope, and min >= max is corrected
+    here rather than raised, since half of every edit passes through that state as the
+    user types.
     """
     unit = _range_unit(PARAM_KIND[name], imperial)
     default_lo, default_hi = PARAM_BOUNDS[name]
-    limit_lo, limit_hi = PARAM_LIMITS[name]
+    limit_lo, limit_hi = _design_limits(name)
 
     saved = _saved_for(machine, "ranges").get(name) or {}
     seed_lo = saved.get("min", default_lo)
@@ -1225,13 +1240,10 @@ if optimize_clicked:
 
 with mid:
     if st.session_state.anim_html is not None:
-        # The animation panel flexes to fill the column (see CSS) so the energy
-        # plots below it sit at the bottom of the screen.
+        # One panel for the whole column: the scene and the energy chart share a clock, so
+        # they share an iframe too (see web/animation3d.py).
         with st.container(key="anim_panel"):
             render_trebuchet_3d_html(st.session_state.anim_html, height=ANIMATION_HEIGHT)
-        if st.session_state.energy_fig is not None:
-            with st.container(key="energy_panel"):
-                st.pyplot(st.session_state.energy_fig)
     else:
         with st.container(key="empty_stage"):
             st.markdown(

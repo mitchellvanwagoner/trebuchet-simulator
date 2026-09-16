@@ -130,7 +130,12 @@ def test_traditional_launch_conserves_energy_with_dissipation_switched_off():
     # stroke went away. Zero allowed loss is the sharper case, not a skipped one - hence
     # the absolute floor beside the relative one, since approx(0.0, rel=...) demands exact.
     allowed = result.metrics["sling_snap_energy"] + result.metrics["projectile_ground_energy"]
-    totals = np.array([entry["total"] for entry in result.energy_history])
+    # The launch alone. The history runs on past the release now (see
+    # physics.POST_RELEASE_ENERGY_SECONDS) and everything there is dissipation by
+    # construction - the stone hands the ground its kinetic energy when it lands, the
+    # counterweight settles - which says nothing about the Lagrangian this is testing.
+    launch = [e for e in result.energy_history if e["time"] <= result.metrics["t_release"]]
+    totals = np.array([entry["total"] for entry in launch])
     drop = totals[0] - totals
     assert drop.min() > -1e-6 * abs(totals[0])            # never gains
     assert drop.max() == pytest.approx(              # loses exactly what it recorded

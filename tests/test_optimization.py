@@ -217,8 +217,10 @@ def test_param_bounds_override_the_default_search_range():
     "bad, message",
     [
         ({"arm_length": (0.8, 0.3)}, "min < max"),
-        ({"arm_length": (0.0, 0.8)}, "PARAM_LIMITS"),
-        ({"arm_length": (0.3, 99.0)}, "PARAM_LIMITS"),
+        ({"arm_length": (-0.1, 0.8)}, "PARAM_LIMITS"),
+        ({"release_angle": (-4.0, 1.0)}, "PARAM_LIMITS"),
+        # Uncapped is not the same as unbounded: DE samples uniformly across a range.
+        ({"arm_length": (0.3, float("inf"))}, "finite"),
         ({"arm_length": (float("nan"), 0.8)}, "finite"),
         ({"not_a_param": (0.3, 0.8)}, "No such parameter"),
         ({"length_counterweight": (0.1, 0.5)}, "No such parameter"),  # wrong machine
@@ -227,6 +229,43 @@ def test_param_bounds_override_the_default_search_range():
 def test_invalid_ranges_are_rejected(bad, message):
     with pytest.raises(ValueError, match=message):
         OptimizationConfig(param_bounds=bad)
+
+
+def test_sizes_and_masses_can_be_ranged_from_zero_with_no_ceiling():
+    """PARAM_LIMITS used to stop an arm at 10 m and a counterweight at 1000 kg - which turned
+    a large machine away for nothing the model cannot represent."""
+    wide = {"arm_length": (0.0, 99.0), "counter_weight_mass": (0.0, 1e5), "string_length": (0.0, 50.0)}
+    config = OptimizationConfig(param_bounds=wide)
+
+    for name, span in wide.items():
+        assert config.bounds_for(name) == span
+    for name in ("counter_weight_mass", "pulley_radius", "arm_length", "string_length", "length_counterweight"):
+        assert PARAM_LIMITS[name] == (0.0, np.inf), name
+
+
+@pytest.mark.parametrize("machine", list(MachineType))
+@pytest.mark.parametrize("size", ["counter_weight_mass", "linkage", "arm_length", "string_length"])
+def test_a_zero_sized_design_is_refused_rather_than_divided_by(machine, size):
+    """Zero is inside every size's range now, and it is no machine rather than a small one.
+
+    Both objectives have to refuse it before the equations of motion divide by it, since the
+    L-BFGS-B polish that finishes a search can evaluate exactly on the end of a range - and
+    the reference engine has to report it, since a dashboard box can now be typed down to it.
+    """
+    config = OptimizationConfig(machine=machine, fixed_params=dict(DEFAULT_MACHINE_FIXED[machine]))
+    name = config.param_names[1] if size == "linkage" else size
+    design = dict(DEFAULT_MACHINE_PARAMS[machine])
+    zeroed = dict(design, **{name: 0.0})
+
+    population = np.array([[design[n], zeroed[n]] for n in config.free_params], dtype=np.float64)
+    costs = _objective_vectorized(population, config)
+
+    assert costs[0] < INVALID_COST  # the shipped design beside it still scores
+    assert costs[1] == INVALID_COST
+    assert _objective([zeroed[n] for n in config.free_params], config) == INVALID_COST
+
+    result = simulate_trebuchet(config.build_params([zeroed[n] for n in config.free_params]))
+    assert "must be greater than zero" in result.metrics["error"]
 
 
 def test_traditional_machine_ranges_its_own_linkage_parameter():

@@ -105,6 +105,23 @@ def test_each_machine_keeps_its_own_target_and_weights(data_dir):
     assert _box(app, "Dist. weight").value == 7.0
 
 
+def test_design_variable_boxes_run_from_zero_with_no_ceiling(data_dir):
+    """Every size and mass box - the value itself and both ends of its search range - starts
+    at zero and has no maximum. The value boxes used to stop at the end of the default search
+    range (a 2 m arm, a 60 kg counterweight) and the range boxes at PARAM_LIMITS (10 m)."""
+    app = _metric(_run())
+
+    for label in ("Counterweight (kg)", "Arm length (m)", "String length (m)",
+                  "Arm length min (m)", "max (m)"):
+        box = _box(app, label)
+        assert box.min == 0.0, label
+        assert box.max is None, label
+
+    # And a machine past the old caps is kept as typed rather than clamped back.
+    app = _run(_box(app, "Arm length (m)").set_value(12.5))
+    assert _box(app, "Arm length (m)").value == 12.5
+
+
 def test_a_one_machine_defaults_file_still_loads_and_survives_the_next_save(data_dir):
     """The original format kept one machine's sections at the top level.
 

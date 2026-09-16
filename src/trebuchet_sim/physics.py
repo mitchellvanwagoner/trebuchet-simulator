@@ -26,6 +26,15 @@ PositionVelocity = Tuple[Tuple[float, float], Tuple[float, float]]
 # Evenly spaced samples taken from the dense ODE solution for energy tracking.
 ENERGY_SAMPLES = 400
 
+# How far past the release the energy history runs, and at how many samples. The launch is
+# over in a fraction of a second and used to be the whole plot, which cut the story off at
+# its turning point: what the throw did with the energy - the stone trading speed for height
+# and then handing the lot to the ground, the counterweight swinging down and settling - all
+# happens after the sling lets go. A flight longer than this carries the history to the
+# landing instead, so the plot always covers everything the animation plays.
+POST_RELEASE_ENERGY_SECONDS = 2.0
+POST_RELEASE_ENERGY_SAMPLES = 200
+
 # The four states a launch can be in. The sling is either carrying load or not, and
 # the projectile is either on the ground or off it, and those are independent: a sling
 # can go slack over a projectile already lying in the dirt, and a taut one can drag a
@@ -409,6 +418,23 @@ class TrebuchetSimulator:
         self.track_energy = track_energy
         self.energy_history: List[Dict] = []
 
+        # A design variable at zero is no machine at all rather than a small one, and the
+        # constants folded below divide by several of them (the pulley's ground angle by its
+        # radius, the beam's ground angle by its length). Nothing upstream keeps a zero out
+        # any more - the dashboard's boxes and the optimizer's ranges both reach down to it,
+        # see optimization.PARAM_LIMITS - so such a machine is left unfolded and simulate()
+        # reports it instead of this raising.
+        linkage_label = "pulley radius" if params.has_pulley else "counterweight arm length"
+        sizes = {
+            "counterweight mass": params.counter_weight_mass,
+            linkage_label: params.pulley_radius if params.has_pulley else params.length_counterweight,
+            "arm length": params.arm_length,
+            "string length": params.string_length,
+        }
+        self._empty_sizes = [label for label, value in sizes.items() if not value > 0.0]
+        if self._empty_sizes:
+            return
+
         # Constant-fold everything the dynamics RHS needs: it runs a few hundred
         # times per simulation, and the dataclass properties (moi_arm, projectile_area,
         # ...) would otherwise be recomputed on every call. Only M12 of the inertia
@@ -637,7 +663,58 @@ class TrebuchetSimulator:
         machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
         arm_cm_pos, _ = self.arm_position_velocity(machine_state)
         cw_pos, cw_vel = self.weight_position_velocity(machine_state)
+        return self._energy_breakdown(t, theta_dot, arm_cm_pos[1], proj_pos, proj_vel, cw_pos, cw_vel)
 
+    def post_release_energy_at(
+        self, aftermath: AftermathResult, trajectory, t_release: float, t_local: float,
+    ) -> Dict[str, float]:
+        """Energy breakdown `t_local` seconds after release, timestamped on the launch clock.
+
+        There is no single state vector to read after the release: the sling lets go and the
+        two halves are integrated apart, the machine by simulate_aftermath and the stone by
+        trajectory.py. So the breakdown is reassembled from both, with the same keys the
+        launch reports, and the history reads as one series across the release.
+
+        The counterweight is the one piece that is not simply where its linkage would put it:
+        once the pulley machine's weight is lying on the ground its rope is slack, so it rests
+        on its own base rather than hanging from the axle (web/animation3d.py draws it in that
+        same place).
+        """
+        theta, theta_dot, regime = aftermath.state_at(t_local)
+        psi, psi_dot = aftermath.swing_at(t_local)
+        machine_state = (theta, theta_dot, 0.0, 0.0, psi, psi_dot)
+        arm_cm_pos, _ = self.arm_position_velocity(machine_state)
+        if regime == "slack":
+            cw_pos, cw_vel = (self.params.pulley_radius, self._cw_half_size), (0.0, 0.0)
+        else:
+            cw_pos, cw_vel = self.weight_position_velocity(machine_state)
+        return self._energy_breakdown(
+            t_release + t_local, theta_dot, arm_cm_pos[1],
+            trajectory.position_at(t_local), trajectory.velocity_at(t_local), cw_pos, cw_vel,
+        )
+
+    def _append_post_release_energy(
+        self, aftermath: AftermathResult, trajectory, t_release: float, flight_time: float,
+    ) -> None:
+        """Extend energy_history past the release (see POST_RELEASE_ENERGY_SECONDS).
+
+        The first sample is dropped: the launch history already ends at the release, and the
+        machine is in the same place an instant later.
+        """
+        duration = max(flight_time, POST_RELEASE_ENERGY_SECONDS)
+        for t in np.linspace(0.0, duration, POST_RELEASE_ENERGY_SAMPLES)[1:]:
+            self.energy_history.append(
+                self.post_release_energy_at(aftermath, trajectory, t_release, float(t))
+            )
+
+    def _energy_breakdown(
+        self, t: float, theta_dot: float, arm_cm_height: float, proj_pos, proj_vel, cw_pos, cw_vel,
+    ) -> Dict[str, float]:
+        """The per-component energies, given where every body is and how fast it is moving.
+
+        Shared by the launch and the post-release tail so the two halves of the history are
+        measured the same way rather than by two copies of the same arithmetic.
+        """
         proj_ke = 0.5 * self.params.projectile_mass * (proj_vel[0] ** 2 + proj_vel[1] ** 2)
         arm_ke = 0.5 * self.params.moi_arm * theta_dot**2
         pulley_ke = 0.5 * self.params.moi_pulley * theta_dot**2
@@ -647,7 +724,7 @@ class TrebuchetSimulator:
         total_ke = proj_ke + arm_ke + pulley_ke + cw_ke
 
         proj_pe = self.params.projectile_mass * G * proj_pos[1]
-        arm_pe = self.params.arm_mass * G * arm_cm_pos[1]
+        arm_pe = self.params.arm_mass * G * arm_cm_height
         cw_pe = self.params.counter_weight_mass * G * cw_pos[1]
         total_pe = proj_pe + arm_pe + cw_pe
 
@@ -2645,6 +2722,15 @@ class TrebuchetSimulator:
         """
         self.energy_history = []
 
+        # A zero-sized design variable, which __init__ refused to fold.
+        if self._empty_sizes:
+            return SimulationResult(0.0, 0.0, {
+                "error": (
+                    f"The {' and '.join(self._empty_sizes)} must be greater than zero - "
+                    "there is no machine to launch."
+                ),
+            }, None)
+
         # Refuse a machine that is already standing in the ground (see
         # _cocked_beam_clearance). Checked before integrating rather than left to the
         # beam's ground event, which by construction only looks for crossings below the
@@ -2801,13 +2887,24 @@ class TrebuchetSimulator:
             flight_time = trajectory.flight_time
 
         aftermath = None
-        if simulate_aftermath and trajectory is not None:
+        # Tracking energy needs the settling machine whether or not the caller asked to
+        # animate it, since it is half of what the history plots after the release - so it is
+        # computed for either, and only attached to the result when it was asked for.
+        if (simulate_aftermath or self.track_energy) and trajectory is not None:
             # Integrated independently of the ballistic flight above (no shared state,
             # no shared dynamics) - only the stopping duration is passed in, so the two
-            # can be stitched together for animation and both end when the projectile lands.
-            aftermath = self.simulate_aftermath(
-                theta_release, theta_dot_release, flight_time, launch.release_swing_state
+            # can be stitched together for animation on one clock. It runs to the landing or
+            # to POST_RELEASE_ENERGY_SECONDS, whichever is longer: a stone that lands in
+            # 0.4 s leaves the counterweight still swinging, and both the plot and the
+            # animation carry on until the machine has something to show.
+            settling = self.simulate_aftermath(
+                theta_release, theta_dot_release,
+                max(flight_time, POST_RELEASE_ENERGY_SECONDS), launch.release_swing_state,
             )
+            if self.track_energy:
+                self._append_post_release_energy(settling, trajectory, t_release, flight_time)
+            if simulate_aftermath:
+                aftermath = settling
 
         arm_angle_rotated = self.params.initial_arm_angle - theta_release
         if self.params.has_pulley:

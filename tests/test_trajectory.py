@@ -24,6 +24,20 @@ def test_position_at_zero_matches_initial_conditions():
     assert y == 2.0
 
 
+def test_velocity_starts_at_the_release_and_ends_at_rest():
+    """The energy plot reads the stone's speed through the flight (see
+    physics.post_release_energy_at), and a landed stone has given the ground the lot."""
+    trajectory = integrate_ballistic_trajectory(
+        x0=1.0, y0=2.0, vx0=3.0, vy0=4.0,
+        mass=0.25, drag_coefficient=0.47, area=math.pi * 0.04**2,
+    )
+
+    assert trajectory.velocity_at(0.0) == (3.0, 4.0)
+    assert trajectory.velocity_at(trajectory.flight_time + 0.5) == (0.0, 0.0)
+    # Drag is the only horizontal force, so the downrange speed only ever falls.
+    assert trajectory.velocity_at(0.1)[0] < 3.0
+
+
 def test_drag_reduces_range_versus_vacuum_trajectory():
     with_drag = integrate_ballistic_trajectory(
         x0=0.0, y0=5.0, vx0=20.0, vy0=0.0,

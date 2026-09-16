@@ -90,10 +90,16 @@ def test_the_energy_figure_plots_the_history_it_was_given(machine, compact, dark
     assert list(ax_totals.lines[0].get_xdata()) == times
     assert list(ax_totals.lines[0].get_ydata()) == [e["total"] for e in history]
     assert list(ax_totals.lines[1].get_ydata()) == [e["cw_pe"] for e in history]
-    # Panel two: the six components, in the order the module plots them.
-    for line, key in zip(ax_detail.lines, ["proj_ke", "arm_ke", "cw_ke", "pulley_ke",
-                                           "proj_pe", "arm_pe"]):
+    # Panel two: the components this machine has, in the order the module plots them. The
+    # traditional machine has no pulley, so that series is left out rather than drawn as a
+    # flat zero with a legend entry to read.
+    expected = ["proj_ke", "arm_ke", "cw_ke", "proj_pe", "arm_pe"]
+    if machine is MachineType.PULLEY:
+        expected.insert(3, "pulley_ke")
+    for line, key in zip(ax_detail.lines, expected):
         assert list(line.get_ydata()) == [e[key] for e in history], key
+    plotted_pulley = any("Pulley" in str(line.get_label()) for line in ax_detail.lines)
+    assert plotted_pulley is (machine is MachineType.PULLEY)
 
 
 @pytest.mark.parametrize("compact", [False, True])
