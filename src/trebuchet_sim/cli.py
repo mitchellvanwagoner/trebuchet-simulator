@@ -335,7 +335,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             target_distance=args.target_distance,
             efficiency_weight=args.efficiency_weight,
             distance_weight=args.distance_weight,
-            mass_weight=args.mass_weight,
+            cw_mass_weight=args.cw_mass_weight,
             snap_penalty_weight=args.snap_penalty_weight,
             jerk_penalty_weight=args.jerk_penalty_weight,
             locked_params=locked,
@@ -446,8 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
              "rather than one that hits it",
     )
     opt_parser.add_argument(
-        "--mass-weight", type=float, default=OptimizationConfig.mass_weight,
-        help=f"How strongly the objective penalizes total mass (default: {OptimizationConfig.mass_weight:g})",
+        "--cw-mass-weight",
+        type=float,
+        default=OptimizationConfig.cw_mass_weight,
+        help="Cost per kilogram of counterweight, and the only mass the objective charges "
+             f"for (default: {OptimizationConfig.cw_mass_weight:g}). At 1 a kilogram trades "
+             "against 0.2 points of efficiency or 0.1%% of the target distance. Raise it to "
+             "be shown the lightest weight that will still do the job; zero lets the search "
+             "take as much mass as its range allows",
     )
     opt_parser.add_argument(
         "--snap-penalty-weight",

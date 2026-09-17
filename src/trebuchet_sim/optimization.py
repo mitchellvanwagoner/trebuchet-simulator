@@ -136,8 +136,8 @@ class OptimizationConfig:
     target_distance: float = 30.0
     # These two are one setting in two parts: their *ratio* is the exchange rate the
     # search trades on, in efficiency points per 1% of target distance. The absolute
-    # scale only decides how much the mass term and the two penalties below can move
-    # things, so at a fixed ratio the numbers here barely change the answer.
+    # scale only decides how much the mass term and the penalties below can move things,
+    # so at a fixed ratio the numbers here barely change the answer.
     #
     # 10:5 = 2.0 is measured. The benchmark is 60 problem/seed pairs over both machines
     # with and without locks, each aimed at 40/70/95% of the range that machine can
@@ -151,7 +151,47 @@ class OptimizationConfig:
     # Past 10 there is nothing left to buy: everything is already being hit.
     efficiency_weight: float = 5.0
     distance_weight: float = 10.0
-    mass_weight: float = 0.15
+    # Cost per kilogram of counterweight - the only mass the objective charges for.
+    #
+    # There used to be a `mass_weight` here as well, charging `total_mass` normalized to a
+    # 30 kg machine, and this replaces it rather than joining it. The two do not measure
+    # the same thing: the counterweight is the part that has to be hauled back up between
+    # throws and the part the frame is sized around, while the rest of `total_mass` is the
+    # beam and the stone, and a beam is not something a design should be pushed to shorten
+    # for its own weight - the arm length is already being chosen on what it does to the
+    # throw. Charging the whole machine let a search asked for a lighter *weight* answer by
+    # cutting the arm instead. (It was also barely asking: at 0.15 the old term cost a
+    # 30 kg machine 15 units against efficiency's ~450, and the unpenalized pulley search
+    # ran its counterweight up against the 60 kg bound regardless.)
+    #
+    # Priced per kilogram, the way the two impulse terms are priced per N*s and the jerk
+    # term per joule, so the number means something on its own: against the shipped
+    # efficiency and distance weights, 1.0 here trades a kilogram for 0.2 points of
+    # efficiency or 0.1% of the target distance. A light machine is not free - a
+    # counterweight is what the throw is spent out of, so shedding mass has to be bought
+    # back with efficiency or given up in range - and this weight is the exchange rate.
+    #
+    # 0.5 is the smallest value that does the one job a default here has: keeping the
+    # search honest about mass without being asked to buy anything with it. At zero the
+    # objective charges nothing for mass at all, and both machines answer by taking as much
+    # as they can get - the pulley search runs its counterweight up against the 60 kg end
+    # of PARAM_BOUNDS, so the *bound* picks the machine, and the traditional one goes from
+    # 20.0 kg to 33.0 kg to buy 0.8 points of efficiency. A winner standing on the edge of
+    # its own search range is not an answer to the question that was asked.
+    #
+    # Swept at 0 / 0.5 / 2 / 5 / 20 against the 30 m target on the shipped seed and
+    # geometry, the winning counterweight runs 60.0 / 59.8 / 59.8 / 29.0 / 10.2 kg on the
+    # pulley machine and 33.0 / 20.0 / 14.2 / 11.6 / 8.7 kg on the traditional one, with
+    # every one of them landing on 30.00 m. The traditional machine pays for it in
+    # efficiency, 94.2 / 93.4 / 92.3 / 90.5 / 84.6%, lengthening beam and sling to swing a
+    # lighter weight further; that machine is where this weight does its work, and 0.5
+    # costs it 0.8 points. The pulley machine barely answers below 5 and is not monotone on
+    # the way - 88.9 / 88.8 / 73.1 / 89.7 / 92.2%, the 2.0 draw having landed in the broad
+    # 1.0 m-arm basin instead of the narrow short-arm one (see `seed`, which describes those
+    # two basins). That is the landscape, not this term: the two basins are about 15 points
+    # of efficiency apart and a weight that moves the score by a few units per kilogram can
+    # tip a seed between them.
+    cw_mass_weight: float = 0.5
     # Cost per N*s of the counterweight rope's "compression impulse", on the pulley
     # machine. That machine hangs its weight on a rope over the axle, which the model
     # holds rigid; a rope pulls and never pushes, so a run where the model needs it to
@@ -392,7 +432,9 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
 
     efficiency_cost = -result.efficiency * 100
     distance_cost = abs(result.distance - config.target_distance) / config.target_distance * 100
-    mass_cost = (params.total_mass / 30.0) * 100
+    # The counterweight, per kilogram, and the only mass the objective charges for. Both
+    # engines charge it the same way.
+    cw_mass_cost = config.cw_mass_weight * params.counter_weight_mass
     # Only the counterweight's link is still a rigid one, so it is the only connector
     # with a compression impulse to charge (the key this used to read for the sling,
     # `string_compression_impulse`, is not in the metrics any more - both engines let the
@@ -414,7 +456,7 @@ def _objective(free_values: Sequence[float], config: OptimizationConfig) -> floa
     return (
         config.efficiency_weight * efficiency_cost
         + config.distance_weight * distance_cost
-        + config.mass_weight * mass_cost
+        + cw_mass_cost
         + slack_cost
         + snap_cost
         + jerk_cost
@@ -491,7 +533,8 @@ def _objective_vectorized(x: np.ndarray, config: "OptimizationConfig") -> np.nda
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"], fixed["joint_friction_coefficient"],
         fixed["bearing_friction_coefficient"], fixed["pivot_shaft_radius"],
         config.machine is MachineType.PULLEY,
-        config.target_distance, config.efficiency_weight, config.distance_weight, config.mass_weight,
+        config.target_distance, config.efficiency_weight, config.distance_weight,
+        config.cw_mass_weight,
         config.slack_penalty_weight, config.snap_penalty_weight, config.jerk_penalty_weight,
     )
 

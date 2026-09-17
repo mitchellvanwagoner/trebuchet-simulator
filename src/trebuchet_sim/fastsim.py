@@ -2794,7 +2794,7 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
            initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
            joint_friction_coefficient, bearing_friction_coefficient, pivot_shaft_radius,
            has_pulley,
-           target_distance, efficiency_weight, distance_weight, mass_weight,
+           target_distance, efficiency_weight, distance_weight, cw_mass_weight,
            slack_penalty_weight, snap_penalty_weight, jerk_penalty_weight):
     """Scalar port of optimization._objective's cost formula for one individual."""
     # Pulley machine only - see optimization._objective for why. That machine tucks its
@@ -2827,16 +2827,13 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
     if not released or distance <= 0.0 or efficiency <= 0.0 or efficiency > _MAX_EFFICIENCY:
         return INVALID_COST
 
-    # TrebuchetParams.total_mass: no pulley to weigh on the traditional machine, and its
-    # beam spans both sides of the pivot.
-    pulley_mass = pulley_density * np.pi * pulley_radius**2 * PULLEY_THICKNESS if has_pulley else 0.0
-    arm_total_length = arm_length if has_pulley else arm_length + length_counterweight
-    arm_mass = arm_density * arm_total_length * ARM_CROSS_SECTION_WIDTH**2
-    total_mass = counter_weight_mass + pulley_mass + arm_mass + projectile_mass
-
     efficiency_cost = -efficiency * 100.0
     distance_cost = abs(distance - target_distance) / target_distance * 100.0
-    mass_cost = (total_mass / 30.0) * 100.0
+    # The counterweight, per kilogram, and the only mass the objective charges for. The
+    # whole machine's mass used to be charged here too, which is why this kernel worked out
+    # a pulley and beam mass it otherwise has no use for; see
+    # optimization.OptimizationConfig.cw_mass_weight for why that went.
+    cw_mass_cost = cw_mass_weight * counter_weight_mass
     # Only the counterweight rope is charged a compression impulse, exactly as in
     # optimization._objective. The sling used to be charged one here too, because this
     # engine held it rigid and the impulse was the only sign it had gone somewhere the
@@ -2854,7 +2851,7 @@ def _score(counter_weight_mass, pulley_radius, length_counterweight, counter_wei
 
     return (
         efficiency_weight * efficiency_cost + distance_weight * distance_cost
-        + mass_weight * mass_cost + slack_cost + snap_cost + jerk_cost
+        + cw_mass_cost + slack_cost + snap_cost + jerk_cost
     )
 
 
@@ -2866,8 +2863,8 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
                          initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
                          joint_friction_coefficient, bearing_friction_coefficient,
                          pivot_shaft_radius, has_pulley, target_distance, efficiency_weight,
-                         distance_weight, mass_weight, slack_penalty_weight, snap_penalty_weight,
-                         jerk_penalty_weight):
+                         distance_weight, cw_mass_weight, slack_penalty_weight,
+                         snap_penalty_weight, jerk_penalty_weight):
     """Cost for an entire DE population in one call.
 
     The six per-individual args are arrays of shape (S,); everything else is a scalar
@@ -2886,7 +2883,7 @@ def evaluate_population(counter_weight_mass, pulley_radius, length_counterweight
             initial_arm_angle, arm_drag_coefficient, projectile_drag_coefficient,
             joint_friction_coefficient, bearing_friction_coefficient, pivot_shaft_radius,
             has_pulley,
-            target_distance, efficiency_weight, distance_weight, mass_weight,
+            target_distance, efficiency_weight, distance_weight, cw_mass_weight,
             slack_penalty_weight, snap_penalty_weight, jerk_penalty_weight,
         )
     return costs

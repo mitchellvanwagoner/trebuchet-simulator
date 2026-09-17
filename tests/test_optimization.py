@@ -364,6 +364,51 @@ def test_both_engines_charge_the_same_jerk_cost():
         )
 
 
+def test_the_objective_can_be_asked_for_a_lighter_counterweight():
+    """`cw_mass_weight` prices the counterweight on its own, per kilogram.
+
+    The `mass_weight` this replaced charged the same kilogram, but it charged the beam and
+    the stone with it, so a search asked for a lighter counterweight through that knob
+    could answer by shortening the arm instead. This one asks only the question a builder
+    has about the part that has to be hauled back up.
+
+    It is the only mass the objective charges for - the `mass_weight` that charged the
+    whole machine is gone - so zero here means a search that will take as much weight as
+    its range allows, which is how the pulley machine ends up standing on the 60 kg end of
+    PARAM_BOUNDS. Hence a nonzero default.
+    """
+    from trebuchet_sim.optimization import _objective
+
+    assert OptimizationConfig.cw_mass_weight > 0.0
+    assert not hasattr(OptimizationConfig, "mass_weight")
+
+    off = OptimizationConfig(cw_mass_weight=0.0)
+    charged = OptimizationConfig(cw_mass_weight=2.0)
+    values = [DEFAULT_OPTIMIZABLE_PARAMS[name] for name in off.free_params]
+
+    # Linear in the weight, and in nothing but the counterweight's own mass.
+    cw = DEFAULT_OPTIMIZABLE_PARAMS["counter_weight_mass"]
+    assert _objective(values, charged) - _objective(values, off) == pytest.approx(2.0 * cw)
+    assert _objective(values, OptimizationConfig()) - _objective(values, off) == pytest.approx(
+        OptimizationConfig.cw_mass_weight * cw
+    )
+
+
+@pytest.mark.parametrize("machine", list(MachineType))
+def test_both_engines_charge_the_same_counterweight_mass_cost(machine):
+    """A weight the two engines priced differently would make the search's answer depend
+    on which one scored it."""
+    for weight in (0.0, 2.0):
+        config = OptimizationConfig(
+            machine=machine, cw_mass_weight=weight, fixed_params=dict(DEFAULT_MACHINE_FIXED[machine])
+        )
+        defaults = DEFAULT_MACHINE_PARAMS[machine]
+        values = [defaults[name] for name in config.free_params]
+        assert _objective_vectorized(
+            np.array([[value] for value in values], dtype=np.float64), config
+        )[0] == pytest.approx(_objective(values, config), rel=1e-3)
+
+
 def test_a_none_fixed_param_means_the_same_as_leaving_it_out():
     """`fixed_params={"initial_arm_angle": None}` must not become a real arm angle.
 

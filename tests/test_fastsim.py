@@ -840,7 +840,10 @@ def test_evaluate_population_matches_per_individual_score(machine):
         fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
         fixed["joint_friction_coefficient"], fixed["bearing_friction_coefficient"],
         fixed["pivot_shaft_radius"], has_pulley,
-        30.0, 5.0, 1.0, 0.15, 200.0, 300.0, 20.0,
+        # Weights: target, efficiency, distance, counterweight mass, slack, snap, jerk.
+        # The counterweight term is given a nonzero value here, where the shipped default
+        # is zero, so a slot passed through in the wrong order would show up.
+        30.0, 5.0, 1.0, 0.5, 200.0, 300.0, 20.0,
     )
 
     for i in range(s):
@@ -853,7 +856,7 @@ def test_evaluate_population_matches_per_individual_score(machine):
             fixed["arm_drag_coefficient"], fixed["projectile_drag_coefficient"],
             fixed["joint_friction_coefficient"], fixed["bearing_friction_coefficient"],
             fixed["pivot_shaft_radius"], has_pulley,
-            30.0, 5.0, 1.0, 0.15, 200.0, 300.0, 20.0,
+            30.0, 5.0, 1.0, 0.5, 200.0, 300.0, 20.0,
         )
         assert costs[i] == pytest.approx(expected)
 

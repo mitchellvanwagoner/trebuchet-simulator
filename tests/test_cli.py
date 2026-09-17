@@ -42,7 +42,7 @@ def test_parser_builds_and_every_help_string_renders():
         ("--target-distance", "target_distance"),
         ("--efficiency-weight", "efficiency_weight"),
         ("--distance-weight", "distance_weight"),
-        ("--mass-weight", "mass_weight"),
+        ("--cw-mass-weight", "cw_mass_weight"),
         ("--snap-penalty-weight", "snap_penalty_weight"),
     ],
 )
@@ -64,7 +64,7 @@ def test_optimize_defaults_are_a_usable_config():
         target_distance=args.target_distance,
         efficiency_weight=args.efficiency_weight,
         distance_weight=args.distance_weight,
-        mass_weight=args.mass_weight,
+        cw_mass_weight=args.cw_mass_weight,
         snap_penalty_weight=args.snap_penalty_weight,
     )
     assert config.free_params  # nothing locked by default, so there is something to search

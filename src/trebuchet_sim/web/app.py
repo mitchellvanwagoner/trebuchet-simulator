@@ -1117,6 +1117,17 @@ with left:
             step=5.0,
             key=_widget_key("tune", "jerk_penalty_weight", machine),
         )
+        # Its own row, in the left half only: the page carries no tooltips, so the unit has
+        # to be in the label, and "CW penalty /kg" beside a second box would wrap.
+        cw_mass_weight = st.columns(2)[0].number_input(
+            "CW penalty /kg",
+            min_value=0.0,
+            value=max(
+                float(saved_target.get("cw_mass_weight", OptimizationConfig.cw_mass_weight)), 0.0
+            ),
+            step=0.5,
+            key=_widget_key("tune", "cw_mass_weight", machine),
+        )
 
     btn_sim, btn_opt, btn_save = st.columns([5, 5, 2])
     simulate_clicked = btn_sim.button("Simulate", type="primary", disabled=not fixed_ready, use_container_width=True)
@@ -1145,6 +1156,7 @@ with left:
                 "absolute_tolerance": absolute_tolerance,
                 "snap_penalty_weight": snap_penalty_weight,
                 "jerk_penalty_weight": jerk_penalty_weight,
+                "cw_mass_weight": cw_mass_weight,
             },
         )
         st.toast("Defaults saved")
@@ -1207,6 +1219,7 @@ if optimize_clicked:
             absolute_tolerance=absolute_tolerance,
             snap_penalty_weight=snap_penalty_weight,
             jerk_penalty_weight=jerk_penalty_weight,
+            cw_mass_weight=cw_mass_weight,
             locked_params=locked,
             fixed_params=fixed_params_all,
             workers=_OPT_WORKERS,
